@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exotel Dialer</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
+    .dialer { background: white; border-radius: 8px; padding: 20px; max-width: 320px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 16px; }
+    button { width: 100%; padding: 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 15px; margin-top: 6px; }
+    #callBtn  { background: #4CAF50; color: white; }
+    #hangupBtn { background: #f44336; color: white; display: none; }
+    #status { margin-top: 12px; font-size: 13px; color: #555; min-height: 20px; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #ccc; margin-right: 6px; }
+    .dot.green { background: #4CAF50; }
+    .dot.red   { background: #f44336; }
+    .dot.yellow { background: #FFC107; }
+  </style>
+</head>
+<body>
+  <div class="dialer">
+    <h3>📞 Exotel Dialer</h3>
+    <div id="regStatus"><span class="dot" id="regDot"></span><span id="regText">Initializing...</span></div>
+
+    <input type="tel" id="phone" placeholder="Enter phone number" />
+    <button id="callBtn"   onclick="makeCall()">📞 Call</button>
+    <button id="hangupBtn" onclick="hangUp()">📵 Hang Up</button>
+
+    <div id="status"></div>
+  </div>
+
+  <!-- Bitrix24 JS API -->
+  <script src="//api.bitrix24.com/api/v1/"></script>
+
+  <!-- Exotel WebRTC SDK -->
+  <script src="/target/crmBundle.js"></script>
+
+  <!-- App logic -->
+  <script src="/popup.js"></script>
+</body>
+</html>
