@@ -13,13 +13,13 @@ const EXOTEL_ACCOUNT_SID = process.env.EXOTEL_ACCOUNT_SID || 'YOUR_ACCOUNT_SID';
 const EXOTEL_SUBDOMAIN  = process.env.EXOTEL_SUBDOMAIN  || 'api.exotel.com'; // or your regional subdomain
 
 // ─── INSTALL ENDPOINT (required by Bitrix24) ───────────────────
+// Handle BOTH get and post for /install
 app.get('/install', (req, res) => {
-  res.send(`
-    <html><body>
-      <h2>Exotel Dialer Installed!</h2>
-      <p>You can close this window.</p>
-    </body></html>
-  `);
+  res.send('<html><body><h2>Exotel Dialer Installed!</h2></body></html>');
+});
+
+app.post('/install', (req, res) => {
+  res.send('<html><body><h2>Exotel Dialer Installed!</h2></body></html>');
 });
 
 // ─── TOKEN ENDPOINT ────────────────────────────────────────────
