@@ -6,201 +6,139 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const VOIP_BASE = 'https://integrationscore.mum1.exotel.com/v2/integrations';
+const BASE = 'https://integrationscore.mum1.exotel.com/v2/integrations';
 
-// ── Your credentials ──────────────────────────────────────────
-const CUSTOMER_ID     = process.env.EXOTEL_CUSTOMER_ID     || '3c8213e0-6e9f-4d8f-81ea-4e78cdc7911f';
-const CUSTOMER_SECRET = process.env.EXOTEL_CUSTOMER_SECRET || '5e858613-9727-41c1-a9f3-02c9b3afd167';
-const ACCOUNT_SID     = process.env.EXOTEL_ACCOUNT_SID     || 'jkstar1';
-const API_KEY         = process.env.EXOTEL_API_KEY         || '';
-const API_TOKEN       = process.env.EXOTEL_API_TOKEN       || '';
-const EXOTEL_DOMAIN   = process.env.EXOTEL_DOMAIN          || 'singapore'; // your account region
-const APP_ID          = process.env.EXOTEL_APP_ID          || '';
-const APP_SECRET = process.env.EXOTEL_APP_SECRET || '';
+const CUSTOMER_ID     = process.env.EXOTEL_CUSTOMER_ID;
+const CUSTOMER_SECRET = process.env.EXOTEL_CUSTOMER_SECRET;
+const ACCOUNT_SID     = process.env.EXOTEL_ACCOUNT_SID;
+const API_KEY         = process.env.EXOTEL_API_KEY;
+const API_TOKEN       = process.env.EXOTEL_API_TOKEN;
+const DOMAIN          = process.env.EXOTEL_DOMAIN || 'mumbai';
+const APP_ID          = process.env.EXOTEL_APP_ID;
+const APP_SECRET      = process.env.EXOTEL_APP_SECRET;
 
-// ── Step 1: Get customer-level auth token ─────────────────────
+// ── Get customer-level token ───────────────────────────────────
 async function getCustomerToken() {
-  const res = await fetch(`${VOIP_BASE}/token`, {
+  const res = await fetch(`${BASE}/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      Id: CUSTOMER_ID,
-      Secret: CUSTOMER_SECRET,
-      Entity: 'customer'
-    })
+    body: JSON.stringify({ Id: CUSTOMER_ID, Secret: CUSTOMER_SECRET, Entity: 'customer' })
   });
-  const raw = await res.text();
-  if (!res.ok) throw new Error(`Customer token failed [${res.status}]: ${raw}`);
-  const data = JSON.parse(raw);
-  return data.Data; // raw base64 token string
-}
-
-// ── Step 2: Get app-level auth token ─────────────────────────
-async function getAppToken() {
-  if (!APP_ID) throw new Error('EXOTEL_APP_ID not set');
-  if (!APP_SECRET) throw new Error('EXOTEL_APP_SECRET not set');
-  
-  const res = await fetch(`${VOIP_BASE}/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      Id: APP_ID,
-      Secret: APP_SECRET,
-      Entity: 'app'
-    })
-  });
-  const raw = await res.text();
-  if (!res.ok) throw new Error(`App token failed [${res.status}]: ${raw}`);
-  const data = JSON.parse(raw);
+  const data = JSON.parse(await res.text());
+  if (!res.ok) throw new Error(`Customer token failed: ${JSON.stringify(data)}`);
   return data.Data;
 }
 
-// ── Install (Bitrix24 sends POST) ─────────────────────────────
+// ── Get app-level token ────────────────────────────────────────
+async function getAppToken() {
+  const res = await fetch(`${BASE}/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ Id: APP_ID, Secret: APP_SECRET, Entity: 'app' })
+  });
+  const data = JSON.parse(await res.text());
+  if (!res.ok) throw new Error(`App token failed: ${JSON.stringify(data)}`);
+  return data.Data;
+}
+
+// ── Bitrix24 install ───────────────────────────────────────────
 app.get('/install',  (req, res) => res.send('<h2>Exotel Dialer Installed!</h2>'));
 app.post('/install', (req, res) => res.send('<h2>Exotel Dialer Installed!</h2>'));
 
-// ── SETUP: Run once to create Application ─────────────────────
-// Visit: https://exotel-websdk.onrender.com/setup
-app.get('/setup', async (req, res) => {
+// ── Health: check all env vars ─────────────────────────────────
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  customer_id_set:     !!CUSTOMER_ID,
+  customer_secret_set: !!CUSTOMER_SECRET,
+  app_id_set:          !!APP_ID,
+  app_secret_set:      !!APP_SECRET,
+  api_key_set:         !!API_KEY,
+  api_token_set:       !!API_TOKEN,
+  domain:              DOMAIN,
+  app_id_value:        APP_ID || 'NOT SET'
+}));
+
+// ── Debug: test customer token ─────────────────────────────────
+app.get('/debug', async (req, res) => {
   try {
-    const customerToken = await getCustomerToken();
-
-    // ── First CHECK if app already exists ──
-    const checkRes = await fetch(`${VOIP_BASE}/app?entity=customer`, {
-      headers: { 'Authorization': customerToken }
-    });
-    const checkRaw = await checkRes.text();
-    const checkData = JSON.parse(checkRaw);
-
-    // If apps already exist, return the first one — don't create new
-    if (checkData.Data && checkData.Data.length > 0) {
-      const existing = checkData.Data[0];
-      return res.json({
-        success: true,
-        message: '✅ App already exists — use this AppID (do NOT run setup again)',
-        AppID: existing.AppID,
-        AppName: existing.AppName,
-        warning: 'If EXOTEL_APP_ID and EXOTEL_APP_SECRET are already set in Render, you are good to go.'
-      });
-    }
-
-    // ── Only create if no app exists ──
-    const appRes = await fetch(`${VOIP_BASE}/app`, {
-      method: 'POST',
-      headers: {
-        'Authorization': customerToken,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        AppName: 'BitrixDialer',
-        ExotelAccountSid: ACCOUNT_SID,
-        ExotelApiKey: API_KEY,
-        ExotelApiToken: API_TOKEN,
-        ExotelDomain: EXOTEL_DOMAIN,
-        IsActive: true
-      })
-    });
-
-    const raw = await appRes.text();
-    if (!appRes.ok) throw new Error(`Create app failed [${appRes.status}]: ${raw}`);
-    const appData = JSON.parse(raw);
-
-    res.json({
-      success: true,
-      message: '✅ App created! Copy AppID and AppSecret into Render env vars NOW.',
-      AppID: appData.Data.AppID,
-      AppSecret: appData.Data.AppSecret
-    });
-
+    const token = await getCustomerToken();
+    res.json({ success: true, message: '✅ Customer token OK', preview: token.substring(0, 30) + '...' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── CREATE USER: POST /create-user ────────────────────────────
+// ── Debug app token ────────────────────────────────────────────
+app.get('/debug-app', async (req, res) => {
+  try {
+    const token = await getAppToken();
+    res.json({ success: true, message: '✅ App token OK', preview: token.substring(0, 30) + '...' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Setup: view current app in Exotel ─────────────────────────
+app.get('/setup', async (req, res) => {
+  try {
+    const customerToken = await getCustomerToken();
+    const r = await fetch(`${BASE}/app?entity=customer`, {
+      headers: { 'Authorization': customerToken }
+    });
+    const data = JSON.parse(await r.text());
+    const apps = data.Data || [];
+    res.json({
+      total_apps: apps.length,
+      EXOTEL_APP_ID_in_env: APP_ID || 'NOT SET',
+      apps: apps.map(a => ({
+        AppID: a.AppID,
+        AppName: a.AppName,
+        IsActive: a.IsActive,
+        matched_with_env: a.AppID === APP_ID ? '✅ MATCH' : '❌ MISMATCH'
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Create user (agent) ────────────────────────────────────────
+// POST /create-user
 // body: { appUserId, appUsername, email, agentNumber, virtualNumber }
 app.post('/create-user', async (req, res) => {
   try {
     const { appUserId, appUsername, email, agentNumber, virtualNumber } = req.body;
-    if (!appUserId || !appUsername || !email || !virtualNumber) {
-      return res.status(400).json({ error: 'appUserId, appUsername, email, virtualNumber are required' });
-    }
+    if (!appUserId || !appUsername || !email || !virtualNumber)
+      return res.status(400).json({ error: 'appUserId, appUsername, email, virtualNumber are all required' });
 
     const appToken = await getAppToken();
-
-    const userRes = await fetch(`${VOIP_BASE}/usermapping`, {
+    const r = await fetch(`${BASE}/usermapping`, {
       method: 'POST',
-      headers: {
-        'Authorization': appToken,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': appToken, 'Content-Type': 'application/json' },
       body: JSON.stringify([{
-        AppUserId: appUserId,
-        AppUsername: appUsername,
-        Email: email,
+        AppUserId:        appUserId,
+        AppUsername:      appUsername,
+        Email:            email,
         ExotelAccountSid: ACCOUNT_SID,
-        ExotelUserName: appUsername,
-        AgentNumber: agentNumber || '',
-        VirtualNumber: virtualNumber
+        ExotelUserName:   appUsername,
+        AgentNumber:      agentNumber || '',
+        VirtualNumber:    virtualNumber
       }])
     });
-
-    const raw = await userRes.text();
-    if (!userRes.ok) throw new Error(`Create user failed [${userRes.status}]: ${raw}`);
-    res.json(JSON.parse(raw));
+    const data = JSON.parse(await r.text());
+    if (!r.ok) throw new Error(`Create user failed [${r.status}]: ${JSON.stringify(data)}`);
+    res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── TOKEN: popup.js calls this for WebRTC token ───────────────
-app.get('/token', async (req, res) => {
+// ── List all users ─────────────────────────────────────────────
+app.get('/list-users', async (req, res) => {
   try {
-    const userId = req.query.user_id;
-    if (!userId) return res.status(400).json({ error: 'user_id query param required' });
-
     const appToken = await getAppToken();
-
-    // Get user details — SipId and SipSecret are what WebRTC SDK needs
-    const userRes = await fetch(`${VOIP_BASE}/usermapping?user_id=${encodeURIComponent(userId)}`, {
+    const r = await fetch(`${BASE}/usermapping`, {
       headers: { 'Authorization': appToken }
-    });
-
-    const raw = await userRes.text();
-    if (!userRes.ok) throw new Error(`Get user failed [${userRes.status}]: ${raw}`);
-    const userData = JSON.parse(raw);
-
-    res.json({
-      sip_id: userData.Data.SipId,
-      sip_secret: userData.Data.SipSecret,
-      app_token: appToken,
-      user: userData.Data
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── DEBUG: Test token generation only ─────────────────────────
-app.get('/debug', async (req, res) => {
-  try {
-    const customerToken = await getCustomerToken();
-    res.json({
-      success: true,
-      message: '✅ Customer token generated successfully!',
-      token_preview: customerToken.substring(0, 20) + '...',
-      next_step: 'Now visit /setup to create your Application'
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/list-apps', async (req, res) => {
-  try {
-    const customerToken = await getCustomerToken();
-    const r = await fetch(`${VOIP_BASE}/app?entity=customer`, {
-      headers: { 'Authorization': customerToken }
     });
     const data = JSON.parse(await r.text());
     res.json(data);
@@ -209,160 +147,95 @@ app.get('/list-apps', async (req, res) => {
   }
 });
 
-// ── DELETE a specific app by ID ───────────────────────────────
-// Visit: /delete-app?appId=YOUR_APP_ID
-app.get('/delete-app', async (req, res) => {
+// ── Get single user by ID ──────────────────────────────────────
+app.get('/get-user', async (req, res) => {
   try {
-    const { appId } = req.query;
-    if (!appId) return res.status(400).json({ error: 'appId query param required' });
-
-    // Need app-level token to delete — but we may not have secret
-    // So use customer token instead
-    const customerToken = await getCustomerToken();
-
-    const delRes = await fetch(`${VOIP_BASE}/app`, {
-      method: 'DELETE',
-      headers: { 'Authorization': customerToken }
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'user_id query param required' });
+    const appToken = await getAppToken();
+    const r = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(user_id)}`, {
+      headers: { 'Authorization': appToken }
     });
-    const raw = await delRes.text();
-    res.json({ status: delRes.status, body: JSON.parse(raw) });
+    const data = JSON.parse(await r.text());
+    if (!r.ok) throw new Error(`Get user failed [${r.status}]: ${JSON.stringify(data)}`);
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── RESET: Delete all apps and create fresh one ───────────────
-// Visit ONCE: /reset-app  — this gives you AppID + AppSecret
-app.get('/reset-app', async (req, res) => {
+// ── Token endpoint: popup.js calls this ───────────────────────
+// Returns app_token + SIP credentials for WebRTC SDK
+app.get('/token', async (req, res) => {
   try {
-    const customerToken = await getCustomerToken();
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: 'user_id query param required' });
 
-    // Step 1: Get all existing apps
-    const listRes = await fetch(`${VOIP_BASE}/app?entity=customer`, {
-      headers: { 'Authorization': customerToken }
+    const appToken = await getAppToken();
+    const r = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(user_id)}`, {
+      headers: { 'Authorization': appToken }
     });
-    const listData = JSON.parse(await listRes.text());
-    const existingApps = listData.Data || [];
-
-    // Step 2: Delete each one
-    const deleteResults = [];
-    for (const existingApp of existingApps) {
-      // Get app token using... we can't without secret
-      // So delete via customer token directly
-      const delRes = await fetch(`${VOIP_BASE}/app`, {
-        method: 'DELETE',
-        headers: { 'Authorization': customerToken }
-      });
-      const delRaw = await delRes.text();
-      deleteResults.push({
-        appId: existingApp.AppID,
-        deleteStatus: delRes.status,
-        response: delRaw
-      });
-    }
-
-    // Step 3: Create fresh app
-    const appRes = await fetch(`${VOIP_BASE}/app`, {
-      method: 'POST',
-      headers: {
-        'Authorization': customerToken,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        AppName: 'BitrixDialer',
-        ExotelAccountSid: ACCOUNT_SID,
-        ExotelApiKey: API_KEY,
-        ExotelApiToken: API_TOKEN,
-        ExotelDomain: EXOTEL_DOMAIN,
-        IsActive: true
-      })
-    });
-
-    const raw = await appRes.text();
-    if (!appRes.ok) throw new Error(`Create app failed [${appRes.status}]: ${raw}`);
-    const appData = JSON.parse(raw);
+    const data = JSON.parse(await r.text());
+    if (!r.ok) throw new Error(`Get user failed [${r.status}]: ${JSON.stringify(data)}`);
 
     res.json({
-      success: true,
-      deleted: deleteResults,
-      message: '✅ Fresh app created! Copy BOTH values below into Render env vars NOW',
-      EXOTEL_APP_ID: appData.Data.AppID,
-      EXOTEL_APP_SECRET: appData.Data.AppSecret,
-      full: appData.Data
+      success:    true,
+      app_token:  appToken,
+      sip_id:     data.Data.SipId,
+      sip_secret: data.Data.SipSecret,
+      user:       data.Data
     });
-
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── UPDATE /setup to also show secret hint ────────────────────
-// Replace your existing /setup with this:
-app.get('/setup', async (req, res) => {
+// ── Set app settings (popup URL, callback URL etc) ─────────────
+// POST /app-setting
+// body: { key: "popup", value: "https://your-url.com" }
+app.post('/app-setting', async (req, res) => {
   try {
-    const customerToken = await getCustomerToken();
-
-    const checkRes = await fetch(`${VOIP_BASE}/app?entity=customer`, {
-      headers: { 'Authorization': customerToken }
-    });
-    const checkData = JSON.parse(await checkRes.text());
-
-    if (checkData.Data && checkData.Data.length > 0) {
-      const existing = checkData.Data[0];
-      return res.json({
-        success: true,
-        message: '⚠️ App already exists. AppSecret cannot be retrieved again.',
-        instruction: 'If you dont have AppSecret, visit /reset-app to delete and recreate with fresh credentials',
-        AppID: existing.AppID,
-        AppName: existing.AppName,
-        total_apps_found: checkData.Data.length,
-        all_app_ids: checkData.Data.map(a => a.AppID)
-      });
-    }
-
-    // Create new if none exists
-    const appRes = await fetch(`${VOIP_BASE}/app`, {
+    const { key, value } = req.body;
+    if (!key || !value) return res.status(400).json({ error: 'key and value required' });
+    const appToken = await getAppToken();
+    const r = await fetch(`${BASE}/app_setting`, {
       method: 'POST',
-      headers: {
-        'Authorization': customerToken,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        AppName: 'BitrixDialer',
-        ExotelAccountSid: ACCOUNT_SID,
-        ExotelApiKey: API_KEY,
-        ExotelApiToken: API_TOKEN,
-        ExotelDomain: EXOTEL_DOMAIN,
-        IsActive: true
-      })
+      headers: { 'Authorization': appToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Key: key, Value: value })
     });
-
-    const raw = await appRes.text();
-    if (!appRes.ok) throw new Error(`Create app failed [${appRes.status}]: ${raw}`);
-    const appData = JSON.parse(raw);
-
-    res.json({
-      success: true,
-      message: '✅ App created! Save these NOW — AppSecret will never be shown again!',
-      EXOTEL_APP_ID: appData.Data.AppID,
-      EXOTEL_APP_SECRET: appData.Data.AppSecret
-    });
-
+    const data = JSON.parse(await r.text());
+    if (!r.ok) throw new Error(`App setting failed [${r.status}]: ${JSON.stringify(data)}`);
+    res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── HEALTH ────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({
-  status: 'ok',
-  app_id_set: !!APP_ID,
-  app_secret_set: !!process.env.EXOTEL_APP_SECRET,
-  api_key_set: !!API_KEY,
-  api_token_set: !!API_TOKEN,
-  customer_id_set: !!CUSTOMER_ID,
-  domain: EXOTEL_DOMAIN
-}));
+// ── Get all app settings ───────────────────────────────────────
+app.get('/app-settings', async (req, res) => {
+  try {
+    const appToken = await getAppToken();
+    const r = await fetch(`${BASE}/app_setting`, {
+      headers: { 'Authorization': appToken }
+    });
+    const data = JSON.parse(await r.text());
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Inbound call webhook (Exotel hits this) ────────────────────
+app.post('/incoming-call', (req, res) => {
+  console.log('📞 Incoming call:', JSON.stringify(req.body, null, 2));
+  res.json({ status: 'received' });
+});
+
+// ── Outbound call callback webhook ────────────────────────────
+app.post('/call-callback', (req, res) => {
+  console.log('📤 Call callback:', JSON.stringify(req.body, null, 2));
+  res.json({ status: 'received' });
+});
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
