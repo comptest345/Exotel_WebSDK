@@ -38,7 +38,8 @@ async function getAppToken() {
   });
   const data = JSON.parse(await res.text());
   if (!res.ok) throw new Error(`App token failed: ${JSON.stringify(data)}`);
-  return data.Data;
+  // Return with Bearer prefix
+  return `Bearer ${data.Data}`;
 }
 
 // ── Bitrix24 install ───────────────────────────────────────────
