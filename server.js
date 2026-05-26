@@ -133,6 +133,42 @@ app.get('/token', async (req, res) => {
   }
 });
 
+// ─── DEBUG: Test each step individually ────────────────────────
+app.get('/debug', async (req, res) => {
+  const results = {};
+
+  // Test 1: Can we reach the auth endpoint at all?
+  const endpointsToTry = [
+    'https://integrationscore.mum1.exotel.com/v1/oauth/token',
+    'https://integrationscore.sin1.exotel.com/v1/oauth/token',  // Singapore
+    'https://integrationscore.exotel.com/v1/oauth/token',        // Generic
+  ];
+
+  for (const url of endpointsToTry) {
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: process.env.EXOTEL_CUSTOMER_ID,
+          client_secret: process.env.EXOTEL_CUSTOMER_SECRET,
+          grant_type: 'client_credentials'
+        })
+      });
+      const raw = await r.text();
+      results[url] = {
+        status: r.status,
+        contentType: r.headers.get('content-type'),
+        body: raw.substring(0, 300)   // first 300 chars to see what's returned
+      };
+    } catch (err) {
+      results[url] = { error: err.message };
+    }
+  }
+
+  res.json(results);
+});
+
 // ─── HEALTH ────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', appId: EXOTEL_APP_ID || 'NOT SET' }));
 
