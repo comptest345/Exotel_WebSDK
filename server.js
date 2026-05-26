@@ -6,171 +6,182 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── YOUR CREDENTIALS ──────────────────────────────────────────
-// From Exotel API Settings page (your last screenshot)
-const EXOTEL_ACCOUNT_SID  = process.env.EXOTEL_ACCOUNT_SID  || 'jkstar1';
-const EXOTEL_API_KEY      = process.env.EXOTEL_API_KEY      || '97ea4aad8ee9b133db098f2cb6e3f2dc4dfafb02743cd080';
-const EXOTEL_API_TOKEN    = process.env.EXOTEL_API_TOKEN    || 'YOUR_API_TOKEN_FROM_DASHBOARD';
-const EXOTEL_SUBDOMAIN    = process.env.EXOTEL_SUBDOMAIN    || 'api.exotel.com'; // Singapore region
+const VOIP_BASE = 'https://integrationscore.mum1.exotel.com/v2/integrations';
 
-// From Exotel Support (they will give you these)
-const EXOTEL_CLIENT_ID     = process.env.EXOTEL_CLIENT_ID    || 'YOUR_CLIENT_ID_FROM_SUPPORT';
-const EXOTEL_CLIENT_SECRET = process.env.EXOTEL_CLIENT_SECRET || 'YOUR_CLIENT_SECRET_FROM_SUPPORT';
+// ── Your credentials ──────────────────────────────────────────
+const CUSTOMER_ID     = process.env.EXOTEL_CUSTOMER_ID     || '3c8213e0-6e9f-4d8f-81ea-4e78cdc7911f';
+const CUSTOMER_SECRET = process.env.EXOTEL_CUSTOMER_SECRET || '5e858613-9727-41c1-a9f3-02c9b3afd167';
+const ACCOUNT_SID     = process.env.EXOTEL_ACCOUNT_SID     || 'jkstar1';
+const API_KEY         = process.env.EXOTEL_API_KEY         || '';
+const API_TOKEN       = process.env.EXOTEL_API_TOKEN       || '';
+const EXOTEL_DOMAIN   = process.env.EXOTEL_DOMAIN          || 'singapore'; // your account region
+const APP_ID          = process.env.EXOTEL_APP_ID          || '';
 
-// From Image 6 — your already created Customer entity
-const EXOTEL_CUSTOMER_ID     = process.env.EXOTEL_CUSTOMER_ID     || '3c8213e0-6e9f-4d8f-81ea-4e78cdc7911f';
-const EXOTEL_CUSTOMER_SECRET = process.env.EXOTEL_CUSTOMER_SECRET || '5e858613-9727-41c1-a9f3-02c9b3afd167';
-
-// Your Application ID — created in Step 3 below (fill after running /setup)
-const EXOTEL_APP_ID = process.env.EXOTEL_APP_ID || '';
-
-const VOIP_BASE = 'https://integrationscore.mum1.exotel.com';
-
-// ─── STEP 1: Get JWT Auth Token ────────────────────────────────
-async function getAuthToken() {
-  const response = await fetch(`${VOIP_BASE}/v1/oauth/token`, {
+// ── Step 1: Get customer-level auth token ─────────────────────
+async function getCustomerToken() {
+  const res = await fetch(`${VOIP_BASE}/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      client_id: EXOTEL_CUSTOMER_ID,       // 3c8213e0-6e9f-...
-      client_secret: EXOTEL_CUSTOMER_SECRET, // 5e858613-9727-...
-      grant_type: 'client_credentials'
+      Id: CUSTOMER_ID,
+      Secret: CUSTOMER_SECRET,
+      Entity: 'customer'
     })
   });
-  const data = await response.json();
-  if (!response.ok) throw new Error('Auth token failed: ' + JSON.stringify(data));
-  return data.access_token;
+  const raw = await res.text();
+  if (!res.ok) throw new Error(`Customer token failed [${res.status}]: ${raw}`);
+  const data = JSON.parse(raw);
+  return data.Data; // raw base64 token string
 }
 
-// ─── INSTALL (Bitrix24 calls this on app open — must handle POST) 
-app.get('/install', (req, res) => {
-  res.send('<html><body><h2>Exotel Dialer Installed!</h2><p>You can close this window.</p></body></html>');
-});
-app.post('/install', (req, res) => {
-  res.send('<html><body><h2>Exotel Dialer Installed!</h2><p>You can close this window.</p></body></html>');
-});
+// ── Step 2: Get app-level auth token ─────────────────────────
+async function getAppToken() {
+  if (!APP_ID) throw new Error('EXOTEL_APP_ID not set. Run /setup first.');
+  const appSecret = process.env.EXOTEL_APP_SECRET || '';
+  if (!appSecret) throw new Error('EXOTEL_APP_SECRET not set. Run /setup first.');
+  const res = await fetch(`${VOIP_BASE}/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      Id: APP_ID,
+      Secret: appSecret,
+      Entity: 'app'
+    })
+  });
+  const raw = await res.text();
+  if (!res.ok) throw new Error(`App token failed [${res.status}]: ${raw}`);
+  const data = JSON.parse(raw);
+  return data.Data;
+}
 
-// ─── SETUP ROUTE: Run this ONCE to create Application + test user
-// Visit: https://your-app.onrender.com/setup
+// ── Install (Bitrix24 sends POST) ─────────────────────────────
+app.get('/install',  (req, res) => res.send('<h2>Exotel Dialer Installed!</h2>'));
+app.post('/install', (req, res) => res.send('<h2>Exotel Dialer Installed!</h2>'));
+
+// ── SETUP: Run once to create Application ─────────────────────
+// Visit: https://exotel-websdk.onrender.com/setup
 app.get('/setup', async (req, res) => {
   try {
-    const token = await getAuthToken();
-    const results = {};
+    const customerToken = await getCustomerToken();
 
-    // Create Application under your Customer
-    const appRes = await fetch(`${VOIP_BASE}/v1/customers/${EXOTEL_CUSTOMER_ID}/applications`, {
+    const appRes = await fetch(`${VOIP_BASE}/app`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${token}`,
+        'Authorization': customerToken,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         AppName: 'BitrixDialer',
-        AppType: 'crm'
+        ExotelAccountSid: ACCOUNT_SID,
+        ExotelApiKey: API_KEY,
+        ExotelApiToken: API_TOKEN,
+        ExotelDomain: EXOTEL_DOMAIN,
+        IsActive: true
       })
     });
-    const appData = await appRes.json();
-    results.application = appData;
-    results.note = 'Copy the AppID from application.Data.AppID and set it as EXOTEL_APP_ID env var on Render';
 
-    res.json(results);
+    const raw = await appRes.text();
+    if (!appRes.ok) throw new Error(`Create app failed [${appRes.status}]: ${raw}`);
+    const appData = JSON.parse(raw);
+
+    res.json({
+      success: true,
+      message: '✅ Copy AppID and AppSecret below into Render env vars as EXOTEL_APP_ID and EXOTEL_APP_SECRET',
+      AppID: appData.Data.AppID,
+      AppSecret: appData.Data.AppSecret,
+      full: appData.Data
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── CREATE USER: Call this for each agent ─────────────────────
-// POST /create-user  body: { email: "agent@company.com", name: "Agent Name" }
+// ── CREATE USER: POST /create-user ────────────────────────────
+// body: { appUserId, appUsername, email, agentNumber, virtualNumber }
 app.post('/create-user', async (req, res) => {
   try {
-    const { email, name } = req.body;
-    if (!email) return res.status(400).json({ error: 'email is required' });
-    if (!EXOTEL_APP_ID) return res.status(400).json({ error: 'EXOTEL_APP_ID not set. Run /setup first.' });
+    const { appUserId, appUsername, email, agentNumber, virtualNumber } = req.body;
+    if (!appUserId || !appUsername || !email || !virtualNumber) {
+      return res.status(400).json({ error: 'appUserId, appUsername, email, virtualNumber are required' });
+    }
 
-    const token = await getAuthToken();
+    const appToken = await getAppToken();
 
-    const userRes = await fetch(
-      `${VOIP_BASE}/v1/customers/${EXOTEL_CUSTOMER_ID}/applications/${EXOTEL_APP_ID}/users`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          UserID: email,       // Email is used as UserID per Exotel docs
-          DisplayName: name || email
-        })
-      }
-    );
-    const userData = await userRes.json();
-    res.json(userData);
+    const userRes = await fetch(`${VOIP_BASE}/usermapping`, {
+      method: 'POST',
+      headers: {
+        'Authorization': appToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify([{
+        AppUserId: appUserId,
+        AppUsername: appUsername,
+        Email: email,
+        ExotelAccountSid: ACCOUNT_SID,
+        ExotelUserName: appUsername,
+        AgentNumber: agentNumber || '',
+        VirtualNumber: virtualNumber
+      }])
+    });
+
+    const raw = await userRes.text();
+    if (!userRes.ok) throw new Error(`Create user failed [${userRes.status}]: ${raw}`);
+    res.json(JSON.parse(raw));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── TOKEN: popup.js calls this to get WebRTC token ───────────
+// ── TOKEN: popup.js calls this for WebRTC token ───────────────
 app.get('/token', async (req, res) => {
   try {
-    const userId = req.query.user_id || 'default_agent';
-    if (!EXOTEL_APP_ID) return res.status(400).json({ error: 'EXOTEL_APP_ID not set. Run /setup first.' });
+    const userId = req.query.user_id;
+    if (!userId) return res.status(400).json({ error: 'user_id query param required' });
 
-    const token = await getAuthToken();
+    const appToken = await getAppToken();
 
-    const tokenRes = await fetch(
-      `${VOIP_BASE}/v1/customers/${EXOTEL_CUSTOMER_ID}/applications/${EXOTEL_APP_ID}/users/${encodeURIComponent(userId)}/token`,
-      {
-        method: 'GET',
-        headers: { 'Authorization': `Bearer ${token}` }
-      }
-    );
-    const tokenData = await tokenRes.json();
-    if (!tokenRes.ok) throw new Error(JSON.stringify(tokenData));
-    res.json(tokenData);
+    // Get user details — SipId and SipSecret are what WebRTC SDK needs
+    const userRes = await fetch(`${VOIP_BASE}/usermapping?user_id=${encodeURIComponent(userId)}`, {
+      headers: { 'Authorization': appToken }
+    });
+
+    const raw = await userRes.text();
+    if (!userRes.ok) throw new Error(`Get user failed [${userRes.status}]: ${raw}`);
+    const userData = JSON.parse(raw);
+
+    res.json({
+      sip_id: userData.Data.SipId,
+      sip_secret: userData.Data.SipSecret,
+      app_token: appToken,
+      user: userData.Data
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── DEBUG: Test each step individually ────────────────────────
+// ── DEBUG: Test token generation only ─────────────────────────
 app.get('/debug', async (req, res) => {
-  const results = {};
-
-  // Test 1: Can we reach the auth endpoint at all?
-  const endpointsToTry = [
-    'https://integrationscore.mum1.exotel.com/v1/oauth/token',
-    'https://integrationscore.sin1.exotel.com/v1/oauth/token',  // Singapore
-    'https://integrationscore.exotel.com/v1/oauth/token',        // Generic
-  ];
-
-  for (const url of endpointsToTry) {
-    try {
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_id: process.env.EXOTEL_CUSTOMER_ID,
-          client_secret: process.env.EXOTEL_CUSTOMER_SECRET,
-          grant_type: 'client_credentials'
-        })
-      });
-      const raw = await r.text();
-      results[url] = {
-        status: r.status,
-        contentType: r.headers.get('content-type'),
-        body: raw.substring(0, 300)   // first 300 chars to see what's returned
-      };
-    } catch (err) {
-      results[url] = { error: err.message };
-    }
+  try {
+    const customerToken = await getCustomerToken();
+    res.json({
+      success: true,
+      message: '✅ Customer token generated successfully!',
+      token_preview: customerToken.substring(0, 20) + '...',
+      next_step: 'Now visit /setup to create your Application'
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-
-  res.json(results);
 });
 
-// ─── HEALTH ────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok', appId: EXOTEL_APP_ID || 'NOT SET' }));
+// ── HEALTH ────────────────────────────────────────────────────
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  app_id_set: !!APP_ID,
+  api_key_set: !!API_KEY,
+  api_token_set: !!API_TOKEN
+}));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
