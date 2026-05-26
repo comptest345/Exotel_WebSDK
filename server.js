@@ -209,6 +209,150 @@ app.get('/list-apps', async (req, res) => {
   }
 });
 
+// ── DELETE a specific app by ID ───────────────────────────────
+// Visit: /delete-app?appId=YOUR_APP_ID
+app.get('/delete-app', async (req, res) => {
+  try {
+    const { appId } = req.query;
+    if (!appId) return res.status(400).json({ error: 'appId query param required' });
+
+    // Need app-level token to delete — but we may not have secret
+    // So use customer token instead
+    const customerToken = await getCustomerToken();
+
+    const delRes = await fetch(`${VOIP_BASE}/app`, {
+      method: 'DELETE',
+      headers: { 'Authorization': customerToken }
+    });
+    const raw = await delRes.text();
+    res.json({ status: delRes.status, body: JSON.parse(raw) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── RESET: Delete all apps and create fresh one ───────────────
+// Visit ONCE: /reset-app  — this gives you AppID + AppSecret
+app.get('/reset-app', async (req, res) => {
+  try {
+    const customerToken = await getCustomerToken();
+
+    // Step 1: Get all existing apps
+    const listRes = await fetch(`${VOIP_BASE}/app?entity=customer`, {
+      headers: { 'Authorization': customerToken }
+    });
+    const listData = JSON.parse(await listRes.text());
+    const existingApps = listData.Data || [];
+
+    // Step 2: Delete each one
+    const deleteResults = [];
+    for (const existingApp of existingApps) {
+      // Get app token using... we can't without secret
+      // So delete via customer token directly
+      const delRes = await fetch(`${VOIP_BASE}/app`, {
+        method: 'DELETE',
+        headers: { 'Authorization': customerToken }
+      });
+      const delRaw = await delRes.text();
+      deleteResults.push({
+        appId: existingApp.AppID,
+        deleteStatus: delRes.status,
+        response: delRaw
+      });
+    }
+
+    // Step 3: Create fresh app
+    const appRes = await fetch(`${VOIP_BASE}/app`, {
+      method: 'POST',
+      headers: {
+        'Authorization': customerToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        AppName: 'BitrixDialer',
+        ExotelAccountSid: ACCOUNT_SID,
+        ExotelApiKey: API_KEY,
+        ExotelApiToken: API_TOKEN,
+        ExotelDomain: EXOTEL_DOMAIN,
+        IsActive: true
+      })
+    });
+
+    const raw = await appRes.text();
+    if (!appRes.ok) throw new Error(`Create app failed [${appRes.status}]: ${raw}`);
+    const appData = JSON.parse(raw);
+
+    res.json({
+      success: true,
+      deleted: deleteResults,
+      message: '✅ Fresh app created! Copy BOTH values below into Render env vars NOW',
+      EXOTEL_APP_ID: appData.Data.AppID,
+      EXOTEL_APP_SECRET: appData.Data.AppSecret,
+      full: appData.Data
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── UPDATE /setup to also show secret hint ────────────────────
+// Replace your existing /setup with this:
+app.get('/setup', async (req, res) => {
+  try {
+    const customerToken = await getCustomerToken();
+
+    const checkRes = await fetch(`${VOIP_BASE}/app?entity=customer`, {
+      headers: { 'Authorization': customerToken }
+    });
+    const checkData = JSON.parse(await checkRes.text());
+
+    if (checkData.Data && checkData.Data.length > 0) {
+      const existing = checkData.Data[0];
+      return res.json({
+        success: true,
+        message: '⚠️ App already exists. AppSecret cannot be retrieved again.',
+        instruction: 'If you dont have AppSecret, visit /reset-app to delete and recreate with fresh credentials',
+        AppID: existing.AppID,
+        AppName: existing.AppName,
+        total_apps_found: checkData.Data.length,
+        all_app_ids: checkData.Data.map(a => a.AppID)
+      });
+    }
+
+    // Create new if none exists
+    const appRes = await fetch(`${VOIP_BASE}/app`, {
+      method: 'POST',
+      headers: {
+        'Authorization': customerToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        AppName: 'BitrixDialer',
+        ExotelAccountSid: ACCOUNT_SID,
+        ExotelApiKey: API_KEY,
+        ExotelApiToken: API_TOKEN,
+        ExotelDomain: EXOTEL_DOMAIN,
+        IsActive: true
+      })
+    });
+
+    const raw = await appRes.text();
+    if (!appRes.ok) throw new Error(`Create app failed [${appRes.status}]: ${raw}`);
+    const appData = JSON.parse(raw);
+
+    res.json({
+      success: true,
+      message: '✅ App created! Save these NOW — AppSecret will never be shown again!',
+      EXOTEL_APP_ID: appData.Data.AppID,
+      EXOTEL_APP_SECRET: appData.Data.AppSecret
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── HEALTH ────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
   status: 'ok',
