@@ -16,6 +16,7 @@ const API_KEY         = process.env.EXOTEL_API_KEY         || '';
 const API_TOKEN       = process.env.EXOTEL_API_TOKEN       || '';
 const EXOTEL_DOMAIN   = process.env.EXOTEL_DOMAIN          || 'singapore'; // your account region
 const APP_ID          = process.env.EXOTEL_APP_ID          || '';
+const APP_SECRET = process.env.EXOTEL_APP_SECRET || '';
 
 // ── Step 1: Get customer-level auth token ─────────────────────
 async function getCustomerToken() {
@@ -36,15 +37,15 @@ async function getCustomerToken() {
 
 // ── Step 2: Get app-level auth token ─────────────────────────
 async function getAppToken() {
-  if (!APP_ID) throw new Error('EXOTEL_APP_ID not set. Run /setup first.');
-  const appSecret = process.env.EXOTEL_APP_SECRET || '';
-  if (!appSecret) throw new Error('EXOTEL_APP_SECRET not set. Run /setup first.');
+  if (!APP_ID) throw new Error('EXOTEL_APP_ID not set');
+  if (!APP_SECRET) throw new Error('EXOTEL_APP_SECRET not set');
+  
   const res = await fetch(`${VOIP_BASE}/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       Id: APP_ID,
-      Secret: appSecret,
+      Secret: APP_SECRET,
       Entity: 'app'
     })
   });
@@ -212,8 +213,11 @@ app.get('/list-apps', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   app_id_set: !!APP_ID,
+  app_secret_set: !!process.env.EXOTEL_APP_SECRET,
   api_key_set: !!API_KEY,
-  api_token_set: !!API_TOKEN
+  api_token_set: !!API_TOKEN,
+  customer_id_set: !!CUSTOMER_ID,
+  domain: EXOTEL_DOMAIN
 }));
 
 const PORT = process.env.PORT || 3000;
