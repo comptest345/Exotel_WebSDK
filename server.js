@@ -64,6 +64,26 @@ app.get('/setup', async (req, res) => {
   try {
     const customerToken = await getCustomerToken();
 
+    // ── First CHECK if app already exists ──
+    const checkRes = await fetch(`${VOIP_BASE}/app?entity=customer`, {
+      headers: { 'Authorization': customerToken }
+    });
+    const checkRaw = await checkRes.text();
+    const checkData = JSON.parse(checkRaw);
+
+    // If apps already exist, return the first one — don't create new
+    if (checkData.Data && checkData.Data.length > 0) {
+      const existing = checkData.Data[0];
+      return res.json({
+        success: true,
+        message: '✅ App already exists — use this AppID (do NOT run setup again)',
+        AppID: existing.AppID,
+        AppName: existing.AppName,
+        warning: 'If EXOTEL_APP_ID and EXOTEL_APP_SECRET are already set in Render, you are good to go.'
+      });
+    }
+
+    // ── Only create if no app exists ──
     const appRes = await fetch(`${VOIP_BASE}/app`, {
       method: 'POST',
       headers: {
@@ -86,11 +106,11 @@ app.get('/setup', async (req, res) => {
 
     res.json({
       success: true,
-      message: '✅ Copy AppID and AppSecret below into Render env vars as EXOTEL_APP_ID and EXOTEL_APP_SECRET',
+      message: '✅ App created! Copy AppID and AppSecret into Render env vars NOW.',
       AppID: appData.Data.AppID,
-      AppSecret: appData.Data.AppSecret,
-      full: appData.Data
+      AppSecret: appData.Data.AppSecret
     });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -170,6 +190,19 @@ app.get('/debug', async (req, res) => {
       token_preview: customerToken.substring(0, 20) + '...',
       next_step: 'Now visit /setup to create your Application'
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/list-apps', async (req, res) => {
+  try {
+    const customerToken = await getCustomerToken();
+    const r = await fetch(`${VOIP_BASE}/app?entity=customer`, {
+      headers: { 'Authorization': customerToken }
+    });
+    const data = JSON.parse(await r.text());
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
