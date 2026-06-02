@@ -17,17 +17,6 @@ const DOMAIN          = process.env.EXOTEL_DOMAIN || 'mumbai';
 const APP_ID          = process.env.EXOTEL_APP_ID;
 const APP_SECRET      = process.env.EXOTEL_APP_SECRET;
 
-async function getCustomerToken() {
-  const res = await fetch(`${BASE}/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ Id: CUSTOMER_ID, Secret: CUSTOMER_SECRET, Entity: 'customer' })
-  });
-  const data = JSON.parse(await res.text());
-  if (!res.ok) throw new Error(`Customer token failed: ${JSON.stringify(data)}`);
-  return data.Data;
-}
-
 async function getAppToken() {
   const res = await fetch(`${BASE}/token`, {
     method: 'POST',
@@ -36,7 +25,18 @@ async function getAppToken() {
   });
   const data = JSON.parse(await res.text());
   if (!res.ok) throw new Error(`App token failed: ${JSON.stringify(data)}`);
-  return data.Data;
+  return data.Data; // raw token — NO Bearer prefix
+}
+
+async function getCustomerToken() {
+  const res = await fetch(`${BASE}/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ Id: CUSTOMER_ID, Secret: CUSTOMER_SECRET, Entity: 'customer' })
+  });
+  const data = JSON.parse(await res.text());
+  if (!res.ok) throw new Error(`Customer token failed: ${JSON.stringify(data)}`);
+  return data.Data; // raw token — NO Bearer prefix
 }
 
 // ── Bitrix24 install ───────────────────────────────────────────
