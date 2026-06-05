@@ -5,38 +5,175 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Exotel Dialer</title>
   <style>
-    body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
-    .dialer { background: white; border-radius: 8px; padding: 20px; max-width: 320px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-    input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 16px; }
-    button { width: 100%; padding: 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 15px; margin-top: 6px; }
-    #callBtn  { background: #4CAF50; color: white; }
-    #hangupBtn { background: #f44336; color: white; display: none; }
-    #status { margin-top: 12px; font-size: 13px; color: #555; min-height: 20px; }
-    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #ccc; margin-right: 6px; }
-    .dot.green { background: #4CAF50; }
-    .dot.red   { background: #f44336; }
-    .dot.yellow { background: #FFC107; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; background: #f0f2f5; min-height: 100vh; display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
+
+    .dialer {
+      background: white;
+      border-radius: 12px;
+      padding: 20px;
+      width: 100%;
+      max-width: 340px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 12px;
+    }
+
+    .header h3 { font-size: 16px; color: #333; }
+
+    .reg-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #666;
+      margin-bottom: 16px;
+    }
+
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #ccc;
+      flex-shrink: 0;
+    }
+    .dot.green  { background: #4CAF50; }
+    .dot.red    { background: #f44336; }
+    .dot.yellow { background: #FFC107; animation: pulse 1s infinite; }
+
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    /* Incoming call panel */
+    #incomingPanel {
+      display: none;
+      background: #fff3e0;
+      border: 2px solid #FF9800;
+      border-radius: 10px;
+      padding: 16px;
+      text-align: center;
+      margin-bottom: 16px;
+      animation: ring 0.5s infinite alternate;
+    }
+    @keyframes ring { from{border-color:#FF9800} to{border-color:#f44336} }
+
+    #incomingPanel .caller { font-size: 18px; font-weight: bold; color: #333; margin: 8px 0; }
+    #incomingPanel .label  { font-size: 12px; color: #888; margin-bottom: 12px; }
+
+    .incoming-btns { display: flex; gap: 10px; }
+    .btn-accept { flex:1; padding:12px; background:#4CAF50; color:white; border:none; border-radius:8px; font-size:15px; cursor:pointer; }
+    .btn-reject { flex:1; padding:12px; background:#f44336; color:white; border:none; border-radius:8px; font-size:15px; cursor:pointer; }
+
+    /* Dialer panel */
+    #dialerPanel { display: block; }
+
+    input[type="tel"] {
+      width: 100%;
+      padding: 12px;
+      margin-bottom: 10px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 16px;
+      outline: none;
+    }
+    input[type="tel"]:focus { border-color: #4CAF50; }
+
+    #callBtn {
+      width: 100%;
+      padding: 12px;
+      background: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    #callBtn:disabled { background: #aaa; cursor: not-allowed; }
+
+    #hangupBtn {
+      width: 100%;
+      padding: 12px;
+      background: #f44336;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      cursor: pointer;
+      margin-top: 8px;
+      display: none;
+    }
+
+    #status {
+      margin-top: 12px;
+      font-size: 12px;
+      color: #666;
+      min-height: 18px;
+      text-align: center;
+    }
+
+    /* Active call panel */
+    #activeCallPanel {
+      display: none;
+      text-align: center;
+      padding: 10px;
+      background: #e8f5e9;
+      border-radius: 8px;
+      margin-bottom: 10px;
+    }
+    #activeCallPanel .call-number { font-size: 16px; font-weight: bold; color: #333; }
+    #activeCallPanel .call-timer  { font-size: 14px; color: #4CAF50; margin-top: 4px; }
   </style>
 </head>
 <body>
   <div class="dialer">
-    <h3>📞 Exotel Dialer</h3>
-    <div id="regStatus"><span class="dot" id="regDot"></span><span id="regText">Initializing...</span></div>
+    <div class="header">
+      <span>📞</span>
+      <h3>Exotel Dialer</h3>
+    </div>
 
-    <input type="tel" id="phone" placeholder="Enter phone number" />
-    <button id="callBtn"   onclick="makeCall()">📞 Call</button>
-    <button id="hangupBtn" onclick="hangUp()">📵 Hang Up</button>
+    <div class="reg-status">
+      <span class="dot yellow" id="regDot"></span>
+      <span id="regText">Initializing...</span>
+    </div>
+
+    <!-- Incoming call panel -->
+    <div id="incomingPanel">
+      <div class="label">📲 Incoming Call</div>
+      <div class="caller" id="callerNumber">Unknown</div>
+      <div class="incoming-btns">
+        <button class="btn-accept" onclick="acceptCall()">✅ Accept</button>
+        <button class="btn-reject" onclick="rejectCall()">❌ Reject</button>
+      </div>
+    </div>
+
+    <!-- Active call panel -->
+    <div id="activeCallPanel">
+      <div class="label">🔴 Call Active</div>
+      <div class="call-number" id="activeNumber"></div>
+      <div class="call-timer" id="callTimer">00:00</div>
+    </div>
+
+    <!-- Dialer panel -->
+    <div id="dialerPanel">
+      <input type="tel" id="phone" placeholder="Enter phone number e.g. 09876543210" />
+      <button id="callBtn" onclick="makeCall()">📞 Call</button>
+      <button id="hangupBtn" onclick="hangUp()">📵 Hang Up</button>
+    </div>
 
     <div id="status"></div>
   </div>
 
-  <!-- Bitrix24 JS API -->
   <script src="//api.bitrix24.com/api/v1/"></script>
-
-  <!-- Exotel WebRTC SDK -->
   <script src="/target/crmBundle.js"></script>
-
-  <!-- App logic -->
   <script src="/popup.js"></script>
 </body>
 </html>
