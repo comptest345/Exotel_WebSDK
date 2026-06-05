@@ -25,7 +25,7 @@ async function init() {
 
   try {
     // Get user_id from Bitrix24 if available
-    let userId = 'khushdxb09@gmail.com'; // default for now
+    let userId = '123'; // default for now
     if (window.BX24) {
       try {
         const profile = await new Promise(r => BX24.callMethod('profile', {}, r));
