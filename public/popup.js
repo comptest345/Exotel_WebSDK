@@ -202,26 +202,16 @@ async function makeCall() {
 
   try {
     setStatus('Calling ' + number + '...');
-    document.getElementById('callBtn').disabled = true;
-
-    await webPhone.MakeCall(number);
-
+    // Correct method name from Exotel SDK
+    await webPhone.call(number);  // try lowercase
     showActiveCall(number);
-    document.getElementById('callBtn').disabled = false;
-
-    // Log outbound call start in Bitrix24
-    if (window.BX24) {
-      BX24.callMethod('telephony.externalcall.show', {
-        USER_PHONE_INNER: currentUserId,
-        USER_ID: BX24.getUser ? BX24.getUser().id : 1,
-        CALL_ID: Date.now().toString(),
-        TYPE: 1  // outbound
-      });
-    }
-
   } catch (err) {
-    setStatus('Call failed: ' + err.message);
-    document.getElementById('callBtn').disabled = false;
+    // If .call() also fails, try this:
+    try {
+      await webPhone.startCall({ to: number });
+    } catch(err2) {
+      setStatus('Call failed: ' + err2.message);
+    }
   }
 }
 
