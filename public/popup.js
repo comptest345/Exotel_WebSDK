@@ -204,17 +204,21 @@ async function makeCall() {
     setStatus('Calling ' + number + '...');
     document.getElementById('callBtn').disabled = true;
 
-    // MakeCall succeeds but throws internal SDK error — ignore it
-    try {
-      await webPhone.MakeCall(number);
-    } catch(sdkErr) {
-      // Check if call actually succeeded despite error
-      console.log('[Dialer] MakeCall internal error (ignoring):', sdkErr.message);
-    }
+    await webPhone.MakeCall(number);
+    document.getElementById('hangupBtn').style.display = 'block';
 
-    // Show active call UI regardless — call was placed successfully
     showActiveCall(number);
     document.getElementById('callBtn').disabled = false;
+
+    // Log outbound call start in Bitrix24
+    if (window.BX24) {
+      BX24.callMethod('telephony.externalcall.show', {
+        USER_PHONE_INNER: currentUserId,
+        USER_ID: BX24.getUser ? BX24.getUser().id : 1,
+        CALL_ID: Date.now().toString(),
+        TYPE: 1  // outbound
+      });
+    }
 
   } catch (err) {
     setStatus('Call failed: ' + err.message);
