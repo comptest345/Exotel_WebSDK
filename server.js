@@ -42,8 +42,64 @@ async function getAppToken() {
 }
 
 // ── Bitrix24 install ───────────────────────────────────────────
-app.get('/install',  (req, res) => res.send('<h2>Exotel Dialer Installed!</h2>'));
-app.post('/install', (req, res) => res.send('<h2>Exotel Dialer Installed!</h2>'));
+app.all('/install', async (req, res) => {
+  console.log('[Install] Called with body:', req.body);
+  console.log('[Install] Called with query:', req.query);
+  try {
+    const authToken = req.body?.AUTH_ID || req.body?.access_token || req.query?.AUTH_ID;
+    const domain = req.body?.DOMAIN || req.query?.DOMAIN || 'gsdny.bitrix24.in';
+    console.log(`[Install] Auth token: ${authToken ? 'present' : 'MISSING'}`);
+    console.log(`[Install] Domain: ${domain}`);
+    if (authToken && domain) {
+      const bindResponse = await fetch(`https://${domain}/rest/placement.bind`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          PLACEMENT: 'PAGE_BACKGROUND_WORKER',
+          HANDLER: 'https://exotel-websdk.onrender.com/background.html',
+          OPTIONS: {
+            errorHandlerUrl: 'https://exotel-websdk.onrender.com/error-handler.html'
+          },
+          TITLE: 'Exotel Background Worker',
+          auth: authToken
+        })
+      });
+      const bindData = await bindResponse.json();
+      console.log('[Install] placement.bind result:', JSON.stringify(bindData));
+      if (bindData.error && bindData.error !== 'ERROR_PLACEMENT_MAX_COUNT') {
+        console.error('[Install] placement.bind failed:', bindData.error);
+      } else {
+        console.log('[Install] ✅ PAGE_BACKGROUND_WORKER registered (or already was)');
+      }
+    } else {
+      console.warn('[Install] No auth token — skipping placement.bind');
+    }
+    res.send(`
+      <html>
+      <head><script src="//api.bitrix24.com/api/v1/"></script></head>
+      <body>
+        <script>
+          BX24.init(function() { BX24.installFinish(); });
+        </script>
+        <p>Exotel Dialer Installed!</p>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error('[Install] ERROR:', err.message);
+    res.send(`
+      <html>
+      <head><script src="//api.bitrix24.com/api/v1/"></script></head>
+      <body>
+        <script>
+          BX24.init(function() { BX24.installFinish(); });
+        </script>
+        <p>Exotel Dialer Installed (with warnings)!</p>
+      </body>
+      </html>
+    `);
+  }
+});
 
 // ── Health ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
@@ -234,52 +290,3 @@ app.post('/call-callback', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
-
-// ── ONE-TIME: Register PAGE_BACKGROUND_WORKER placement ──────
-app.get('/register-background', async (req, res) => {
-  try {
-    const { auth_token, domain } = req.query;
-
-    if (!auth_token || !domain) {
-      return res.status(400).json({
-        error: 'Missing params',
-        usage: '/register-background?auth_token=YOUR_ACCESS_TOKEN&domain=gsdny.bitrix24.in'
-      });
-    }
-
-    const response = await fetch(`https://${domain}/rest/placement.bind`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        PLACEMENT: 'PAGE_BACKGROUND_WORKER',
-        HANDLER: 'https://exotel-websdk.onrender.com/background.html',
-        OPTIONS: {
-          errorHandlerUrl: 'https://exotel-websdk.onrender.com/error-handler.html'
-        },
-        TITLE: 'Exotel Background Worker',
-        auth: auth_token
-      })
-    });
-
-    const data = await response.json();
-
-    if (data.error) {
-      return res.status(400).json({
-        error: data.error,
-        description: data.error_description,
-        note: data.error === 'ERROR_PLACEMENT_MAX_COUNT'
-          ? '⚠️ Already registered! This is fine — it means PAGE_BACKGROUND_WORKER is already active.'
-          : 'Check the error above'
-      });
-    }
-
-    res.json({
-      success: true,
-      message: '✅ PAGE_BACKGROUND_WORKER registered!',
-      result: data.result
-    });
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
