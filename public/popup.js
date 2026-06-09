@@ -96,7 +96,11 @@ async function init() {
     console.log('[Dialer] Got credentials — sip_id:', data.sip_id);
     setStatus('Initializing SDK...');
 
-    const sdk = new ExotelCRMWebSDK(data.app_token, currentUserId, false);
+    // ✅ Fix — pass sip_id and sip_secret
+    const sdk = new ExotelCRMWebSDK(data.app_token, currentUserId, false, {
+      sipId: data.sip_id,
+      sipSecret: data.sip_secret
+    });
 
     webPhone = await sdk.Initialize(
       function callListener(event) {
