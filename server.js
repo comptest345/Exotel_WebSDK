@@ -46,7 +46,7 @@ app.all('/install', async (req, res) => {
   console.log('[Install] Called with body:', req.body);
   console.log('[Install] Called with query:', req.query);
   try {
-    const authToken = req.body?.AUTH_ID || req.body?.access_token || req.query?.AUTH_ID;
+    const authToken = req.body?.AUTH_ID || req.body?.access_token || req.query?.AUTH_ID || req.query?.APP_SID || req.body?.APP_SID;
     const domain = req.body?.DOMAIN || req.query?.DOMAIN || 'gsdny.bitrix24.in';
     console.log(`[Install] Auth token: ${authToken ? 'present' : 'MISSING'}`);
     console.log(`[Install] Domain: ${domain}`);
