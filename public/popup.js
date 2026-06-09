@@ -66,7 +66,23 @@ function startTimer() {
 function stopTimer() {
   if (callTimerInterval) { clearInterval(callTimerInterval); callTimerInterval = null; }
 }
+// Read number pre-filled by background worker (click-to-call)
+if (window.BX24) {
+  const placement = BX24.placement.info();
+  const options = placement?.options;
 
+  if (options?.number) {
+    // Pre-fill dialer and auto-call
+    document.getElementById('phone').value = options.number;
+    // makeCall() will fire after SDK is ready (end of init)
+  }
+
+  if (options?.incomingFrom) {
+    // Background worker detected inbound call — show incoming panel
+    document.getElementById('callerNumber').textContent = options.incomingFrom;
+    document.getElementById('incomingPanel').style.display = 'block';
+  }
+}
 // ── Init ───────────────────────────────────────────────────────
 async function init() {
   setReg('connecting');
@@ -95,6 +111,12 @@ async function init() {
 
     console.log('[Dialer] Got credentials — sip_id:', data.sip_id);
     setStatus('Initializing SDK...');
+
+    // Auto-dial if number was passed from background worker
+if (window.BX24) {
+  const options = BX24.placement.info()?.options;
+  if (options?.number) makeCall();
+}
 
     // ✅ Fix — pass sip_id and sip_secret
     const sdk = new ExotelCRMWebSDK(data.app_token, currentUserId, false, {
