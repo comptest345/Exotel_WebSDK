@@ -234,3 +234,52 @@ app.post('/call-callback', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+
+// ── ONE-TIME: Register PAGE_BACKGROUND_WORKER placement ──────
+app.get('/register-background', async (req, res) => {
+  try {
+    const { auth_token, domain } = req.query;
+
+    if (!auth_token || !domain) {
+      return res.status(400).json({
+        error: 'Missing params',
+        usage: '/register-background?auth_token=YOUR_ACCESS_TOKEN&domain=gsdny.bitrix24.in'
+      });
+    }
+
+    const response = await fetch(`https://${domain}/rest/placement.bind`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        PLACEMENT: 'PAGE_BACKGROUND_WORKER',
+        HANDLER: 'https://exotel-websdk.onrender.com/background.html',
+        OPTIONS: {
+          errorHandlerUrl: 'https://exotel-websdk.onrender.com/error-handler.html'
+        },
+        TITLE: 'Exotel Background Worker',
+        auth: auth_token
+      })
+    });
+
+    const data = await response.json();
+
+    if (data.error) {
+      return res.status(400).json({
+        error: data.error,
+        description: data.error_description,
+        note: data.error === 'ERROR_PLACEMENT_MAX_COUNT'
+          ? '⚠️ Already registered! This is fine — it means PAGE_BACKGROUND_WORKER is already active.'
+          : 'Check the error above'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: '✅ PAGE_BACKGROUND_WORKER registered!',
+      result: data.result
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
