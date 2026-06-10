@@ -4,7 +4,7 @@ const path = require('path');
 
 const app = express();
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.urlencoded({ extended: true }));
 
 const BASE = 'https://integrationscore.mum1.exotel.com/v2/integrations';
 
@@ -17,7 +17,6 @@ const DOMAIN          = process.env.EXOTEL_DOMAIN || 'singapore';
 const APP_ID          = process.env.EXOTEL_APP_ID;
 const APP_SECRET      = process.env.EXOTEL_APP_SECRET;
 
-// ── One-time: Customer token ───────────────────────────────────
 async function getCustomerToken() {
   const res = await fetch(`${BASE}/token`, {
     method: 'POST',
@@ -29,7 +28,6 @@ async function getCustomerToken() {
   return data.Data;
 }
 
-// ── Runtime: App token (called every time agent opens dialer) ──
 async function getAppToken() {
   const res = await fetch(`${BASE}/token`, {
     method: 'POST',
@@ -41,67 +39,45 @@ async function getAppToken() {
   return data.Data;
 }
 
-// ── Bitrix24 install ───────────────────────────────────────────
-// For local apps, placement.bind must be called CLIENT-SIDE using
-// BX24.getAuth() which provides a valid OAuth access_token.
-// APP_SID from query params is NOT an OAuth token and cannot be
-// used directly with REST methods.
+// ── FIX: Bitrix24 sends POST to handler path — must handle it ──
+app.all('/popup.html', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'popup.html'));
+});
+app.all('/background.html', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'background.html'));
+});
+
+// ── Install — registers PAGE_BACKGROUND_WORKER client-side ────
 app.all('/install', (req, res) => {
-  console.log('[Install] Called — serving client-side installer');
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="UTF-8">
-      <script src="//api.bitrix24.com/api/v1/"></script>
-    </head>
-    <body>
-      <p id="status">Installing Exotel Dialer...</p>
-      <script>
-        BX24.init(function() {
-          var auth = BX24.getAuth();
-          var accessToken = auth.access_token;
-          var domain = auth.domain;
-
-          console.log('[Install] access_token present:', !!accessToken);
-          console.log('[Install] domain:', domain);
-
-          // Register PAGE_BACKGROUND_WORKER via REST using real OAuth token
-          BX24.callMethod(
-            'placement.bind',
-            {
-              PLACEMENT: 'PAGE_BACKGROUND_WORKER',
-              HANDLER: 'https://exotel-websdk.onrender.com/background.html',
-              OPTIONS: {
-                errorHandlerUrl: 'https://exotel-websdk.onrender.com/error-handler.html'
-              },
-              TITLE: 'Exotel Background Worker'
-            },
-            function(result) {
-              if (result.error()) {
-                var err = result.error();
-                // ERROR_PLACEMENT_MAX_COUNT = already registered = fine
-                if (err.toString().indexOf('ERROR_PLACEMENT_MAX_COUNT') !== -1) {
-                  console.log('[Install] PAGE_BACKGROUND_WORKER already registered — OK');
-                  document.getElementById('status').innerText = 'Exotel Dialer Installed!';
-                } else {
-                  console.error('[Install] placement.bind error:', err);
-                  document.getElementById('status').innerText = 'Installed (placement warning: ' + err + ')';
-                }
-              } else {
-                console.log('[Install] PAGE_BACKGROUND_WORKER registered successfully');
-                document.getElementById('status').innerText = 'Exotel Dialer Installed!';
-              }
-
-              // Always finish installation regardless of placement.bind result
-              BX24.installFinish();
-            }
-          );
-        });
-      </script>
-    </body>
-    </html>
-  `);
+  console.log('[Install] Called');
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <script src="//api.bitrix24.com/api/v1/"></script>
+</head>
+<body>
+  <p id="msg">Installing Exotel Dialer...</p>
+  <script>
+    BX24.init(function() {
+      BX24.callMethod('placement.bind', {
+        PLACEMENT: 'PAGE_BACKGROUND_WORKER',
+        HANDLER: 'https://exotel-websdk.onrender.com/background.html',
+        TITLE: 'Exotel Background Worker'
+      }, function(result) {
+        var err = result.error ? result.error() : null;
+        if (err && err.toString().indexOf('ERROR_PLACEMENT_MAX_COUNT') === -1) {
+          console.warn('[Install] placement.bind warning:', err.toString());
+        } else {
+          console.log('[Install] Background worker registered successfully');
+        }
+        document.getElementById('msg').innerText = 'Exotel Dialer Installed!';
+        BX24.installFinish();
+      });
+    });
+  </script>
+</body>
+</html>`);
 });
 
 // ── Health ─────────────────────────────────────────────────────
@@ -122,9 +98,7 @@ app.get('/debug', async (req, res) => {
   try {
     const token = await getCustomerToken();
     res.json({ success: true, message: '✅ Customer token OK', preview: token.substring(0, 30) + '...' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Debug app token ────────────────────────────────────────────
@@ -132,12 +106,10 @@ app.get('/debug-app', async (req, res) => {
   try {
     const token = await getAppToken();
     res.json({ success: true, message: '✅ App token OK', preview: token.substring(0, 30) + '...' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── ONE-TIME: View all apps under customer ─────────────────────
+// ── Setup: view all apps ───────────────────────────────────────
 app.get('/setup', async (req, res) => {
   try {
     const customerToken = await getCustomerToken();
@@ -157,12 +129,10 @@ app.get('/setup', async (req, res) => {
         matched_with_env: a.AppID === APP_ID ? '✅ MATCH' : '❌ MISMATCH'
       }))
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── ONE-TIME: Create app (only if none exists) ─────────────────
+// ── Create app (one-time only) ─────────────────────────────────
 app.get('/create-app', async (req, res) => {
   try {
     if (APP_ID && APP_SECRET) {
@@ -177,119 +147,89 @@ app.get('/create-app', async (req, res) => {
       method: 'POST',
       headers: { 'Authorization': customerToken, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        AppName:          'BitrixDialer',
-        ExotelAccountSid: ACCOUNT_SID,
-        ExotelApiKey:     API_KEY,
-        ExotelApiToken:   API_TOKEN,
-        ExotelDomain:     DOMAIN,
-        IsActive:         true
+        AppName: 'BitrixDialer', ExotelAccountSid: ACCOUNT_SID,
+        ExotelApiKey: API_KEY, ExotelApiToken: API_TOKEN,
+        ExotelDomain: DOMAIN, IsActive: true
       })
     });
     const data = JSON.parse(await r.text());
     if (!r.ok) throw new Error(`Failed: ${JSON.stringify(data)}`);
     res.json({
-      success:           true,
-      message:           '✅ SAVE THESE NOW — AppSecret is never shown again!',
-      EXOTEL_APP_ID:     data.Data.AppID,
+      success: true,
+      message: '✅ SAVE THESE NOW — AppSecret never shown again!',
+      EXOTEL_APP_ID: data.Data.AppID,
       EXOTEL_APP_SECRET: data.Data.AppSecret
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── ONE-TIME: Create user/agent ────────────────────────────────
+// ── Create user (one-time only) ────────────────────────────────
 app.post('/create-user', async (req, res) => {
   try {
     const { appUserId, appUsername, email, agentNumber, virtualNumber } = req.body;
     if (!appUserId || !appUsername || !email || !virtualNumber)
-      return res.status(400).json({ error: 'appUserId, appUsername, email, virtualNumber are required' });
-
+      return res.status(400).json({ error: 'appUserId, appUsername, email, virtualNumber required' });
     const appToken = await getAppToken();
     const r = await fetch(`${BASE}/usermapping`, {
       method: 'POST',
       headers: { 'Authorization': appToken, 'Content-Type': 'application/json' },
       body: JSON.stringify([{
-        AppUserId:        appUserId,
-        AppUsername:      appUsername,
-        Email:            email,
-        ExotelAccountSid: ACCOUNT_SID,
-        ExotelUserName:   appUsername,
-        AgentNumber:      agentNumber || '',
-        VirtualNumber:    virtualNumber
+        AppUserId: appUserId, AppUsername: appUsername, Email: email,
+        ExotelAccountSid: ACCOUNT_SID, ExotelUserName: appUsername,
+        AgentNumber: agentNumber || '', VirtualNumber: virtualNumber
       }])
     });
     const data = JSON.parse(await r.text());
     if (!r.ok) throw new Error(`Failed [${r.status}]: ${JSON.stringify(data)}`);
     res.json({ success: true, data });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── ONE-TIME: List all users ───────────────────────────────────
+// ── List users ─────────────────────────────────────────────────
 app.get('/list-users', async (req, res) => {
   try {
     const appToken = await getAppToken();
-    const r = await fetch(`${BASE}/usermapping`, {
-      headers: { 'Authorization': appToken }
-    });
+    const r = await fetch(`${BASE}/usermapping`, { headers: { 'Authorization': appToken } });
     const data = JSON.parse(await r.text());
     res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── RUNTIME: Token endpoint — popup.js calls this ──────────────
-// Returns app_token + SIP credentials for WebRTC SDK
-// This is the ONLY endpoint called repeatedly at runtime
+// ── RUNTIME: Token endpoint (called by popup.js every load) ───
 app.get('/token', async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
-
     const appToken = await getAppToken();
     const r = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(user_id)}`, {
       headers: { 'Authorization': appToken }
     });
     const data = JSON.parse(await r.text());
     if (!r.ok) throw new Error(`Failed [${r.status}]: ${JSON.stringify(data)}`);
-
-    // Handle both response formats from Exotel
     let user = null;
-    if (data.Data && data.Data.Users && data.Data.Users.length > 0) {
-      user = data.Data.Users[0]; // paginated format
-    } else if (data.Data && data.Data.SipId) {
-      user = data.Data; // direct format
-    } else {
-      throw new Error('User not found or no SIP credentials');
-    }
-
+    if (data.Data?.Users?.length > 0) user = data.Data.Users[0];
+    else if (data.Data?.SipId) user = data.Data;
+    else throw new Error('User not found or no SIP credentials');
     res.json({
-      success:        true,
-      app_token:      appToken,
-      sip_id:         user.SipId,
-      sip_secret:     user.SipSecret,
-      virtual_number: user.VirtualNumber,
-      user_id:        user.AppUserId
+      success: true, app_token: appToken,
+      sip_id: user.SipId, sip_secret: user.SipSecret,
+      virtual_number: user.VirtualNumber, user_id: user.AppUserId
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Inbound call webhook (Exotel hits this) ────────────────────
+// ── Webhooks ───────────────────────────────────────────────────
 app.post('/incoming-call', (req, res) => {
-  console.log('📞 Incoming call:', JSON.stringify(req.body, null, 2));
+  console.log('📞 Incoming call:', JSON.stringify(req.body));
+  res.json({ status: 'received' });
+});
+app.post('/call-callback', (req, res) => {
+  console.log('📤 Call callback:', JSON.stringify(req.body));
   res.json({ status: 'received' });
 });
 
-// ── Outbound call callback webhook ────────────────────────────
-app.post('/call-callback', (req, res) => {
-  console.log('📤 Call callback:', JSON.stringify(req.body, null, 2));
-  res.json({ status: 'received' });
-});
+// ── Static files (MUST be last) ────────────────────────────────
+app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
