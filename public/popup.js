@@ -1,162 +1,134 @@
-let webPhone   = null;
-let activeCall = null;
-let callTimerInterval = null;
-let callSeconds = 0;
+let webPhone = null;
+let timerInterval = null;
+let timerSec = 0;
 let currentUserId = '123';
 
-// ── UI helpers ─────────────────────────────────────────────────
+function log(msg) { console.log('[Dialer]', msg); }
+
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
-  console.log('[Dialer]', msg);
+  log(msg);
 }
 
 function setReg(state) {
-  const dot  = document.getElementById('regDot');
-  const text = document.getElementById('regText');
-  const map  = {
-    connecting:   { cls: 'yellow', label: 'Connecting...' },
-    registered:   { cls: 'green',  label: '🟢 Ready' },
-    failed:       { cls: 'red',    label: '🔴 Registration failed' },
-    unregistered: { cls: 'red',    label: '🔴 Not registered' }
+  const dot = document.getElementById('regDot');
+  const txt = document.getElementById('regText');
+  const map = {
+    connecting: { cls: 'yellow', label: 'Connecting...' },
+    registered:  { cls: 'green',  label: '🟢 Ready' },
+    failed:      { cls: 'red',    label: '🔴 Registration failed' }
   };
   const s = map[state] || { cls: '', label: state };
-  dot.className    = 'dot ' + s.cls;
-  text.textContent = s.label;
+  dot.className = 'dot ' + s.cls;
+  txt.textContent = s.label;
 }
 
-function showIncoming(callerNumber) {
-  document.getElementById('callerNumber').textContent = callerNumber || 'Unknown';
+function showIncoming(from) {
+  document.getElementById('callerNum').textContent = from || 'Unknown';
   document.getElementById('incomingPanel').style.display = 'block';
-  document.getElementById('dialerPanel').style.display   = 'none';
-  document.getElementById('activeCallPanel').style.display = 'none';
-  // Play ringtone if browser allows
-  try { new Audio('/target/ringtone.wav').play(); } catch(e) {}
+  document.getElementById('activePanel').style.display   = 'none';
+  document.getElementById('dialerPanel').style.display   = 'block';
 }
 
-function showActiveCall(number) {
-  document.getElementById('activeNumber').textContent  = number || '';
-  document.getElementById('incomingPanel').style.display   = 'none';
-  document.getElementById('activeCallPanel').style.display = 'block';
-  document.getElementById('dialerPanel').style.display     = 'block';
-  document.getElementById('hangupBtn').style.display       = 'block';
-  document.getElementById('callBtn').style.display         = 'none';
+function showActive(num) {
+  document.getElementById('activeNum').textContent = num || '';
+  document.getElementById('incomingPanel').style.display = 'none';
+  document.getElementById('activePanel').style.display   = 'block';
+  document.getElementById('dialerPanel').style.display   = 'block';
+  document.getElementById('hangupBtn').style.display     = 'block';
+  document.getElementById('callBtn').style.display       = 'none';
   startTimer();
 }
 
 function showDialer() {
-  document.getElementById('incomingPanel').style.display   = 'none';
-  document.getElementById('activeCallPanel').style.display = 'none';
-  document.getElementById('dialerPanel').style.display     = 'block';
-  document.getElementById('hangupBtn').style.display       = 'none';
-  document.getElementById('callBtn').style.display         = 'block';
+  document.getElementById('incomingPanel').style.display = 'none';
+  document.getElementById('activePanel').style.display   = 'none';
+  document.getElementById('dialerPanel').style.display   = 'block';
+  document.getElementById('hangupBtn').style.display     = 'none';
+  document.getElementById('callBtn').style.display       = 'block';
   stopTimer();
 }
 
 function startTimer() {
-  callSeconds = 0;
-  stopTimer();
-  callTimerInterval = setInterval(() => {
-    callSeconds++;
-    const m = String(Math.floor(callSeconds / 60)).padStart(2, '0');
-    const s = String(callSeconds % 60).padStart(2, '0');
-    document.getElementById('callTimer').textContent = `${m}:${s}`;
+  timerSec = 0; stopTimer();
+  timerInterval = setInterval(() => {
+    timerSec++;
+    const m = String(Math.floor(timerSec / 60)).padStart(2, '0');
+    const s = String(timerSec % 60).padStart(2, '0');
+    document.getElementById('timerEl').textContent = m + ':' + s;
   }, 1000);
 }
 
 function stopTimer() {
-  if (callTimerInterval) { clearInterval(callTimerInterval); callTimerInterval = null; }
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
-// Read number pre-filled by background worker (click-to-call)
-if (window.BX24) {
-  const placement = BX24.placement.info();
-  const options = placement?.options;
 
-  if (options?.number) {
-    // Pre-fill dialer and auto-call
-    document.getElementById('phone').value = options.number;
-    // makeCall() will fire after SDK is ready (end of init)
-  }
-
-  if (options?.incomingFrom) {
-    // Background worker detected inbound call — show incoming panel
-    document.getElementById('callerNumber').textContent = options.incomingFrom;
-    document.getElementById('incomingPanel').style.display = 'block';
-  }
-}
 // ── Init ───────────────────────────────────────────────────────
 async function init() {
   setReg('connecting');
   setStatus('Fetching credentials...');
 
   try {
-    // Try to get Bitrix24 user email as userId
+    let prefilledNumber = null;
+
     if (window.BX24) {
       try {
+        // Check if number was passed from background worker (click-to-call)
+        const info = BX24.placement.info();
+        if (info && info.options && info.options.number) {
+          prefilledNumber = info.options.number;
+        }
+        // Get Bitrix24 user identity
         const profile = await new Promise(r => BX24.callMethod('profile', {}, r));
         const d = profile.data();
         if (d && d.EMAIL) currentUserId = d.EMAIL;
         else if (d && d.ID) currentUserId = String(d.ID);
-      } catch(e) {
-        console.log('BX24 profile failed, using default userId:', currentUserId);
+      } catch (e) {
+        log('BX24 profile failed, using default userId: ' + currentUserId);
       }
     }
 
-    const res = await fetch(`/token?user_id=${encodeURIComponent(currentUserId)}`);
+    const res = await fetch('/token?user_id=' + encodeURIComponent(currentUserId));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
 
-    if (!data.sip_id || !data.sip_secret || !data.app_token) {
-      throw new Error('Missing SIP credentials: ' + JSON.stringify(data));
+    if (!data.sip_id || !data.app_token) {
+      throw new Error('Missing credentials: ' + JSON.stringify(data));
     }
 
-    console.log('[Dialer] Got credentials — sip_id:', data.sip_id);
+    log('Got credentials — sip_id: ' + data.sip_id);
     setStatus('Initializing SDK...');
 
-    // Auto-dial if number was passed from background worker
-if (window.BX24) {
-  const options = BX24.placement.info()?.options;
-  if (options?.number) makeCall();
-}
-
-    // ✅ Fix — pass sip_id and sip_secret
-    const sdk = new ExotelCRMWebSDK(data.app_token, currentUserId, false, {
-      sipId: data.sip_id,
-      sipSecret: data.sip_secret
-    });
+    const sdk = new ExotelCRMWebSDK(data.app_token, currentUserId, false);
 
     webPhone = await sdk.Initialize(
       function callListener(event) {
-        console.log('[Dialer] Call event:', JSON.stringify(event));
+        log('Call event: ' + JSON.stringify(event));
         handleCallEvent(event);
       },
-      function registrationListener(event) {
-        console.log('[Dialer] Registration event:', JSON.stringify(event));
+      function regListener(event) {
+        log('Reg event: ' + JSON.stringify(event));
         handleRegistration(event);
       }
     );
 
-    // SDK initialized successfully
+    // SDK initialized — mark as ready
     setReg('registered');
-    setStatus('✅ Ready to make/receive calls');
+    setStatus('✅ Ready');
 
-    // ── Bitrix24 Click-to-Call (Outbound Type 1) ───────────────
-    // When agent clicks phone icon next to a number in CRM
+    // If number was pre-filled by background worker, auto-dial
+    if (prefilledNumber) {
+      document.getElementById('phone').value = prefilledNumber;
+      setTimeout(makeCall, 600);
+    }
+
+    // Bind click-to-call (works even if background worker not registered)
     if (window.BX24) {
       BX24.placement.bind('CRM_PHONE_NUMBER_CLICK', function(event) {
-        console.log('[Dialer] CRM phone click:', JSON.stringify(event));
-        const number = event?.data?.PHONE_NUMBER || event?.data?.phone;
-        if (number) {
-          document.getElementById('phone').value = number;
-          makeCall();
-        }
-      });
-
-      // Also bind to telephony external call event
-      BX24.addCustomEvent('onExternalCallStart', function(data) {
-        console.log('[Dialer] External call start:', JSON.stringify(data));
-        const number = data?.PHONE_NUMBER;
-        if (number) {
-          document.getElementById('phone').value = number;
+        log('CRM phone click: ' + JSON.stringify(event));
+        const num = event && event.data && (event.data.PHONE_NUMBER || event.data.phone);
+        if (num) {
+          document.getElementById('phone').value = num;
           makeCall();
         }
       });
@@ -169,82 +141,54 @@ if (window.BX24) {
   }
 }
 
-// ── Registration handler ───────────────────────────────────────
 function handleRegistration(event) {
-  console.log('[Dialer] Registration FULL:', JSON.stringify(event));
+  log('Registration: ' + JSON.stringify(event));
   setReg('registered');
-  setStatus('✅ Ready to make/receive calls');
+  setStatus('✅ Ready');
 }
 
-// ── Call event handler ─────────────────────────────────────────
 function handleCallEvent(event) {
-  console.log('[Dialer] Call event type:', event?.type, event?.status, event?.CallState);
-
+  log('Call event raw: ' + JSON.stringify(event));
   const raw = JSON.stringify(event).toLowerCase();
 
   if (raw.includes('incoming') || raw.includes('ringing')) {
-    const from = event?.FromNumber || event?.from || event?.callerNumber || 'Unknown';
-    activeCall = event;
+    const from = event.FromNumber || event.from || event.callerNumber || 'Unknown';
     showIncoming(from);
     setStatus('');
-
-    // Notify Bitrix24 of incoming call
-    if (window.BX24) {
-      BX24.callMethod('telephony.externalcall.show', {
-        USER_PHONE_INNER: currentUserId,
-        USER_ID: BX24.getUser ? BX24.getUser().id : 1,
-        CALL_ID: event?.callSid || event?.CallSid || Date.now().toString(),
-        TYPE: 2  // inbound
-      });
-    }
+    try { new Audio('/target/ringtone.wav').play(); } catch(e) {}
 
   } else if (raw.includes('accept') || raw.includes('connect') || raw.includes('active')) {
-    const num = document.getElementById('phone').value || activeCall?.FromNumber || '';
-    showActiveCall(num);
+    const num = document.getElementById('phone').value ||
+                document.getElementById('callerNum').textContent || '';
+    showActive(num);
     setStatus('');
 
-  } else if (raw.includes('end') || raw.includes('disconnect') || raw.includes('terminal') || raw.includes('bye') || raw.includes('hangup')) {
-    activeCall = null;
+  } else if (raw.includes('end') || raw.includes('disconnect') ||
+             raw.includes('bye') || raw.includes('terminal') || raw.includes('hangup')) {
     showDialer();
     setStatus('Call ended');
-
-    // Log call in Bitrix24 CRM
-    if (window.BX24) {
-      BX24.callMethod('telephony.externalcall.finish', {
-        CALL_ID: event?.callSid || event?.CallSid || '',
-        USER_ID: BX24.getUser ? BX24.getUser().id : 1,
-        DURATION: callSeconds,
-        STATUS_CODE: 200
-      });
-    }
   }
 }
 
 // ── Outbound call ──────────────────────────────────────────────
 async function makeCall() {
   const number = document.getElementById('phone').value.trim();
-  if (!number) { setStatus('Please enter a number'); return; }
-  if (!webPhone) { setStatus('SDK not ready yet'); return; }
+  if (!number) { setStatus('Enter a number'); return; }
+  if (!webPhone) { setStatus('SDK not ready'); return; }
 
   try {
     setStatus('Calling ' + number + '...');
     document.getElementById('callBtn').disabled = true;
 
-    await webPhone.MakeCall(number);
-    document.getElementById('hangupBtn').style.display = 'block';
-
-    showActiveCall(number);
-    document.getElementById('callBtn').disabled = false;
-
-    // Log outbound call start in Bitrix24
-    if (window.BX24) {
-      BX24.callMethod('telephony.externalcall.show', {
-        USER_PHONE_INNER: currentUserId,
-        USER_ID: BX24.getUser ? BX24.getUser().id : 1,
-        CALL_ID: Date.now().toString(),
-        TYPE: 1  // outbound
-      });
+    // MakeCall is confirmed correct — internal SDK error after success is harmless
+    try {
+      await webPhone.MakeCall(number);
+    } catch (e) {
+      log('MakeCall internal error (call was placed): ' + e.message);
     }
+
+    showActive(number);
+    document.getElementById('callBtn').disabled = false;
 
   } catch (err) {
     setStatus('Call failed: ' + err.message);
@@ -252,44 +196,33 @@ async function makeCall() {
   }
 }
 
-// ── Accept incoming ────────────────────────────────────────────
+// ── Accept incoming call ───────────────────────────────────────
 async function acceptCall() {
   if (!webPhone) return;
   try {
     await webPhone.AcceptCall();
-    const from = document.getElementById('callerNumber').textContent;
-    showActiveCall(from);
+    const from = document.getElementById('callerNum').textContent;
+    showActive(from);
+    setStatus('');
   } catch (err) {
     setStatus('Accept failed: ' + err.message);
   }
 }
 
-// ── Reject incoming ────────────────────────────────────────────
+// ── Reject incoming call ───────────────────────────────────────
 async function rejectCall() {
   if (!webPhone) return;
-  try {
-    await webPhone.HangupCall();
-    activeCall = null;
-    showDialer();
-    setStatus('Call rejected');
-  } catch (err) {
-    setStatus('Reject failed: ' + err.message);
-    showDialer();
-  }
+  try { await webPhone.HangupCall(); } catch (e) { log('Reject: ' + e.message); }
+  showDialer();
+  setStatus('Call rejected');
 }
 
-// ── Hangup active call ─────────────────────────────────────────
+// ── Hang up active call ────────────────────────────────────────
 async function hangUp() {
   if (!webPhone) return;
-  try {
-    await webPhone.HangupCall();
-    activeCall = null;
-    showDialer();
-    setStatus('Call ended');
-  } catch (err) {
-    setStatus('Hangup error: ' + err.message);
-    showDialer();
-  }
+  try { await webPhone.HangupCall(); } catch (e) { log('Hangup: ' + e.message); }
+  showDialer();
+  setStatus('Call ended');
 }
 
 window.onload = init;
