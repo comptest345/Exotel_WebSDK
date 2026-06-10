@@ -1,83 +1,69 @@
 let webPhone = null;
 let currentUserId = '123';
 
-async function initBackground() {
+async function initBG() {
   console.log('[BGWorker] Starting...');
-
   try {
-    // Get Bitrix24 user identity
     if (window.BX24) {
       try {
         const profile = await new Promise(r => BX24.callMethod('profile', {}, r));
         const d = profile.data();
-        if (d?.EMAIL) currentUserId = d.EMAIL;
-        else if (d?.ID) currentUserId = String(d.ID);
-      } catch (e) {
-        console.warn('[BGWorker] BX24 profile failed:', e);
-      }
+        if (d && d.EMAIL) currentUserId = d.EMAIL;
+        else if (d && d.ID) currentUserId = String(d.ID);
+      } catch (e) { console.warn('[BGWorker] profile failed:', e); }
     }
 
-    // Fetch SIP credentials from your server
-    const res = await fetch(`/token?user_id=${encodeURIComponent(currentUserId)}`);
+    const res = await fetch('/token?user_id=' + encodeURIComponent(currentUserId));
+    if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
+    if (!data.app_token) throw new Error('No app_token in response');
 
-    if (!data.sip_id || !data.sip_secret || !data.app_token) {
-      throw new Error('Missing credentials: ' + JSON.stringify(data));
-    }
-
-    console.log('[BGWorker] Credentials fetched, initializing SDK...');
+    console.log('[BGWorker] Got credentials, initializing SDK...');
 
     const sdk = new ExotelCRMWebSDK(data.app_token, currentUserId, false);
 
     webPhone = await sdk.Initialize(
       function callListener(event) {
         console.log('[BGWorker] Call event:', JSON.stringify(event));
-        handleInboundCall(event);
+        handleCall(event);
       },
-      function registrationListener(event) {
-        console.log('[BGWorker] Registered:', JSON.stringify(event));
+      function regListener(event) {
+        console.log('[BGWorker] ✅ SIP Registered');
       }
     );
 
-    console.log('[BGWorker] ✅ SDK ready, binding phone click...');
+    console.log('[BGWorker] ✅ SDK ready — binding click-to-call');
 
-    // ✅ THIS is what was missing before — binding happens immediately
-    // because the background worker is already alive when the page loads
-    BX24.placement.bind('CRM_PHONE_NUMBER_CLICK', function(event) {
-      console.log('[BGWorker] Phone click:', JSON.stringify(event));
-      const number = event?.data?.PHONE_NUMBER || event?.data?.phone;
-      if (number) {
-        // Open the dialer popup with the number pre-filled
-        BX24.openApplication({ number: number });
-      }
-    });
+    // ── Intercept CRM phone number clicks ─────────────────────
+    if (window.BX24) {
+      BX24.placement.bind('CRM_PHONE_NUMBER_CLICK', function(event) {
+        console.log('[BGWorker] Phone click:', JSON.stringify(event));
+        const number = (event && event.data) &&
+                       (event.data.PHONE_NUMBER || event.data.phone);
+        if (number) {
+          // Open the visible dialer popup with number pre-filled
+          BX24.openApplication({ number: number });
+        }
+      });
+    }
 
   } catch (err) {
-    console.error('[BGWorker] Init failed:', err);
-    // Retry after 30 seconds if init fails
-    setTimeout(initBackground, 30000);
+    console.error('[BGWorker] Init failed:', err.message);
+    // Retry after 30 seconds
+    setTimeout(initBG, 30000);
   }
 }
 
-// ── Handle inbound call notification ──────────────────────────
-function handleInboundCall(event) {
+function handleCall(event) {
   const raw = JSON.stringify(event).toLowerCase();
-
   if (raw.includes('incoming') || raw.includes('ringing')) {
-    const from = event?.FromNumber || event?.from || event?.callerNumber || 'Unknown';
+    const from = (event && (event.FromNumber || event.from || event.callerNumber)) || 'Unknown';
     console.log('[BGWorker] Incoming call from:', from);
-
-    // Show Bitrix24 native call popup
-    BX24.callMethod('telephony.externalcall.show', {
-      USER_PHONE_INNER: currentUserId,
-      USER_ID: 1,
-      CALL_ID: event?.callSid || Date.now().toString(),
-      TYPE: 2  // inbound
-    });
-
-    // Open your dialer popup so agent can accept/reject
-    BX24.openApplication({ incomingFrom: from, callSid: event?.callSid });
+    // Open the dialer popup so agent can accept/reject
+    if (window.BX24) {
+      BX24.openApplication({ incomingFrom: from, callSid: event.callSid || '' });
+    }
   }
 }
 
-window.onload = initBackground;
+window.onload = initBG;
