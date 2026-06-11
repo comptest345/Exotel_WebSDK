@@ -1,67 +1,73 @@
+// ═══════════════════════════════════════════════════════════════
+// background.js — Always-on silent worker
+// Runs in PAGE_BACKGROUND_WORKER placement (invisible iframe)
+// Handles: SIP registration, inbound call detection, click-to-call
+// ═══════════════════════════════════════════════════════════════
+
 let webPhone = null;
-let currentUserId = '123';
+const USER_ID = '123'; // Fixed — matches AppUserId in Exotel
 
 async function initBG() {
-  console.log('[BGWorker] Starting...');
+  console.log('[BGWorker] Starting initialization...');
   try {
-    if (window.BX24) {
-      try {
-        const profile = await new Promise(r => BX24.callMethod('profile', {}, r));
-        const d = profile.data();
-        if (d && d.EMAIL) currentUserId = d.EMAIL;
-        else if (d && d.ID) currentUserId = String(d.ID);
-      } catch (e) { console.warn('[BGWorker] profile failed:', e); }
-    }
-
-    const res = await fetch('/token?user_id=' + encodeURIComponent(currentUserId));
+    // Fetch SIP credentials from server
+    const res = await fetch('/token?user_id=' + encodeURIComponent(USER_ID));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
     if (!data.app_token) throw new Error('No app_token in response');
 
-    console.log('[BGWorker] Got credentials, initializing SDK...');
+    console.log('[BGWorker] Credentials received, initializing SDK...');
 
-    const sdk = new ExotelCRMWebSDK(data.app_token, currentUserId, false);
+    // Initialize WebRTC SDK
+    const sdk = new ExotelCRMWebSDK(data.app_token, USER_ID, false);
 
     webPhone = await sdk.Initialize(
       function callListener(event) {
         console.log('[BGWorker] Call event:', JSON.stringify(event));
-        handleCall(event);
+        handleInboundCall(event);
       },
       function regListener(event) {
-        console.log('[BGWorker] ✅ SIP Registered');
+        console.log('[BGWorker] ✅ SIP Registered successfully');
       }
     );
 
-    console.log('[BGWorker] ✅ SDK ready — binding click-to-call');
+    console.log('[BGWorker] ✅ SDK ready');
 
-    // ── Intercept CRM phone number clicks ─────────────────────
+    // Bind CRM phone number click-to-call
     if (window.BX24) {
       BX24.placement.bind('CRM_PHONE_NUMBER_CLICK', function(event) {
-        console.log('[BGWorker] Phone click:', JSON.stringify(event));
-        const number = (event && event.data) &&
+        console.log('[BGWorker] CRM phone click:', JSON.stringify(event));
+        const number = event && event.data &&
                        (event.data.PHONE_NUMBER || event.data.phone);
         if (number) {
-          // Open the visible dialer popup with number pre-filled
+          console.log('[BGWorker] Opening dialer with number:', number);
+          // Open the dialer popup with number pre-filled
           BX24.openApplication({ number: number });
         }
       });
+      console.log('[BGWorker] CRM_PHONE_NUMBER_CLICK bound');
     }
 
   } catch (err) {
     console.error('[BGWorker] Init failed:', err.message);
-    // Retry after 30 seconds
+    // Retry after 30 seconds on failure
     setTimeout(initBG, 30000);
   }
 }
 
-function handleCall(event) {
+function handleInboundCall(event) {
   const raw = JSON.stringify(event).toLowerCase();
+
   if (raw.includes('incoming') || raw.includes('ringing')) {
     const from = (event && (event.FromNumber || event.from || event.callerNumber)) || 'Unknown';
-    console.log('[BGWorker] Incoming call from:', from);
-    // Open the dialer popup so agent can accept/reject
+    console.log('[BGWorker] 📲 Incoming call from:', from);
+
+    // Open popup with incoming call info
     if (window.BX24) {
-      BX24.openApplication({ incomingFrom: from, callSid: event.callSid || '' });
+      BX24.openApplication({
+        incomingFrom: from,
+        callSid: (event && event.callSid) || ''
+      });
     }
   }
 }
