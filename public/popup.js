@@ -1,24 +1,15 @@
 // ═══════════════════════════════════════════════════════════════
 // popup.js — Visible dialer widget inside Bitrix24
-// Handles: UI display, outbound calls, accept/reject inbound
-// NOTE: Does NOT initialize its own SDK — uses background.js SDK
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone = null;
 let timerInterval = null;
 let timerSec = 0;
-const USER_ID = '123'; // Fixed — matches AppUserId in Exotel
+const USER_ID = '123';
 
-// ── Logging ────────────────────────────────────────────────────
 function log(msg) { console.log('[Dialer]', msg); }
+function setStatus(msg) { document.getElementById('status').textContent = msg; log(msg); }
 
-// ── Status display ─────────────────────────────────────────────
-function setStatus(msg) {
-  document.getElementById('status').textContent = msg;
-  log(msg);
-}
-
-// ── Registration indicator ─────────────────────────────────────
 function setReg(state) {
   const dot = document.getElementById('regDot');
   const txt = document.getElementById('regText');
@@ -28,11 +19,10 @@ function setReg(state) {
     failed:     { cls: 'red',    label: '🔴 Registration failed' }
   };
   const s = map[state] || { cls: '', label: state };
-  dot.className   = 'dot ' + s.cls;
+  dot.className = 'dot ' + s.cls;
   txt.textContent = s.label;
 }
 
-// ── UI panels ──────────────────────────────────────────────────
 function showIncoming(from) {
   document.getElementById('callerNum').textContent       = from || 'Unknown';
   document.getElementById('incomingPanel').style.display = 'block';
@@ -62,7 +52,6 @@ function showDialer() {
   stopTimer();
 }
 
-// ── Call timer ─────────────────────────────────────────────────
 function startTimer() {
   timerSec = 0; stopTimer();
   timerInterval = setInterval(() => {
@@ -83,35 +72,30 @@ async function init() {
   setStatus('Fetching credentials...');
 
   try {
-    // Check if opened by background worker with pre-filled data
     let prefilledNumber = null;
-    let incomingFrom = null;
+    let incomingFrom    = null;
 
+    // Check if opened by background worker with pre-filled data
     if (window.BX24) {
       try {
         const info = BX24.placement.info();
         if (info && info.options) {
-          if (info.options.number) prefilledNumber = info.options.number;
-          if (info.options.incomingFrom) incomingFrom = info.options.incomingFrom;
+          if (info.options.number)       prefilledNumber = info.options.number;
+          if (info.options.incomingFrom) incomingFrom    = info.options.incomingFrom;
         }
       } catch (e) { log('placement.info failed: ' + e.message); }
     }
 
-    // Always use fixed USER_ID — never use BX24 profile ID
+    // Always use fixed USER_ID
     const res = await fetch('/token?user_id=' + encodeURIComponent(USER_ID));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
-
-    if (!data.sip_id || !data.app_token) {
-      throw new Error('Missing credentials: ' + JSON.stringify(data));
-    }
+    if (!data.sip_id || !data.app_token) throw new Error('Missing credentials: ' + JSON.stringify(data));
 
     log('Got credentials — sip_id: ' + data.sip_id);
     setStatus('Initializing SDK...');
 
-    // Initialize WebRTC SDK in popup
     const sdk = new ExotelCRMWebSDK(data.app_token, USER_ID, false);
-
     webPhone = await sdk.Initialize(
       function callListener(event) {
         log('Call event: ' + JSON.stringify(event));
@@ -124,20 +108,19 @@ async function init() {
       }
     );
 
-    // SDK initialized successfully
     setReg('registered');
     setStatus('✅ Ready');
 
-    // Handle pre-filled number (from click-to-call via background worker)
+    // Auto-dial if number passed from background worker
     if (prefilledNumber) {
       log('Auto-dialing: ' + prefilledNumber);
       document.getElementById('phone').value = prefilledNumber;
       setTimeout(makeCall, 600);
     }
 
-    // Handle incoming call notification from background worker
+    // Show incoming call panel if triggered by background worker
     if (incomingFrom) {
-      log('Incoming call from: ' + incomingFrom);
+      log('Showing incoming from: ' + incomingFrom);
       showIncoming(incomingFrom);
       setStatus('');
     }
@@ -151,24 +134,20 @@ async function init() {
 
 // ── Call event handler ─────────────────────────────────────────
 function handleCallEvent(event) {
-  log('Raw call event: ' + JSON.stringify(event));
+  log('Raw: ' + JSON.stringify(event));
   const raw = JSON.stringify(event).toLowerCase();
 
   if (raw.includes('incoming') || raw.includes('ringing')) {
     const from = (event && (event.FromNumber || event.from || event.callerNumber)) || 'Unknown';
     showIncoming(from);
     setStatus('');
-
   } else if (raw.includes('accept') || raw.includes('connect') || raw.includes('active')) {
     const num = document.getElementById('phone').value ||
                 document.getElementById('callerNum').textContent || '';
     showActive(num);
     setStatus('');
-
-  } else if (
-    raw.includes('end') || raw.includes('disconnect') ||
-    raw.includes('bye') || raw.includes('terminal') || raw.includes('hangup')
-  ) {
+  } else if (raw.includes('end') || raw.includes('disconnect') || raw.includes('bye') ||
+             raw.includes('terminal') || raw.includes('hangup')) {
     showDialer();
     setStatus('Call ended');
   }
@@ -179,56 +158,46 @@ async function makeCall() {
   const number = document.getElementById('phone').value.trim();
   if (!number) { setStatus('Enter a number'); return; }
   if (!webPhone) { setStatus('SDK not ready'); return; }
-
   try {
     setStatus('Calling ' + number + '...');
     document.getElementById('callBtn').disabled = true;
-
     try {
       await webPhone.MakeCall(number);
     } catch (e) {
-      // SDK throws internal error AFTER successfully placing the call
-      // This is a known Exotel SDK bug — the call goes through fine
-      log('MakeCall internal (call placed successfully): ' + e.message);
+      log('MakeCall internal (call placed OK): ' + e.message);
     }
-
     showActive(number);
     document.getElementById('callBtn').disabled = false;
-
   } catch (err) {
     setStatus('Call failed: ' + err.message);
     document.getElementById('callBtn').disabled = false;
   }
 }
 
-// ── Accept incoming call ───────────────────────────────────────
+// ── Accept incoming ────────────────────────────────────────────
 async function acceptCall() {
   if (!webPhone) { setStatus('SDK not ready'); return; }
   try {
     await webPhone.AcceptCall();
-    const from = document.getElementById('callerNum').textContent;
-    showActive(from);
+    showActive(document.getElementById('callerNum').textContent);
     setStatus('');
   } catch (err) {
     setStatus('Accept failed: ' + err.message);
-    log('AcceptCall error: ' + err.message);
   }
 }
 
-// ── Reject incoming call ───────────────────────────────────────
+// ── Reject incoming ────────────────────────────────────────────
 async function rejectCall() {
   if (!webPhone) return;
-  try { await webPhone.HangupCall(); } catch (e) { log('Reject: ' + e.message); }
-  showDialer();
-  setStatus('Call rejected');
+  try { await webPhone.HangupCall(); } catch(e) { log('Reject: ' + e.message); }
+  showDialer(); setStatus('Call rejected');
 }
 
-// ── Hang up active call ────────────────────────────────────────
+// ── Hang up ────────────────────────────────────────────────────
 async function hangUp() {
   if (!webPhone) return;
-  try { await webPhone.HangupCall(); } catch (e) { log('Hangup: ' + e.message); }
-  showDialer();
-  setStatus('Call ended');
+  try { await webPhone.HangupCall(); } catch(e) { log('Hangup: ' + e.message); }
+  showDialer(); setStatus('Call ended');
 }
 
 window.onload = init;
