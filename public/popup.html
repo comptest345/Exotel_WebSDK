@@ -6,21 +6,21 @@
   <title>Exotel Dialer</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: Arial, sans-serif; background: #f0f2f5; display: flex; justify-content: center; padding: 16px; min-height: 100vh; }
-    .dialer { background: white; border-radius: 12px; padding: 20px; width: 100%; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); height: fit-content; }
+    body { font-family: Arial, sans-serif; background: #f0f2f5; display: flex; justify-content: center; padding: 16px; }
+    .dialer { background: white; border-radius: 12px; padding: 20px; width: 100%; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); }
     .header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; border-bottom: 1px solid #eee; padding-bottom: 12px; }
     .header h3 { font-size: 16px; color: #333; }
     .reg-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #666; margin-bottom: 14px; }
     .dot { width: 9px; height: 9px; border-radius: 50%; background: #ccc; flex-shrink: 0; }
-    .dot.green { background: #4CAF50; }
-    .dot.red { background: #f44336; }
+    .dot.green  { background: #4CAF50; }
+    .dot.red    { background: #f44336; }
     .dot.yellow { background: #FFC107; animation: pulse 1s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
-    #incomingPanel { display:none; background:#fff3e0; border:2px solid #FF9800; border-radius:10px; padding:16px; text-align:center; margin-bottom:14px; animation: ringAnim 0.6s infinite alternate; }
-    @keyframes ringAnim { from{border-color:#FF9800} to{border-color:#f44336} }
+    #incomingPanel { display:none; background:#fff3e0; border:2px solid #FF9800; border-radius:10px; padding:16px; text-align:center; margin-bottom:14px; animation: ring 0.6s infinite alternate; }
+    @keyframes ring { from{border-color:#FF9800} to{border-color:#f44336} }
     .caller-label { font-size:11px; color:#888; margin-bottom:4px; }
-    .caller-from { font-size:18px; font-weight:bold; color:#333; margin-bottom:14px; }
+    .caller-from  { font-size:18px; font-weight:bold; color:#333; margin-bottom:14px; }
     .ibtn { display:flex; gap:10px; }
     .ibtn button { flex:1; padding:12px; border:none; border-radius:8px; font-size:14px; cursor:pointer; color:white; font-weight:bold; }
     .ibtn .acc { background:#4CAF50; }
@@ -28,12 +28,12 @@
 
     #activePanel { display:none; background:#e8f5e9; border-radius:8px; padding:12px; text-align:center; margin-bottom:12px; }
     .active-label { font-size:11px; color:#888; }
-    .active-num { font-size:15px; font-weight:bold; color:#333; margin:4px 0; }
+    .active-num   { font-size:15px; font-weight:bold; color:#333; margin:4px 0; }
     .active-timer { color:#4CAF50; font-size:13px; }
 
     input[type=tel] { width:100%; padding:11px; margin-bottom:10px; border:1px solid #ddd; border-radius:8px; font-size:16px; outline:none; }
     input[type=tel]:focus { border-color:#4CAF50; }
-    #callBtn { width:100%; padding:12px; background:#4CAF50; color:white; border:none; border-radius:8px; font-size:15px; cursor:pointer; font-weight:bold; }
+    #callBtn   { width:100%; padding:12px; background:#4CAF50; color:white; border:none; border-radius:8px; font-size:15px; cursor:pointer; font-weight:bold; }
     #callBtn:disabled { background:#aaa; cursor:not-allowed; }
     #hangupBtn { width:100%; padding:12px; background:#f44336; color:white; border:none; border-radius:8px; font-size:15px; cursor:pointer; margin-top:8px; display:none; font-weight:bold; }
     #status { margin-top:10px; font-size:12px; color:#666; text-align:center; min-height:16px; }
@@ -51,7 +51,6 @@
     <span id="regText">Initializing...</span>
   </div>
 
-  <!-- Incoming call panel -->
   <div id="incomingPanel">
     <div class="caller-label">📲 Incoming Call</div>
     <div class="caller-from" id="callerNum">Unknown</div>
@@ -61,14 +60,12 @@
     </div>
   </div>
 
-  <!-- Active call panel -->
   <div id="activePanel">
     <div class="active-label">🔴 Call Active</div>
     <div class="active-num" id="activeNum"></div>
     <div class="active-timer" id="timerEl">00:00</div>
   </div>
 
-  <!-- Dialer panel -->
   <div id="dialerPanel">
     <input type="tel" id="phone" placeholder="e.g. 09876543210" />
     <button id="callBtn" onclick="makeCall()">📞 Call</button>
