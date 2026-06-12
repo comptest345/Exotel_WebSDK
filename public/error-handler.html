@@ -1,22 +1,15 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="UTF-8"><title>Exotel Error Handler</title></head>
+<head><meta charset="UTF-8"></head>
 <body>
 <script src="//api.bitrix24.com/api/v1/"></script>
 <script>
 BX24.init(function() {
-  console.log('[ErrorHandler] Re-registering background worker...');
   BX24.callMethod('placement.bind', {
     PLACEMENT: 'PAGE_BACKGROUND_WORKER',
     HANDLER: 'https://exotel-websdk.onrender.com/background.html',
     TITLE: 'Exotel Background Worker'
-  }, function(result) {
-    if (result.error && result.error()) {
-      console.warn('[ErrorHandler] Re-register warning:', result.error().toString());
-    } else {
-      console.log('[ErrorHandler] ✅ Re-registered successfully');
-    }
-  });
+  }, function(r) { console.log('[ErrorHandler] Re-registered'); });
 });
 </script>
 </body>
