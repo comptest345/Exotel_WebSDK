@@ -123,7 +123,6 @@ app.all('/install', (req, res) => {
 
 // ── OnExternalCallStart webhook ────────────────────────────────
 // Bitrix24 hits this when agent clicks a phone number in CRM
-// This replaces the native "Call cannot be completed" popup
 app.post('/bx24-call-start', async (req, res) => {
   console.log('[BX24-CallStart] Event received:', JSON.stringify(req.body));
   try {
@@ -134,12 +133,57 @@ app.post('/bx24-call-start', async (req, res) => {
 
     console.log(`[BX24-CallStart] Outbound to: ${phoneNumber} by user: ${userId}`);
 
-    // Store pending call for background worker
+    // Store pending call for background worker (WebRTC path)
     pendingOutboundCall = { number: phoneNumber, userId, callId, ts: Date.now() };
 
-    // DO NOT call telephony.externalcall.show here for outbound
-    // Bitrix24 already shows its native call UI automatically
-    // background.js will pick up the call via onExternalCallStart event
+    // ── PRIMARY: Server-side Exotel outbound call ──────────────
+    // More reliable than waiting for background.js WebRTC poll.
+    // Exotel rings the agent's registered phone/softphone first,
+    // then bridges to the customer (phoneNumber).
+    try {
+      const at = await getAppToken();
+
+      // Look up the agent's virtual number from Exotel user mapping
+      const mapRes = await fetch(
+        `${BASE}/usermapping?user_id=${encodeURIComponent(BX24_USER_ID)}`,
+        { headers: { 'Authorization': at } }
+      );
+      const mapData = await mapRes.json();
+      const user = (mapData.Data && mapData.Data.Users && mapData.Data.Users.length > 0)
+        ? mapData.Data.Users[0]
+        : (mapData.Data && mapData.Data.SipId ? mapData.Data : null);
+      const virtualNumber = user && user.VirtualNumber;
+
+      if (virtualNumber && API_KEY && API_TOKEN && ACCOUNT_SID) {
+        // Exotel Connect API: calls From (agent) then bridges to To (customer)
+        const exotelHost = DOMAIN === 'singapore' ? 'api.exotel.in' : 'api.exotel.com';
+        const callPayload = new URLSearchParams({
+          From:           virtualNumber,
+          To:             phoneNumber,
+          CallerId:       virtualNumber,
+          StatusCallback: 'https://exotel-websdk.onrender.com/call-callback'
+        });
+        const callRes = await fetch(
+          `https://${API_KEY}:${API_TOKEN}@${exotelHost}/v1/Accounts/${ACCOUNT_SID}/Calls/connect`,
+          {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body:    callPayload
+          }
+        );
+        const callData = await callRes.json();
+        console.log('[BX24-CallStart] Exotel call initiated:', JSON.stringify(callData));
+        if (callData.Call && callData.Call.Sid) {
+          // Replace the callId with Exotel's own SID so finish() works
+          pendingOutboundCall.exotelSid = callData.Call.Sid;
+        }
+      } else {
+        console.warn('[BX24-CallStart] Server-side call skipped — virtualNumber:', virtualNumber, 'API creds:', !!(API_KEY && API_TOKEN && ACCOUNT_SID));
+      }
+    } catch (callErr) {
+      // Non-fatal: background.js WebRTC will attempt MakeCall as fallback
+      console.error('[BX24-CallStart] Server-side Exotel call error:', callErr.message);
+    }
 
     res.json({ status: 'ok' });
   } catch (err) {
