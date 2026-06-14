@@ -127,7 +127,6 @@ app.all('/install', (req, res) => {
 app.post('/bx24-call-start', async (req, res) => {
   console.log('[BX24-CallStart] Event received:', JSON.stringify(req.body));
   try {
-    // FIX: data is nested inside req.body.data
     const eventData   = req.body.data || req.body;
     const phoneNumber = eventData.PHONE_NUMBER || '';
     const userId      = eventData.USER_ID || BX24_USER_ID;
@@ -135,18 +134,12 @@ app.post('/bx24-call-start', async (req, res) => {
 
     console.log(`[BX24-CallStart] Outbound to: ${phoneNumber} by user: ${userId}`);
 
-    // Store for background.js to pick up via polling
+    // Store pending call for background worker
     pendingOutboundCall = { number: phoneNumber, userId, callId, ts: Date.now() };
 
-    // Tell Bitrix24 we are handling this call — prevents native popup
-    if (BX24_WEBHOOK && phoneNumber) {
-      await bx24Call('telephony.externalcall.show', {
-        CALL_ID:         callId,
-        USER_ID:         userId,
-        PHONE_NUMBER:    phoneNumber,
-        TYPE:            1
-      });
-    }
+    // DO NOT call telephony.externalcall.show here for outbound
+    // Bitrix24 already shows its native call UI automatically
+    // background.js will pick up the call via onExternalCallStart event
 
     res.json({ status: 'ok' });
   } catch (err) {
