@@ -30,74 +30,34 @@ async function initBG() {
 
     console.log('[BGWorker] ✅ SDK ready — binding Bitrix24 telephony events');
 
-    if (window.BX24) {
-      // ── Outbound: fires when agent clicks phone number in CRM ──
-      // Bitrix24 already shows native call UI — we just start the call audio
-      BX24.addCustomEvent('onExternalCallStart', function(eventData) {
-        console.log('[BGWorker] onExternalCallStart:', JSON.stringify(eventData));
-        const number = eventData && (eventData.PHONE_NUMBER || eventData.phone_number);
-        const callId = eventData && eventData.CALL_ID;
-        if (number && webPhone) {
-          currentCallId = callId;
-          console.log('[BGWorker] Starting outbound call to:', number);
-          try {
-            webPhone.MakeCall(number);
-          } catch(e) {
-            console.log('[BGWorker] MakeCall internal (call placed):', e.message);
-          }
-        }
-      });
 
-      // ── Agent clicks Accept on native incoming call UI ─────────
-      BX24.addCustomEvent('onExternalCallAnswer', function(eventData) {
-        console.log('[BGWorker] onExternalCallAnswer:', JSON.stringify(eventData));
-        if (webPhone) {
-          try {
-            webPhone.AcceptCall();
-            console.log('[BGWorker] Call accepted via SDK');
-          } catch(e) {
-            console.log('[BGWorker] AcceptCall error:', e.message);
-          }
-        }
-      });
-
-      // ── Agent clicks Hang Up on native UI ─────────────────────
-      BX24.addCustomEvent('onExternalCallHangup', function(eventData) {
-        console.log('[BGWorker] onExternalCallHangup:', JSON.stringify(eventData));
-        if (webPhone) {
-          try {
-            webPhone.HangupCall();
-            console.log('[BGWorker] Call hung up via SDK');
-          } catch(e) {
-            console.log('[BGWorker] HangupCall error:', e.message);
-          }
-        }
-        currentCallId = null;
-      });
-    }
-
-    // Poll for inbound calls from server (Exotel → server → background)
-    startPolling();
-
-  } catch (err) {
-    console.error('[BGWorker] Init failed:', err.message);
-    setTimeout(initBG, 30000);
-  }
-}
-
-// ── Poll server for inbound call notifications ─────────────────
+// ── Poll server for pending calls ─────────────────────────────
 function startPolling() {
   if (pollInterval) clearInterval(pollInterval);
   pollInterval = setInterval(async () => {
     try {
-      const res  = await fetch('/pending-inbound');
-      const data = await res.json();
-      if (data.pending && data.from) {
-        console.log('[BGWorker] Inbound call detected from:', data.from);
-        currentCallId = data.callSid;
-        // Bitrix24 native UI already shown by server via telephony.externalcall.show
-        // SDK is already receiving the call via SIP — no action needed here
-        // Agent will click Accept on native UI which fires onExternalCallAnswer
+      // Check for outbound call from CRM click
+      const outRes  = await fetch('/pending-call');
+      const outData = await outRes.json();
+      if (outData.pending && outData.number) {
+        console.log('[BGWorker] 📞 Outbound call to:', outData.number);
+        currentCallId = outData.callId;
+        if (webPhone) {
+          try {
+            webPhone.MakeCall(outData.number);
+            console.log('[BGWorker] MakeCall fired for:', outData.number);
+          } catch(e) {
+            console.log('[BGWorker] MakeCall internal (call placed):', e.message);
+          }
+        }
+      }
+
+      // Check for inbound
+      const inRes  = await fetch('/pending-inbound');
+      const inData = await inRes.json();
+      if (inData.pending && inData.from) {
+        console.log('[BGWorker] 📲 Inbound from:', inData.from);
+        currentCallId = inData.callSid;
       }
     } catch(e) { /* silent */ }
   }, 2000);
