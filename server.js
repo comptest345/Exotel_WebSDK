@@ -15,6 +15,8 @@ const API_TOKEN    = process.env.EXOTEL_API_TOKEN;
 const DOMAIN       = process.env.EXOTEL_DOMAIN || 'singapore';
 const APP_ID       = process.env.EXOTEL_APP_ID;
 const APP_SECRET   = process.env.EXOTEL_APP_SECRET;
+const EXOTEL_APP_USER_ID = process.env.EXOTEL_APP_USER_ID || '123'; // Exotel AppUserId — NOT Bitrix24 user ID
+const EXOTEL_VIRTUAL_NUMBER = process.env.EXOTEL_VIRTUAL_NUMBER || '';
 
 // Bitrix24 webhook for server-side REST calls (set this in Render env)
 // Create it at: gsdny.bitrix24.in/devops/list/ → Add webhook → select telephony scope
@@ -145,14 +147,15 @@ app.post('/bx24-call-start', async (req, res) => {
 
       // Look up the agent's virtual number from Exotel user mapping
       const mapRes = await fetch(
-        `${BASE}/usermapping?user_id=${encodeURIComponent(BX24_USER_ID)}`,
+        `${BASE}/usermapping?user_id=${encodeURIComponent(EXOTEL_APP_USER_ID)}`,
         { headers: { 'Authorization': at } }
       );
       const mapData = await mapRes.json();
       const user = (mapData.Data && mapData.Data.Users && mapData.Data.Users.length > 0)
         ? mapData.Data.Users[0]
         : (mapData.Data && mapData.Data.SipId ? mapData.Data : null);
-      const virtualNumber = user && user.VirtualNumber;
+      // Use user's VirtualNumber from Exotel, or fall back to EXOTEL_VIRTUAL_NUMBER env var
+      const virtualNumber = (user && user.VirtualNumber) || EXOTEL_VIRTUAL_NUMBER;
 
       if (virtualNumber && API_KEY && API_TOKEN && ACCOUNT_SID) {
         // Exotel Connect API: calls From (agent) then bridges to To (customer)
