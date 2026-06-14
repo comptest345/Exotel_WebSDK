@@ -5,7 +5,8 @@
 let webPhone = null;
 let timerInterval = null;
 let timerSec = 0;
-const USER_ID = '123';
+const EXOTEL_APP_USER_ID = '123'; // Exotel AppUserId (NOT Bitrix24 user ID)
+const BX24_USER_ID = '44';    // Bitrix24 user ID
 
 function log(msg) { console.log('[Dialer]', msg); }
 function setStatus(msg) { document.getElementById('status').textContent = msg; log(msg); }
@@ -87,7 +88,7 @@ async function init() {
     }
 
     // Always use fixed USER_ID
-    const res = await fetch('/token?user_id=' + encodeURIComponent(USER_ID));
+    const res = await fetch('/token?user_id=' + encodeURIComponent(EXOTEL_APP_USER_ID));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
     if (!data.sip_id || !data.app_token) throw new Error('Missing credentials: ' + JSON.stringify(data));
@@ -95,7 +96,7 @@ async function init() {
     log('Got credentials — sip_id: ' + data.sip_id);
     setStatus('Initializing SDK...');
 
-    const sdk = new ExotelCRMWebSDK(data.app_token, USER_ID, false);
+    const sdk = new ExotelCRMWebSDK(data.app_token, EXOTEL_APP_USER_ID, false);
     webPhone = await sdk.Initialize(
       function callListener(event) {
         log('Call event: ' + JSON.stringify(event));
