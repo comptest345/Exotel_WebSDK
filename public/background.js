@@ -1,26 +1,25 @@
 // ═══════════════════════════════════════════════════════════════
 // background.js — Connects Bitrix24 native call UI to Exotel WebRTC
-// FIX: Corrected broken function structure + startPolling() now called
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone = null;
-// USER_ID must match the AppUserId you used in /create-user for Exotel.
-// From your Bitrix24 logs, your user ID is 44 — match it here.
-const USER_ID = '44';
+// EXOTEL_APP_USER_ID — the AppUserId you used when calling /create-user on Exotel.
+// This is '123' (your Exotel side ID), NOT the Bitrix24 user ID (44).
+const EXOTEL_APP_USER_ID = '123';
 let currentCallId = null;
 let pollInterval = null;
 
 async function initBG() {
   console.log('[BGWorker] Starting...');
   try {
-    const res = await fetch('/token?user_id=' + encodeURIComponent(USER_ID));
+    const res = await fetch('/token?user_id=' + encodeURIComponent(EXOTEL_APP_USER_ID));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
     if (!data.app_token) throw new Error('No app_token in response: ' + JSON.stringify(data));
 
     console.log('[BGWorker] Got credentials, initializing SDK...');
 
-    const sdk = new ExotelCRMWebSDK(data.app_token, USER_ID, false);
+    const sdk = new ExotelCRMWebSDK(data.app_token, EXOTEL_APP_USER_ID, false);
     webPhone = await sdk.Initialize(
       function callListener(event) {
         console.log('[BGWorker] Call event:', JSON.stringify(event));
@@ -33,23 +32,20 @@ async function initBG() {
     );
 
     console.log('[BGWorker] ✅ SDK ready');
-    // Start polling immediately too — regListener may fire before this line
     startPolling();
 
   } catch (err) {
     console.error('[BGWorker] Init error:', err.message);
-    // Retry after 5 seconds on failure
     setTimeout(initBG, 5000);
   }
 }
 
 // ── Poll server for pending calls ─────────────────────────────
 function startPolling() {
-  if (pollInterval) return; // already running, don't double-start
+  if (pollInterval) return;
   console.log('[BGWorker] Polling /pending-call every 2s');
   pollInterval = setInterval(async () => {
     try {
-      // Check for outbound call from CRM click
       const outRes  = await fetch('/pending-call');
       const outData = await outRes.json();
       if (outData.pending && outData.number) {
@@ -63,11 +59,10 @@ function startPolling() {
             console.log('[BGWorker] MakeCall internal (call placed):', e.message);
           }
         } else {
-          console.warn('[BGWorker] webPhone not ready yet — call will be retried next poll if still pending');
+          console.warn('[BGWorker] webPhone not ready yet');
         }
       }
 
-      // Check for inbound
       const inRes  = await fetch('/pending-inbound');
       const inData = await inRes.json();
       if (inData.pending && inData.from) {
@@ -80,21 +75,20 @@ function startPolling() {
   }, 2000);
 }
 
-// ── Handle SDK call events — sync state to Bitrix24 native UI ──
+// ── Handle SDK call events ─────────────────────────────────────
 function handleSDKCallEvent(event) {
   const raw = JSON.stringify(event).toLowerCase();
 
   if (raw.includes('incoming') || raw.includes('ringing')) {
     const from = (event && (event.FromNumber || event.from)) || 'Unknown';
     console.log('[BGWorker] SDK: Incoming call from:', from);
-    // Native UI is already shown by server — just log here
 
   } else if (raw.includes('accept') || raw.includes('connect') || raw.includes('active')) {
     console.log('[BGWorker] SDK: Call connected');
     if (window.BX24 && currentCallId) {
       BX24.callMethod('telephony.externalcall.show', {
         CALL_ID: currentCallId,
-        USER_ID: USER_ID
+        USER_ID: '44'  // BX24 user ID for Bitrix24 API calls
       });
     }
 
@@ -103,7 +97,7 @@ function handleSDKCallEvent(event) {
     if (window.BX24 && currentCallId) {
       BX24.callMethod('telephony.externalcall.finish', {
         CALL_ID:     currentCallId,
-        USER_ID:     USER_ID,
+        USER_ID:     '44',  // BX24 user ID for Bitrix24 API calls
         DURATION:    0,
         STATUS_CODE: 200
       });
