@@ -175,29 +175,31 @@ app.get('/pending-call', (req, res) => {
 // Set this URL in Exotel App Bazaar → Connect applet → Popup URL:
 // https://exotel-websdk.onrender.com/incoming-call
 app.post('/incoming-call', async (req, res) => {
-  console.log('[Incoming] Call received:', JSON.stringify(req.body));
+  // Exotel sends form data — merge body and query params
+  const params = Object.assign({}, req.query, req.body);
+  console.log('[Incoming] Call received:', JSON.stringify(params));
+
   try {
-    const callerNumber = req.body.From       || req.body.CallFrom || req.body.caller_id || 'Unknown';
-    const callSid      = req.body.CallSid    || req.body.call_sid || ('in_' + Date.now());
-    const toNumber     = req.body.To         || req.body.CallTo   || '+17182858933';
+    const callerNumber = params.From || params.CallFrom || params.caller_id || 
+                         params.CallerId || params.callerid || 'Unknown';
+    const callSid      = params.CallSid || params.call_sid || ('in_' + Date.now());
+    const toNumber     = params.To || params.CallTo || '+17182858933';
 
     console.log(`[Incoming] From: ${callerNumber} To: ${toNumber}`);
 
     if (BX24_WEBHOOK) {
-      // Register call in Bitrix24 CRM
       const registerResult = await bx24Call('telephony.externalcall.register', {
         USER_ID:         BX24_USER_ID,
         PHONE_NUMBER:    callerNumber,
-        TYPE:            2,              // 2 = inbound
+        TYPE:            2,
         CALL_START_DATE: new Date().toISOString(),
         CRM_CREATE:      true,
         LINE_NUMBER:     toNumber
       });
 
-      const bxCallId = registerResult?.CALL_ID || callSid;
+      const bxCallId = (registerResult && registerResult.CALL_ID) || callSid;
       console.log('[Incoming] Registered in BX24, CALL_ID:', bxCallId);
 
-      // Show incoming call popup to the agent in Bitrix24
       await bx24Call('telephony.externalcall.show', {
         CALL_ID: bxCallId,
         USER_ID: BX24_USER_ID
@@ -205,17 +207,12 @@ app.post('/incoming-call', async (req, res) => {
 
       console.log('[Incoming] Popup shown to agent in Bitrix24');
 
-      // Store for background.js to pick up
-      pendingInboundCall = {
-        from: callerNumber,
-        callSid: bxCallId,
-        ts: Date.now()
-      };
+      pendingInboundCall = { from: callerNumber, callSid: bxCallId, ts: Date.now() };
+    } else {
+      console.warn('[Incoming] BX24_WEBHOOK not set — skipping Bitrix24 notification');
     }
 
-    // Respond to Exotel (required to proceed with call routing)
     res.json({ status: 'received' });
-
   } catch (err) {
     console.error('[Incoming] Error:', err.message);
     res.json({ status: 'error', message: err.message });
