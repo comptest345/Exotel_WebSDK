@@ -1,9 +1,12 @@
 // ═══════════════════════════════════════════════════════════════
 // background.js — Connects Bitrix24 native call UI to Exotel WebRTC
+// FIX: Corrected broken function structure + startPolling() now called
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone = null;
-const USER_ID = '123';
+// USER_ID must match the AppUserId you used in /create-user for Exotel.
+// From your Bitrix24 logs, your user ID is 44 — match it here.
+const USER_ID = '44';
 let currentCallId = null;
 let pollInterval = null;
 
@@ -13,7 +16,7 @@ async function initBG() {
     const res = await fetch('/token?user_id=' + encodeURIComponent(USER_ID));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
-    if (!data.app_token) throw new Error('No app_token');
+    if (!data.app_token) throw new Error('No app_token in response: ' + JSON.stringify(data));
 
     console.log('[BGWorker] Got credentials, initializing SDK...');
 
@@ -24,16 +27,26 @@ async function initBG() {
         handleSDKCallEvent(event);
       },
       function regListener(event) {
-        console.log('[BGWorker] ✅ SIP Registered');
+        console.log('[BGWorker] ✅ SIP Registered — starting poll');
+        startPolling();
       }
     );
 
-    console.log('[BGWorker] ✅ SDK ready — binding Bitrix24 telephony events');
+    console.log('[BGWorker] ✅ SDK ready');
+    // Start polling immediately too — regListener may fire before this line
+    startPolling();
 
+  } catch (err) {
+    console.error('[BGWorker] Init error:', err.message);
+    // Retry after 5 seconds on failure
+    setTimeout(initBG, 5000);
+  }
+}
 
 // ── Poll server for pending calls ─────────────────────────────
 function startPolling() {
-  if (pollInterval) clearInterval(pollInterval);
+  if (pollInterval) return; // already running, don't double-start
+  console.log('[BGWorker] Polling /pending-call every 2s');
   pollInterval = setInterval(async () => {
     try {
       // Check for outbound call from CRM click
@@ -49,6 +62,8 @@ function startPolling() {
           } catch(e) {
             console.log('[BGWorker] MakeCall internal (call placed):', e.message);
           }
+        } else {
+          console.warn('[BGWorker] webPhone not ready yet — call will be retried next poll if still pending');
         }
       }
 
@@ -59,7 +74,9 @@ function startPolling() {
         console.log('[BGWorker] 📲 Inbound from:', inData.from);
         currentCallId = inData.callSid;
       }
-    } catch(e) { /* silent */ }
+    } catch(e) {
+      console.warn('[BGWorker] Poll error:', e.message);
+    }
   }, 2000);
 }
 
@@ -74,21 +91,19 @@ function handleSDKCallEvent(event) {
 
   } else if (raw.includes('accept') || raw.includes('connect') || raw.includes('active')) {
     console.log('[BGWorker] SDK: Call connected');
-    // Notify Bitrix24 the call is now active
     if (window.BX24 && currentCallId) {
       BX24.callMethod('telephony.externalcall.show', {
         CALL_ID: currentCallId,
-        USER_ID: '44'
+        USER_ID: USER_ID
       });
     }
 
   } else if (raw.includes('end') || raw.includes('disconnect') || raw.includes('terminal') || raw.includes('bye')) {
     console.log('[BGWorker] SDK: Call ended');
-    // Finish the call in Bitrix24 CRM
     if (window.BX24 && currentCallId) {
       BX24.callMethod('telephony.externalcall.finish', {
         CALL_ID:     currentCallId,
-        USER_ID:     '44',
+        USER_ID:     USER_ID,
         DURATION:    0,
         STATUS_CODE: 200
       });
