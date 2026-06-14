@@ -127,27 +127,26 @@ app.all('/install', (req, res) => {
 app.post('/bx24-call-start', async (req, res) => {
   console.log('[BX24-CallStart] Event received:', JSON.stringify(req.body));
   try {
-    const phoneNumber = req.body.PHONE_NUMBER || req.body.phone_number || '';
-    const userId      = req.body.USER_ID      || BX24_USER_ID;
-    const callId      = req.body.CALL_ID      || ('ext_' + Date.now());
+    // FIX: data is nested inside req.body.data
+    const eventData   = req.body.data || req.body;
+    const phoneNumber = eventData.PHONE_NUMBER || '';
+    const userId      = eventData.USER_ID || BX24_USER_ID;
+    const callId      = eventData.CALL_ID || ('ext_' + Date.now());
 
     console.log(`[BX24-CallStart] Outbound to: ${phoneNumber} by user: ${userId}`);
 
-    // Register the call in Bitrix24 CRM
+    // Store for background.js to pick up via polling
+    pendingOutboundCall = { number: phoneNumber, userId, callId, ts: Date.now() };
+
+    // Tell Bitrix24 we are handling this call — prevents native popup
     if (BX24_WEBHOOK && phoneNumber) {
-      await bx24Call('telephony.externalcall.register', {
+      await bx24Call('telephony.externalcall.show', {
+        CALL_ID:         callId,
         USER_ID:         userId,
         PHONE_NUMBER:    phoneNumber,
-        TYPE:            1,              // 1 = outbound
-        CALL_START_DATE: new Date().toISOString(),
-        CRM_CREATE:      true,
-        LINE_NUMBER:     '+17182858933'
+        TYPE:            1
       });
     }
-
-    // Tell background.js to open the dialer popup with the number
-    // We store it temporarily so background.js can pick it up
-    pendingOutboundCall = { number: phoneNumber, userId, callId, ts: Date.now() };
 
     res.json({ status: 'ok' });
   } catch (err) {
