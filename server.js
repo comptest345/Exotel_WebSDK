@@ -166,15 +166,18 @@ app.post('/bx24-call-start', async (req, res) => {
           CallerId:       virtualNumber,
           StatusCallback: 'https://exotel-websdk.onrender.com/call-callback'
         });
+        // NOTE: Append .json to force JSON response — without it Exotel returns XML
         const callRes = await fetch(
-          `https://${API_KEY}:${API_TOKEN}@${exotelHost}/v1/Accounts/${ACCOUNT_SID}/Calls/connect`,
+          `https://${API_KEY}:${API_TOKEN}@${exotelHost}/v1/Accounts/${ACCOUNT_SID}/Calls/connect.json`,
           {
             method:  'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body:    callPayload
           }
         );
-        const callData = await callRes.json();
+        const callRaw = await callRes.text();
+        let callData = {};
+        try { callData = JSON.parse(callRaw); } catch(e) { console.error('[BX24-CallStart] Non-JSON response from Exotel:', callRaw.slice(0, 200)); }
         console.log('[BX24-CallStart] Exotel call initiated:', JSON.stringify(callData));
         if (callData.Call && callData.Call.Sid) {
           // Replace the callId with Exotel's own SID so finish() works
@@ -210,43 +213,55 @@ app.get('/pending-call', (req, res) => {
   }
 });
 
+// Map: Exotel CallSid → BX24 CALL_ID (needed so /call-callback can finish the right BX24 call)
+const inboundCallMap = {};
+
 // ── Inbound call webhook (Exotel hits this as popup URL) ───────
 // Set this URL in Exotel App Bazaar → Connect applet → Popup URL:
 // https://exotel-websdk.onrender.com/incoming-call
-app.post('/incoming-call', async (req, res) => {
-  // Exotel sends form data — merge body and query params
+// IMPORTANT: Exotel sends a GET request to this URL, not POST — use app.all
+app.all('/incoming-call', async (req, res) => {
+  // Exotel sends params as query string (GET) — merge body too for safety
   const params = Object.assign({}, req.query, req.body);
   console.log('[Incoming] Call received:', JSON.stringify(params));
 
+  // Exotel fires this URL multiple times with different EventType values.
+  // Only handle the initial ringing event — ignore free/terminal/completed events.
+  const eventType = (params.EventType || params.Status || '').toLowerCase();
+  if (eventType && (eventType === 'free' || eventType === 'terminal' || eventType === 'completed' || eventType === 'busy' || eventType === 'noanswer')) {
+    console.log('[Incoming] Ignoring terminal event:', eventType);
+    return res.json({ status: 'ignored' });
+  }
+
   try {
-    const callerNumber = params.From || params.CallFrom || params.caller_id || 
+    const callerNumber = params.From || params.CallFrom || params.caller_id ||
                          params.CallerId || params.callerid || 'Unknown';
     const callSid      = params.CallSid || params.call_sid || ('in_' + Date.now());
-    const toNumber     = params.To || params.CallTo || '+17182858933';
+    const toNumber     = params.To || params.DialWhomNumber || params.CallTo || EXOTEL_VIRTUAL_NUMBER || 'Unknown';
 
-    console.log(`[Incoming] From: ${callerNumber} To: ${toNumber}`);
+    console.log(`[Incoming] From: ${callerNumber} To: ${toNumber} EventType: ${eventType}`);
 
     if (BX24_WEBHOOK) {
+      // SHOW: 1 triggers the native Bitrix24 incoming call popup immediately
+      // without needing a separate telephony.externalcall.show() call
       const registerResult = await bx24Call('telephony.externalcall.register', {
         USER_ID:         BX24_USER_ID,
         PHONE_NUMBER:    callerNumber,
-        TYPE:            2,
+        TYPE:            2,            // 2 = inbound call
         CALL_START_DATE: new Date().toISOString(),
         CRM_CREATE:      true,
-        LINE_NUMBER:     toNumber
+        LINE_NUMBER:     toNumber,
+        SHOW:            1             // Show native BX24 call popup right away
       });
 
       const bxCallId = (registerResult && registerResult.CALL_ID) || callSid;
       console.log('[Incoming] Registered in BX24, CALL_ID:', bxCallId);
 
-      await bx24Call('telephony.externalcall.show', {
-        CALL_ID: bxCallId,
-        USER_ID: BX24_USER_ID
-      });
-
-      console.log('[Incoming] Popup shown to agent in Bitrix24');
+      // Store mapping so /call-callback can finish the right BX24 call
+      inboundCallMap[callSid] = bxCallId;
 
       pendingInboundCall = { from: callerNumber, callSid: bxCallId, ts: Date.now() };
+      console.log('[Incoming] BX24 popup triggered, mapped', callSid, '→', bxCallId);
     } else {
       console.warn('[Incoming] BX24_WEBHOOK not set — skipping Bitrix24 notification');
     }
@@ -274,21 +289,30 @@ app.get('/pending-inbound', (req, res) => {
 });
 
 // ── Call ended webhook ─────────────────────────────────────────
-app.post('/call-callback', async (req, res) => {
-  console.log('[Callback] Call ended:', JSON.stringify(req.body));
+// Exotel posts here when any call (inbound or outbound) ends.
+// BX24 needs its own CALL_ID — for inbound, look it up from inboundCallMap.
+// For outbound, pendingOutboundCall.callId was the BX24 CALL_ID from OnExternalCallStart.
+app.all('/call-callback', async (req, res) => {
+  const params = Object.assign({}, req.query, req.body);
+  console.log('[Callback] Call ended:', JSON.stringify(params));
   try {
-    const callSid  = req.body.CallSid || req.body.call_sid || '';
-    const duration = parseInt(req.body.Duration || req.body.duration || '0');
-    const status   = req.body.Status  || req.body.status   || 'completed';
+    const exotelSid = params.CallSid || params.call_sid || '';
+    const duration  = parseInt(params.Duration || params.duration || '0');
+    const status    = params.Status  || params.status   || 'completed';
 
-    if (BX24_WEBHOOK && callSid) {
+    // Resolve BX24 CALL_ID: inbound calls are in inboundCallMap; outbound used BX24's own callId
+    const bxCallId = inboundCallMap[exotelSid] || exotelSid;
+    // Clean up the map entry
+    if (inboundCallMap[exotelSid]) delete inboundCallMap[exotelSid];
+
+    if (BX24_WEBHOOK && bxCallId) {
       await bx24Call('telephony.externalcall.finish', {
-        CALL_ID:        callSid,
-        USER_ID:        BX24_USER_ID,
-        DURATION:       duration,
-        STATUS_CODE:    status === 'completed' ? 200 : 304
+        CALL_ID:     bxCallId,
+        USER_ID:     BX24_USER_ID,
+        DURATION:    duration,
+        STATUS_CODE: status === 'completed' ? 200 : 304
       });
-      console.log('[Callback] Call finished in BX24');
+      console.log('[Callback] Call finished in BX24, CALL_ID:', bxCallId, 'duration:', duration);
     }
 
     res.json({ status: 'received' });
