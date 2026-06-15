@@ -76,7 +76,9 @@
 </div>
 
 <script src="//api.bitrix24.com/api/v1/"></script>
-<script src="/target/crmBundle.js"></script>
+<!-- crmBundle.js intentionally NOT loaded here. -->
+<!-- background.js owns the single SDK instance — loading it here would -->
+<!-- create a second SIP registration and cause double-calls. -->
 <script src="/popup.js"></script>
 </body>
 </html>
