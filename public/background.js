@@ -1,10 +1,9 @@
 // ═══════════════════════════════════════════════════════════════
-// background.js — Connects Bitrix24 native call UI to Exotel WebRTC
+// background.js — Single SDK instance. Owns all SIP/WebRTC audio.
+// Popup is a dumb UI — it polls /call-state and sends /call-action.
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone = null;
-// EXOTEL_APP_USER_ID — the AppUserId you used when calling /create-user on Exotel.
-// This is '123' (your Exotel side ID), NOT the Bitrix24 user ID (44).
 const EXOTEL_APP_USER_ID = '123';
 let currentCallId = null;
 let pollInterval = null;
@@ -40,12 +39,23 @@ async function initBG() {
   }
 }
 
-// ── Poll server for pending calls ─────────────────────────────
+// ── Post state update to server ───────────────────────────────
+function postState(state) {
+  fetch('/update-call-state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(state)
+  }).catch(e => console.warn('[BGWorker] postState error:', e.message));
+}
+
+// ── Poll server for pending calls and actions ──────────────────
 function startPolling() {
   if (pollInterval) return;
-  console.log('[BGWorker] Polling /pending-call every 2s');
+  console.log('[BGWorker] Polling /pending-call and /pending-action every 2s');
+
   pollInterval = setInterval(async () => {
     try {
+      // ── Poll for pending outbound call (from BX24 CRM click) ──
       const outRes  = await fetch('/pending-call');
       const outData = await outRes.json();
       if (outData.pending && outData.number) {
@@ -58,17 +68,36 @@ function startPolling() {
           } catch(e) {
             console.log('[BGWorker] MakeCall internal (call placed):', e.message);
           }
+          // Outbound via WebRTC auto-connects — Exotel dials the customer directly
+          postState({ state: 'active', number: outData.number });
         } else {
           console.warn('[BGWorker] webPhone not ready yet');
         }
       }
 
-      const inRes  = await fetch('/pending-inbound');
-      const inData = await inRes.json();
-      if (inData.pending && inData.from) {
-        console.log('[BGWorker] 📲 Inbound from:', inData.from);
-        currentCallId = inData.callSid;
+      // ── Poll for pending action (from popup UI: answer / hangup / makecall) ──
+      const actionRes  = await fetch('/pending-action');
+      const actionData = await actionRes.json();
+      if (actionData && actionData.action) {
+        console.log('[BGWorker] ⚡ Pending action:', actionData.action, actionData.number || '');
+        if (actionData.action === 'answer') {
+          if (webPhone) {
+            try { webPhone.AcceptCall(); } catch(e) { console.log('[BGWorker] AcceptCall:', e.message); }
+          }
+        } else if (actionData.action === 'hangup') {
+          if (webPhone) {
+            try { webPhone.HangupCall(); } catch(e) { console.log('[BGWorker] HangupCall:', e.message); }
+          }
+          postState({ state: 'idle', from: '', number: '' });
+        } else if (actionData.action === 'makecall') {
+          currentCallId = 'ext_' + Date.now();
+          if (webPhone) {
+            try { webPhone.MakeCall(actionData.number); } catch(e) { console.log('[BGWorker] MakeCall (action):', e.message); }
+            postState({ state: 'active', number: actionData.number });
+          }
+        }
       }
+
     } catch(e) {
       console.warn('[BGWorker] Poll error:', e.message);
     }
@@ -76,33 +105,31 @@ function startPolling() {
 }
 
 // ── Handle SDK call events ─────────────────────────────────────
+// background.js is the ONLY SDK instance — it posts all state changes
+// to the server so popup can reflect them via /call-state polling.
+// background.js does NOT make any BX24.callMethod() calls —
+// the server handles all BX24 telephony API calls via webhooks.
 function handleSDKCallEvent(event) {
   const raw = JSON.stringify(event).toLowerCase();
 
   if (raw.includes('incoming') || raw.includes('ringing')) {
-    const from = (event && (event.FromNumber || event.from)) || 'Unknown';
+    const from = (event && (event.callFromNumber || event.FromNumber || event.from)) || 'Unknown';
     console.log('[BGWorker] SDK: Incoming call from:', from);
+    // State is already set by /incoming-call webhook on the server.
+    // Just update the from number in case the SDK has more detail.
+    postState({ state: 'incoming', from: from });
+    // Do NOT auto-answer — agent accepts via popup UI (action: 'answer')
 
   } else if (raw.includes('accept') || raw.includes('connect') || raw.includes('active')) {
-    console.log('[BGWorker] SDK: Call connected');
-    if (window.BX24 && currentCallId) {
-      BX24.callMethod('telephony.externalcall.show', {
-        CALL_ID: currentCallId,
-        USER_ID: '44'  // BX24 user ID for Bitrix24 API calls
-      });
-    }
+    console.log('[BGWorker] SDK: Call connected/active');
+    postState({ state: 'active' });
 
   } else if (raw.includes('end') || raw.includes('disconnect') || raw.includes('terminal') || raw.includes('bye')) {
     console.log('[BGWorker] SDK: Call ended');
-    if (window.BX24 && currentCallId) {
-      BX24.callMethod('telephony.externalcall.finish', {
-        CALL_ID:     currentCallId,
-        USER_ID:     '44',  // BX24 user ID for Bitrix24 API calls
-        DURATION:    0,
-        STATUS_CODE: 200
-      });
-    }
+    postState({ state: 'idle', from: '', number: '' });
     currentCallId = null;
+    // NOTE: BX24 telephony.externalcall.finish is handled by /call-callback webhook on server.
+    // Do NOT call it here to avoid double-finishing.
   }
 }
 
