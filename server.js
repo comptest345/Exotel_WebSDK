@@ -15,15 +15,18 @@ const API_TOKEN    = process.env.EXOTEL_API_TOKEN;
 const DOMAIN       = process.env.EXOTEL_DOMAIN || 'singapore';
 const APP_ID       = process.env.EXOTEL_APP_ID;
 const APP_SECRET   = process.env.EXOTEL_APP_SECRET;
-const EXOTEL_APP_USER_ID = process.env.EXOTEL_APP_USER_ID || '123'; // Exotel AppUserId — NOT Bitrix24 user ID
+const EXOTEL_APP_USER_ID = process.env.EXOTEL_APP_USER_ID || '123';
 const EXOTEL_VIRTUAL_NUMBER = process.env.EXOTEL_VIRTUAL_NUMBER || '';
 
-// Bitrix24 webhook for server-side REST calls (set this in Render env)
-// Create it at: gsdny.bitrix24.in/devops/list/ → Add webhook → select telephony scope
 const BX24_WEBHOOK = process.env.BX24_WEBHOOK_URL || '';
-// Bitrix24 user ID of the agent (Khushil = 1 usually, check at /rest/user.current.json)
 const BX24_USER_ID = process.env.BX24_USER_ID || '1';
 const BX24_DOMAIN  = process.env.BX24_DOMAIN || 'gsdny.bitrix24.in';
+
+// ── In-memory call state (background.js is the single source of truth for SDK) ──
+let callState = { state: 'idle', from: '', number: '', callId: '' };
+
+// ── Pending action: popup → server → background.js ────────────
+let pendingAction = null;
 
 // ── Exotel token helpers ───────────────────────────────────────
 async function getCustomerToken() {
@@ -66,7 +69,7 @@ async function bx24Call(method, params) {
 app.all('/popup.html',     (req, res) => res.sendFile(path.join(__dirname, 'public', 'popup.html')));
 app.all('/background.html',(req, res) => res.sendFile(path.join(__dirname, 'public', 'background.html')));
 
-// ── Install — registers placements + external telephony line ──
+// ── Install — registers placements ────────────────────────────
 app.all('/install', (req, res) => {
   console.log('[Install] Called');
   res.send(`<!DOCTYPE html>
@@ -93,27 +96,35 @@ app.all('/install', (req, res) => {
           console.log('[Install] Background worker registered');
         }
 
-        // Step 2: Register external telephony line
-        // This makes Bitrix24 route CRM phone clicks to our app
-        BX24.callMethod('telephony.externalLine.add', {
-          LINE_NAME: 'Exotel',
-          APP_ID: BX24.getAuth().client_id
-        }, function(r2) {
-          var e2 = r2.error ? r2.error() : null;
-          if (e2) {
-            console.warn('[Install] externalLine.add warning:', e2.toString());
-          } else {
-            console.log('[Install] External telephony line registered:', r2.data());
-          }
+        // Step 2: Register CRM sidebar dialer
+        BX24.callMethod('placement.bind', {
+          PLACEMENT: 'CRM_ACTIVITY_SIDEBAR',
+          HANDLER: 'https://exotel-websdk.onrender.com/popup.html',
+          TITLE: 'Exotel Dialer'
+        }, function(rs) {
+          console.log('[Install] Sidebar registered');
 
-          // Step 3: Subscribe to outbound call event
-          BX24.callMethod('event.bind', {
-            EVENT: 'OnExternalCallStart',
-            HANDLER: 'https://exotel-websdk.onrender.com/bx24-call-start'
-          }, function(r3) {
-            console.log('[Install] OnExternalCallStart bound');
-            document.getElementById('msg').innerText = 'Exotel Dialer Installed!';
-            BX24.installFinish();
+          // Step 3: Register external telephony line
+          BX24.callMethod('telephony.externalLine.add', {
+            LINE_NAME: 'Exotel',
+            APP_ID: BX24.getAuth().client_id
+          }, function(r2) {
+            var e2 = r2.error ? r2.error() : null;
+            if (e2) {
+              console.warn('[Install] externalLine.add warning:', e2.toString());
+            } else {
+              console.log('[Install] External telephony line registered:', r2.data());
+            }
+
+            // Step 4: Subscribe to outbound call event
+            BX24.callMethod('event.bind', {
+              EVENT: 'OnExternalCallStart',
+              HANDLER: 'https://exotel-websdk.onrender.com/bx24-call-start'
+            }, function(r3) {
+              console.log('[Install] OnExternalCallStart bound');
+              document.getElementById('msg').innerText = 'Exotel Dialer Installed!';
+              BX24.installFinish();
+            });
           });
         });
       });
@@ -124,7 +135,8 @@ app.all('/install', (req, res) => {
 });
 
 // ── OnExternalCallStart webhook ────────────────────────────────
-// Bitrix24 hits this when agent clicks a phone number in CRM
+// Bitrix24 hits this when agent clicks a phone number in CRM.
+// Server stores the pending call — background.js does the actual MakeCall() via WebRTC.
 app.post('/bx24-call-start', async (req, res) => {
   console.log('[BX24-CallStart] Event received:', JSON.stringify(req.body));
   try {
@@ -135,61 +147,9 @@ app.post('/bx24-call-start', async (req, res) => {
 
     console.log(`[BX24-CallStart] Outbound to: ${phoneNumber} by user: ${userId}`);
 
-    // Store pending call for background worker (WebRTC path)
+    // Store pending call — background.js will pick this up and call MakeCall()
     pendingOutboundCall = { number: phoneNumber, userId, callId, ts: Date.now() };
-
-    // ── PRIMARY: Server-side Exotel outbound call ──────────────
-    // More reliable than waiting for background.js WebRTC poll.
-    // Exotel rings the agent's registered phone/softphone first,
-    // then bridges to the customer (phoneNumber).
-    try {
-      const at = await getAppToken();
-
-      // Look up the agent's virtual number from Exotel user mapping
-      const mapRes = await fetch(
-        `${BASE}/usermapping?user_id=${encodeURIComponent(EXOTEL_APP_USER_ID)}`,
-        { headers: { 'Authorization': at } }
-      );
-      const mapData = await mapRes.json();
-      const user = (mapData.Data && mapData.Data.Users && mapData.Data.Users.length > 0)
-        ? mapData.Data.Users[0]
-        : (mapData.Data && mapData.Data.SipId ? mapData.Data : null);
-      // Use user's VirtualNumber from Exotel, or fall back to EXOTEL_VIRTUAL_NUMBER env var
-      const virtualNumber = (user && user.VirtualNumber) || EXOTEL_VIRTUAL_NUMBER;
-
-      if (virtualNumber && API_KEY && API_TOKEN && ACCOUNT_SID) {
-        // Exotel Connect API: calls From (agent) then bridges to To (customer)
-        const exotelHost = DOMAIN === 'singapore' ? 'api.exotel.in' : 'api.exotel.com';
-        const callPayload = new URLSearchParams({
-          From:           virtualNumber,
-          To:             phoneNumber,
-          CallerId:       virtualNumber,
-          StatusCallback: 'https://exotel-websdk.onrender.com/call-callback'
-        });
-        // NOTE: Append .json to force JSON response — without it Exotel returns XML
-        const callRes = await fetch(
-          `https://${API_KEY}:${API_TOKEN}@${exotelHost}/v1/Accounts/${ACCOUNT_SID}/Calls/connect.json`,
-          {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body:    callPayload
-          }
-        );
-        const callRaw = await callRes.text();
-        let callData = {};
-        try { callData = JSON.parse(callRaw); } catch(e) { console.error('[BX24-CallStart] Non-JSON response from Exotel:', callRaw.slice(0, 200)); }
-        console.log('[BX24-CallStart] Exotel call initiated:', JSON.stringify(callData));
-        if (callData.Call && callData.Call.Sid) {
-          // Replace the callId with Exotel's own SID so finish() works
-          pendingOutboundCall.exotelSid = callData.Call.Sid;
-        }
-      } else {
-        console.warn('[BX24-CallStart] Server-side call skipped — virtualNumber:', virtualNumber, 'API creds:', !!(API_KEY && API_TOKEN && ACCOUNT_SID));
-      }
-    } catch (callErr) {
-      // Non-fatal: background.js WebRTC will attempt MakeCall as fallback
-      console.error('[BX24-CallStart] Server-side Exotel call error:', callErr.message);
-    }
+    console.log('[BX24-CallStart] Pending call stored, background.js will handle MakeCall()');
 
     res.json({ status: 'ok' });
   } catch (err) {
@@ -201,7 +161,7 @@ app.post('/bx24-call-start', async (req, res) => {
 // Temporary store for pending outbound call (picked up by background.js poll)
 let pendingOutboundCall = null;
 
-// ── Background worker polls this to get pending call ──────────
+// ── Background worker polls this to get pending outbound call ──
 app.get('/pending-call', (req, res) => {
   if (pendingOutboundCall && (Date.now() - pendingOutboundCall.ts) < 30000) {
     const call = pendingOutboundCall;
@@ -213,20 +173,45 @@ app.get('/pending-call', (req, res) => {
   }
 });
 
-// Map: Exotel CallSid → BX24 CALL_ID (needed so /call-callback can finish the right BX24 call)
+// ── Call state endpoints ───────────────────────────────────────
+
+// GET /call-state — popup polls this every second to update its UI
+app.get('/call-state', (req, res) => {
+  res.json(callState);
+});
+
+// POST /update-call-state — background.js posts SDK state changes here
+app.post('/update-call-state', (req, res) => {
+  callState = Object.assign(callState, req.body);
+  console.log('[CallState] Updated:', JSON.stringify(callState));
+  res.json({ status: 'ok' });
+});
+
+// ── Action endpoints (popup → server → background.js) ─────────
+
+// POST /call-action — popup sends user actions (answer / hangup / makecall)
+app.post('/call-action', (req, res) => {
+  const { action, number } = req.body;
+  pendingAction = { action, number };
+  console.log('[CallAction] Stored pending action:', JSON.stringify(pendingAction));
+  res.json({ status: 'ok' });
+});
+
+// GET /pending-action — background.js polls this; consumed on read
+app.get('/pending-action', (req, res) => {
+  const action = pendingAction;
+  pendingAction = null; // consume it
+  res.json(action || null);
+});
+
+// Map: Exotel CallSid → BX24 CALL_ID
 const inboundCallMap = {};
 
 // ── Inbound call webhook (Exotel hits this as popup URL) ───────
-// Set this URL in Exotel App Bazaar → Connect applet → Popup URL:
-// https://exotel-websdk.onrender.com/incoming-call
-// IMPORTANT: Exotel sends a GET request to this URL, not POST — use app.all
 app.all('/incoming-call', async (req, res) => {
-  // Exotel sends params as query string (GET) — merge body too for safety
   const params = Object.assign({}, req.query, req.body);
   console.log('[Incoming] Call received:', JSON.stringify(params));
 
-  // Exotel fires this URL multiple times with different EventType values.
-  // Only handle the initial ringing event — ignore free/terminal/completed events.
   const eventType = (params.EventType || params.Status || '').toLowerCase();
   if (eventType && (eventType === 'free' || eventType === 'terminal' || eventType === 'completed' || eventType === 'busy' || eventType === 'noanswer')) {
     console.log('[Incoming] Ignoring terminal event:', eventType);
@@ -242,26 +227,24 @@ app.all('/incoming-call', async (req, res) => {
     console.log(`[Incoming] From: ${callerNumber} To: ${toNumber} EventType: ${eventType}`);
 
     if (BX24_WEBHOOK) {
-      // SHOW: 1 triggers the native Bitrix24 incoming call popup immediately
-      // without needing a separate telephony.externalcall.show() call
       const registerResult = await bx24Call('telephony.externalcall.register', {
         USER_ID:         BX24_USER_ID,
         PHONE_NUMBER:    callerNumber,
-        TYPE:            2,            // 2 = inbound call
+        TYPE:            2,
         CALL_START_DATE: new Date().toISOString(),
         CRM_CREATE:      true,
         LINE_NUMBER:     toNumber,
-        SHOW:            1             // Show native BX24 call popup right away
+        SHOW:            1
       });
 
       const bxCallId = (registerResult && registerResult.CALL_ID) || callSid;
       console.log('[Incoming] Registered in BX24, CALL_ID:', bxCallId);
 
-      // Store mapping so /call-callback can finish the right BX24 call
       inboundCallMap[callSid] = bxCallId;
 
-      pendingInboundCall = { from: callerNumber, callSid: bxCallId, ts: Date.now() };
-      console.log('[Incoming] BX24 popup triggered, mapped', callSid, '→', bxCallId);
+      // Update shared call state so popup can show incoming panel
+      callState = { state: 'incoming', from: callerNumber, number: toNumber, callId: bxCallId };
+      console.log('[Incoming] callState updated to incoming');
     } else {
       console.warn('[Incoming] BX24_WEBHOOK not set — skipping Bitrix24 notification');
     }
@@ -273,25 +256,7 @@ app.all('/incoming-call', async (req, res) => {
   }
 });
 
-// Temporary store for pending inbound call
-let pendingInboundCall = null;
-
-// ── Background worker polls this for incoming calls ────────────
-app.get('/pending-inbound', (req, res) => {
-  if (pendingInboundCall && (Date.now() - pendingInboundCall.ts) < 30000) {
-    const call = pendingInboundCall;
-    pendingInboundCall = null;
-    res.json({ pending: true, from: call.from, callSid: call.callSid });
-  } else {
-    pendingInboundCall = null;
-    res.json({ pending: false });
-  }
-});
-
 // ── Call ended webhook ─────────────────────────────────────────
-// Exotel posts here when any call (inbound or outbound) ends.
-// BX24 needs its own CALL_ID — for inbound, look it up from inboundCallMap.
-// For outbound, pendingOutboundCall.callId was the BX24 CALL_ID from OnExternalCallStart.
 app.all('/call-callback', async (req, res) => {
   const params = Object.assign({}, req.query, req.body);
   console.log('[Callback] Call ended:', JSON.stringify(params));
@@ -300,9 +265,7 @@ app.all('/call-callback', async (req, res) => {
     const duration  = parseInt(params.Duration || params.duration || '0');
     const status    = params.Status  || params.status   || 'completed';
 
-    // Resolve BX24 CALL_ID: inbound calls are in inboundCallMap; outbound used BX24's own callId
     const bxCallId = inboundCallMap[exotelSid] || exotelSid;
-    // Clean up the map entry
     if (inboundCallMap[exotelSid]) delete inboundCallMap[exotelSid];
 
     if (BX24_WEBHOOK && bxCallId) {
@@ -314,6 +277,10 @@ app.all('/call-callback', async (req, res) => {
       });
       console.log('[Callback] Call finished in BX24, CALL_ID:', bxCallId, 'duration:', duration);
     }
+
+    // Reset call state
+    callState = { state: 'idle', from: '', number: '', callId: '' };
+    console.log('[Callback] callState reset to idle');
 
     res.json({ status: 'received' });
   } catch (err) {
@@ -334,7 +301,8 @@ app.get('/health', (req, res) => res.json({
   bx24_webhook_set:    !!BX24_WEBHOOK,
   bx24_user_id:        BX24_USER_ID,
   domain:              DOMAIN,
-  app_id_value:        APP_ID || 'NOT SET'
+  app_id_value:        APP_ID || 'NOT SET',
+  call_state:          callState
 }));
 
 app.get('/debug',     async (req, res) => { try { const t = await getCustomerToken(); res.json({ success: true, message: '✅ Customer token OK' }); } catch(e) { res.status(500).json({ error: e.message }); } });
