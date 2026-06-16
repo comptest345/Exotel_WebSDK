@@ -163,7 +163,7 @@ let pendingOutboundCall = null;
 
 // ── Background worker polls this to get pending outbound call ──
 app.get('/pending-call', (req, res) => {
-  if (pendingOutboundCall && (Date.now() - pendingOutboundCall.ts) < 30000) {
+  if (pendingOutboundCall && (Date.now() - pendingOutboundCall.ts) < 60000) {
     const call = pendingOutboundCall;
     pendingOutboundCall = null; // consume it
     res.json({ pending: true, number: call.number, callId: call.callId });
@@ -287,6 +287,13 @@ app.all('/call-callback', async (req, res) => {
     console.error('[Callback] Error:', err.message);
     res.json({ status: 'error', message: err.message });
   }
+});
+
+// ── Heartbeat: background.js pings this every 10s ─────────────
+// Use Render logs to verify background.js is alive and SDK state.
+app.post('/heartbeat', (req, res) => {
+  console.log('[Heartbeat] BGWorker alive — sdkReady:', req.body.sdkReady);
+  res.json({ status: 'ok' });
 });
 
 // ── Health ─────────────────────────────────────────────────────
