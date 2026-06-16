@@ -87,7 +87,8 @@ app.all('/install', (req, res) => {
       BX24.callMethod('placement.bind', {
         PLACEMENT: 'PAGE_BACKGROUND_WORKER',
         HANDLER: 'https://exotel-websdk.onrender.com/background.html',
-        TITLE: 'Exotel Background Worker'
+        TITLE: 'Exotel Background Worker',
+        OPTIONS: { errorHandlerUrl: 'https://exotel-websdk.onrender.com/error-handler.html' }
       }, function(r1) {
         var e1 = r1.error ? r1.error() : null;
         if (e1 && e1.toString().indexOf('ERROR_PLACEMENT_MAX_COUNT') === -1) {
@@ -162,13 +163,20 @@ app.post('/bx24-call-start', async (req, res) => {
 let pendingOutboundCall = null;
 
 // ── Background worker polls this to get pending outbound call ──
+// Counts incoming polls so we can prove background.js is hitting the server
+// even when there's nothing pending to deliver (logged every 15th tick = ~15s).
+let pollCount = 0;
+
 app.get('/pending-call', (req, res) => {
+  pollCount++;
+  if (pollCount % 15 === 1) console.log('[Poll] /pending-call hit #' + pollCount + ' (background.js is alive)');
   if (pendingOutboundCall && (Date.now() - pendingOutboundCall.ts) < 60000) {
     const call = pendingOutboundCall;
     pendingOutboundCall = null; // consume it
+    console.log('[Poll] /pending-call → delivered:', call.number);
     res.json({ pending: true, number: call.number, callId: call.callId });
   } else {
-    pendingOutboundCall = null;
+    if (pendingOutboundCall) pendingOutboundCall = null;
     res.json({ pending: false });
   }
 });
@@ -201,6 +209,7 @@ app.post('/call-action', (req, res) => {
 app.get('/pending-action', (req, res) => {
   const action = pendingAction;
   pendingAction = null; // consume it
+  if (action) console.log('[Poll] /pending-action → delivered:', JSON.stringify(action));
   res.json(action || null);
 });
 
@@ -287,6 +296,23 @@ app.all('/call-callback', async (req, res) => {
     console.error('[Callback] Error:', err.message);
     res.json({ status: 'error', message: err.message });
   }
+});
+
+// ── Diagnostic: verify PAGE_BACKGROUND_WORKER is actually bound ──
+app.get('/check-placements', async (req, res) => {
+  try {
+    const bgResult  = await bx24Call('placement.get', { PLACEMENT: 'PAGE_BACKGROUND_WORKER' });
+    const sideResult = await bx24Call('placement.get', { PLACEMENT: 'CRM_ACTIVITY_SIDEBAR' });
+    res.json({ PAGE_BACKGROUND_WORKER: bgResult, CRM_ACTIVITY_SIDEBAR: sideResult });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Client-side error/log reporting ────────────────────────────
+// background.js runs in a hidden iframe with no visible console.
+// It POSTs here so we can see what's happening in Render logs.
+app.post('/client-log', (req, res) => {
+  console.log('[ClientLog]', JSON.stringify(req.body));
+  res.json({ status: 'ok' });
 });
 
 // ── Heartbeat: background.js pings this every 10s ─────────────
