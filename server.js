@@ -262,6 +262,15 @@ app.get('/token', async (req, res) => {
   }
 });
 
+// ── Explicit route for crmBundle.js (ensures correct JS MIME type) ──
+app.get('/crmBundle.js', (req, res) => {
+  res.setHeader('Content-Type', 'application/javascript');
+  res.sendFile(path.join(__dirname, 'public', 'crmBundle.js'));
+});
+
+// ── Static files LAST ────────────────────────────────────────
+app.use(express.static(path.join(__dirname, 'public')));
+
 // ── Static files — MUST be last ───────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 
