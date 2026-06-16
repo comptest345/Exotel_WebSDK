@@ -67,9 +67,19 @@ async function bx24Call(method, params) {
   return data.result;
 }
 
-// ── Serve HTML files ──────────────────────────────────────────────
-app.all('/popup.html',      (req, res) => res.sendFile(path.join(__dirname, 'public', 'popup.html')));
-app.all('/background.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'background.html')));
+// ── FIX: Handle POST to static HTML files ───────────────────
+app.all('/popup.html',     (req, res) => res.sendFile(path.join(__dirname, 'public', 'popup.html')));
+app.all('/background.html',(req, res) => res.sendFile(path.join(__dirname, 'public', 'background.html')));
+
+// ── FIX: crmBundle.js lives in public/target/ not public/ ───
+app.get('/crmBundle.js', (req, res) => {
+  res.setHeader('Content-Type', 'application/javascript');
+  res.sendFile(path.join(__dirname, 'public', 'target', 'crmBundle.js'));
+});
+app.get('/crmBundle.js.LICENSE.txt', (req, res) => {
+  res.setHeader('Content-Type', 'text/plain');
+  res.sendFile(path.join(__dirname, 'public', 'target', 'crmBundle.js.LICENSE.txt'));
+});
 
 // ── Install ───────────────────────────────────────────────────────
 app.all('/install', (req, res) => {
@@ -270,9 +280,7 @@ app.get('/crmBundle.js', (req, res) => {
 
 // ── Static files LAST ────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
-
-// ── Static files — MUST be last ───────────────────────────────────
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public', 'target'))); // ← ADD THIS LINE
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`\u2705 Exotel WebSDK server on port ${PORT} | SIP: ${SIP_FB}`));
