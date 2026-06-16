@@ -393,13 +393,14 @@ app.get('/token', async (req, res) => {
     console.log('[Token] Returning credentials for user', user_id, '| sip_id:', user.SipId);
 
     res.json({
-      success:        true,
-      app_token:      at,
-      sip_id:         user.SipId,
-      sip_secret:     user.SipSecret,
-      virtual_number: user.VirtualNumber,
-      user_id:        user.AppUserId
-    });
+  success: true,
+  app_token:      at,
+  sip_id:         user.SipId,
+  sip_secret:     user.SipSecret,
+  sip_domain:     user.SipDomain || 'voip.in1.exotel.com', // ADD THIS
+  virtual_number: user.VirtualNumber,
+  user_id:        user.AppUserId
+});
   } catch(e) {
     console.error('[Token] Error:', e.message);
     res.status(500).json({ error: e.message });
