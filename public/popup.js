@@ -1,35 +1,24 @@
 // ═══════════════════════════════════════════════════════════════
-// popup.js — Owns the ONLY SDK instance (single SIP registration).
+// popup.js — Correct SDK initialization based on actual SDK source.
 //
-// This loads inside CRM_ACTIVITY_SIDEBAR — a VISIBLE iframe open
-// while the agent works a lead/contact/deal — so getUserMedia()
-// (microphone) actually has a normal permission context, unlike a
-// hidden PAGE_BACKGROUND_WORKER page.
-//
-// Outbound calls from typing a number in this UI, or from clicking
-// a phone number elsewhere in BX24 (which fires OnExternalCallStart
-// -> our server webhook -> /pending-call), both result in a direct
-// local webPhone.MakeCall() call — no relay through another page.
+// KEY FIX: ExotelCRMWebSDK constructor takes NO arguments.
+// sdk.Initialize() must be called with a full sipAccountInfo object:
+//   { userName, authUser, domain, sipdomain, secret, port, ... }
+// These come from /token (sip_id → userName/authUser, sip_secret → secret)
+// plus server-known SIP domain info returned from /token.
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone      = null;
 let sdkReady      = false;
-let queuedCall    = null;       // a call that arrived before the SDK was ready
-let currentUIState = 'idle';    // tracks last rendered state to avoid flicker
+let queuedCall    = null;
+let currentUIState = 'idle';
 let timerInterval = null;
 let timerSec      = 0;
 let pollInterval  = null;
-
-// FIX: Track whether we've already started SDK initialization so we never
-// call new ExotelCRMWebSDK() more than once per page session. A second call
-// with the same SIP user hits the SDK's internal dedup map and is silently
-// rejected — sdkReady never becomes true and the queued call hangs forever.
 let sdkInitStarted = false;
-let regHeartbeat   = null;  // setInterval handle for "still waiting" log
+let regHeartbeat   = null;
 
-const EXOTEL_APP_USER_ID = '123';
-
-// ── Logging — also mirrored to the server so Render logs show what's happening ──
+// ── Logging ──────────────────────────────────────────────────────
 function log(msg, extra) {
   console.log('[Dialer]', msg, extra || '');
   fetch('/client-log', {
@@ -97,7 +86,6 @@ function stopTimer() {
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
-// ── Mirror state to server (for logging / so /call-state stays accurate) ──
 function postState(state) {
   fetch('/update-call-state', {
     method: 'POST',
@@ -106,7 +94,7 @@ function postState(state) {
   }).catch(() => {});
 }
 
-// ── Place an outbound call — directly via the local SDK instance ──
+// ── Place an outbound call ───────────────────────────────────────
 function executeMakeCall(number) {
   if (sdkReady && webPhone) {
     log('MakeCall firing for ' + number);
@@ -126,7 +114,6 @@ function executeMakeCall(number) {
   }
 }
 
-// ── Outbound call from the dialer's own input box ──
 async function makeCall() {
   const number = document.getElementById('phone').value.trim();
   if (!number) { setStatus('Enter a number'); return; }
@@ -134,13 +121,10 @@ async function makeCall() {
   executeMakeCall(number);
 }
 
-// ── Accept incoming call — direct local SDK call ──
 async function acceptCall() {
   if (sdkReady && webPhone) {
     try { webPhone.AcceptCall(); log('AcceptCall fired'); }
     catch (e) { log('AcceptCall threw: ' + e.message); }
-  } else {
-    log('AcceptCall skipped — SDK not ready', { sdkReady, webPhoneExists: !!webPhone });
   }
   showActive(document.getElementById('callerNum').textContent);
   currentUIState = 'active';
@@ -148,7 +132,6 @@ async function acceptCall() {
   setStatus('');
 }
 
-// ── Reject incoming call ──
 async function rejectCall() {
   if (webPhone) {
     try { webPhone.HangupCall(); log('HangupCall (reject) fired'); }
@@ -160,7 +143,6 @@ async function rejectCall() {
   postState({ state: 'idle', from: '', number: '' });
 }
 
-// ── Hang up an active call ──
 async function hangUp() {
   if (webPhone) {
     try { webPhone.HangupCall(); log('HangupCall fired'); }
@@ -172,7 +154,6 @@ async function hangUp() {
   postState({ state: 'idle', from: '', number: '' });
 }
 
-// ── Handle SDK call events (i_new_call, accept_reject, connected, terminated) ──
 function handleSDKCallEvent(event) {
   const raw = JSON.stringify(event).toLowerCase();
   log('SDK event: ' + raw.slice(0, 200));
@@ -196,9 +177,6 @@ function handleSDKCallEvent(event) {
   }
 }
 
-// ── Poll for BX24-initiated outbound calls (agent clicked a phone number in CRM) ──
-// This is the one thing that genuinely has to go through the server, since the
-// OnExternalCallStart event fires to a server webhook, not to this page directly.
 function startPollingPendingCall() {
   if (pollInterval) return;
   pollInterval = setInterval(async () => {
@@ -209,17 +187,23 @@ function startPollingPendingCall() {
         log('BX24 outbound pending: ' + data.number);
         executeMakeCall(data.number);
       }
-    } catch (e) { /* network hiccup, ignore and retry next tick */ }
+    } catch (e) { /* ignore */ }
   }, 1000);
 }
 
-// ── SDK init — ONE attempt per page session. No retry with a fresh instance.
-// Retrying with new ExotelCRMWebSDK() poisons the SDK's internal dedup map:
-// the second call for the same SIP user is silently rejected ([Dup-Reg]) and
-// regListener never fires. If init fails, show a clear error and let the user
-// refresh the page (which gives a genuinely clean JS context).
+// ── SDK init — correct initialization based on SDK source ────────
+//
+// The ExotelCRMWebSDK (class ce) constructor takes NO arguments.
+// sdk.Initialize(callCb, regCb) internally calls initWebrtc() which
+// requires sipAccountInfo to have: userName, authUser, sipdomain, domain, port, secret.
+//
+// The SDK's initWebrtc() checks:
+//   if (!sipAccountInfo.userName || !sipAccountInfo.sipdomain || !sipAccountInfo.port) return false;
+//
+// Our /token endpoint returns sip_id and sip_secret from Exotel usermapping.
+// The server also returns the SIP domain config needed to build the WSS URL.
+// ────────────────────────────────────────────────────────────────
 async function initSDK() {
-  // FIX: Guard — never run more than once per page load.
   if (sdkInitStarted) {
     log('initSDK called again — ignoring (already started)');
     return;
@@ -230,61 +214,115 @@ async function initSDK() {
   setStatus('Connecting...');
 
   try {
-    // Wait for crmBundle.js to define ExotelCRMWebSDK (it's a script tag load,
-    // not a module import, so it may not be ready at DOMContentLoaded time).
-    // We poll briefly here rather than looping and creating fresh SDK instances.
+    // Wait for crmBundle.js to define ExotelCRMWebSDK
     let attempts = 0;
     while (typeof ExotelCRMWebSDK === 'undefined') {
       if (attempts++ > 20) throw new Error('ExotelCRMWebSDK not defined after 10s — crmBundle.js failed to load');
       await new Promise(r => setTimeout(r, 500));
     }
+    log('ExotelCRMWebSDK class available');
 
-    const res = await fetch('/token?user_id=' + encodeURIComponent(EXOTEL_APP_USER_ID));
+    // Fetch SIP credentials from server
+    // /token now returns: app_token, sip_id, sip_secret, sip_domain, sip_port
+    const res = await fetch('/token?user_id=123');
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
-    if (!data.app_token) throw new Error('No app_token in response: ' + JSON.stringify(data));
+    log('Token response received', {
+      has_sip_id: !!data.sip_id,
+      has_sip_secret: !!data.sip_secret,
+      sip_domain: data.sip_domain,
+      sip_port: data.sip_port
+    });
 
-    log('Token fetched, initializing SDK — single attempt...');
+    if (!data.sip_id) throw new Error('No sip_id in token response: ' + JSON.stringify(data));
+    if (!data.sip_secret) throw new Error('No sip_secret in token response: ' + JSON.stringify(data));
+    if (!data.sip_domain) throw new Error('No sip_domain in token response — server must provide it');
 
-    // FIX: Start a heartbeat so Render logs show "still waiting" every 5s
-    // instead of silence, making a stuck registration immediately visible.
+    // Build sipAccountInfo exactly as SDK's initWebrtc() / loadCredentials() expect:
+    //   userName    → displayed name & SIP username (sip_id from Exotel)
+    //   authUser    → SIP auth username (same as sip_id)
+    //   secret      → SIP password (sip_secret from Exotel)
+    //   domain      → hostname[:port] used to build WSS URL
+    //   sipdomain   → SIP registrar domain (used for sip: URI @domain part)
+    //   port        → WSS port (8089 for wss, 8088 for ws)
+    //   security    → 'wss'
+    //   endpoint    → 'ws' (path appended to WSS URL)
+    //   contactHost → public IP (SDK fetches via STUN, but we provide fallback)
+    const sipPort = data.sip_port || 8089;
+    const sipDomain = data.sip_domain;  // e.g. "singapore.exotel.com"
+
+    const sipAccountInfo = {
+      userName:    data.sip_id,
+      authUser:    data.sip_id,
+      secret:      data.sip_secret,
+      domain:      sipDomain + ':' + sipPort,   // txtHostNameWithPort → txtHostName + txtWSPort
+      sipdomain:   sipDomain,                    // used for sip: URI
+      port:        sipPort,
+      security:    'wss',
+      endpoint:    'ws',
+      displayName: data.sip_id,
+      accountName: data.sip_id,
+      contactHost: ''                            // SDK fills via STUN
+    };
+
+    log('sipAccountInfo built', {
+      userName: sipAccountInfo.userName,
+      domain: sipAccountInfo.domain,
+      sipdomain: sipAccountInfo.sipdomain,
+      port: sipAccountInfo.port,
+      wssURL: 'wss://' + sipAccountInfo.domain + '/ws'  // what SDK will build
+    });
+
+    // Start heartbeat so Render logs show registration progress
     let regWaitSec = 0;
     regHeartbeat = setInterval(() => {
       regWaitSec += 5;
       log('Still waiting for SIP registration... ' + regWaitSec + 's elapsed');
     }, 5000);
 
-    const sdk = new ExotelCRMWebSDK(data.app_token, EXOTEL_APP_USER_ID, false);
+    // ExotelCRMWebSDK constructor takes NO args per SDK source
+    const sdk = new ExotelCRMWebSDK();
+
+    // Initialize takes: sipAccountInfo, callCallback, registerCallback, sessionCallback
+    // Returns a promise that resolves to the webPhone object
     webPhone = await sdk.Initialize(
+      sipAccountInfo,
       function callListener(event) {
         handleSDKCallEvent(event);
       },
       function regListener(event) {
-        // FIX: Stop the "still waiting" heartbeat the moment registration lands.
         if (regHeartbeat) { clearInterval(regHeartbeat); regHeartbeat = null; }
-        log('SIP REGISTERED — SDK is now ready');
-        sdkReady = true;
-        setReg('registered');
-        setStatus('✅ Ready');
-        if (queuedCall) {
-          const n = queuedCall;
-          queuedCall = null;
-          log('Executing queued call now that SDK is ready: ' + n);
-          executeMakeCall(n);
+        const evStr = JSON.stringify(event).toLowerCase();
+        log('Registration event received: ' + evStr.slice(0, 200));
+        if (evStr.includes('registered') || evStr.includes('ready') || evStr.includes('connected')) {
+          log('SIP REGISTERED — SDK is now ready');
+          sdkReady = true;
+          setReg('registered');
+          setStatus('✅ Ready');
+          if (queuedCall) {
+            const n = queuedCall;
+            queuedCall = null;
+            log('Executing queued call now that SDK is ready: ' + n);
+            executeMakeCall(n);
+          }
+        } else if (evStr.includes('unregistered') || evStr.includes('error') || evStr.includes('failed')) {
+          log('SIP registration FAILED: ' + evStr);
+          setReg('failed');
+          setStatus('❌ Registration failed — please refresh');
         }
+      },
+      function sessionListener(event) {
+        log('Session event: ' + JSON.stringify(event).slice(0, 100));
       }
     );
 
-    log('SDK object created (waiting for SIP registration callback)');
-    // Do NOT loop or retry here. If regListener never fires, the heartbeat
-    // above will make that visible in Render logs. The user should refresh.
+    log('SDK.Initialize() returned — waiting for regListener callback');
 
   } catch (err) {
-    // FIX: Stop heartbeat on hard error too.
     if (regHeartbeat) { clearInterval(regHeartbeat); regHeartbeat = null; }
-    log('SDK init FAILED (will not retry — please refresh): ' + err.message, { stack: err.stack });
+    log('SDK init FAILED: ' + err.message, { stack: err.stack });
     setReg('failed');
-    setStatus('❌ Registration failed — please refresh this page');
+    setStatus('❌ Init failed — please refresh. Error: ' + err.message);
   }
 }
 
