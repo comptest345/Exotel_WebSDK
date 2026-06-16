@@ -1,24 +1,22 @@
 // ═══════════════════════════════════════════════════════════════
 // popup.js — Exotel WebRTC Dialer inside Bitrix24 CRM_ACTIVITY_SIDEBAR
 //
-// The SDK (ExotelCRMWebSDK) registers SIP directly from this visible
-// iframe so microphone permission works. No background worker needed.
-// MakeCall() fires directly here for outbound. Inbound calls come via
-// Exotel webhook → /incoming-call → server stores → we poll /pending-inbound.
+// Uses ExotelCRMWebSDK(accessToken, userId, autoConnect) — official constructor.
+// Inbound calls come via Exotel webhook → /incoming-call → server stores → we poll /pending-inbound.
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone      = null;
 let sdkReady      = false;
-let sdkInitDone   = false;   // guard: only init once per page load
-let queuedCall    = null;    // outbound queued before SDK was ready
+let sdkInitDone   = false;
+let queuedCall    = null;
 let timerInterval = null;
 let timerSec      = 0;
 let pollInterval  = null;
 
-const EXOTEL_APP_USER_ID = '123';  // Exotel AppUserId — NOT Bitrix24 user ID
+const EXOTEL_APP_USER_ID = '123';  // Exotel AppUserId
 const BX24_USER_ID       = '44';   // Bitrix24 user ID (Khushil)
 
-// ── Logging (mirrored to Render via /client-log) ───────────────
+// ── Logging ────────────────────────────────────────────────────
 function log(msg, extra) {
   console.log('[Dialer]', msg, extra !== undefined ? extra : '');
   fetch('/client-log', {
@@ -129,7 +127,6 @@ function executeMakeCall(number) {
     showActive(number);
   } catch (e) {
     log('MakeCall threw: ' + e.message + ' — retrying in 1s');
-    // Some SDK versions throw but the call still connects; retry once
     setTimeout(() => {
       try {
         webPhone.MakeCall(number);
@@ -178,15 +175,11 @@ async function hangUp() {
 }
 
 // ── Poll for BX24-originated outbound + inbound calls ──────────
-// Outbound: agent clicks phone number in CRM → BX24 fires OnExternalCallStart
-//           → our server stores it → we pick it up here and MakeCall()
-// Inbound:  Exotel hits /incoming-call → server stores → we show ringing UI
 function startPolling() {
   if (pollInterval) return;
   log('Starting poll for pending calls');
   pollInterval = setInterval(async () => {
     try {
-      // Check for BX24-originated outbound call
       const outRes  = await fetch('/pending-call');
       const outData = await outRes.json();
       if (outData.pending && outData.number) {
@@ -194,18 +187,19 @@ function startPolling() {
         executeMakeCall(outData.number);
       }
 
-      // Check for inbound call from Exotel
       const inRes  = await fetch('/pending-inbound');
       const inData = await inRes.json();
       if (inData.pending && inData.from) {
         log('Inbound call from: ' + inData.from);
         showIncoming(inData.from);
       }
-    } catch (e) { /* network hiccup, ignore */ }
+    } catch (e) { /* network hiccup */ }
   }, 1500);
 }
 
 // ── SDK Initialization ─────────────────────────────────────────
+// Uses official constructor: new ExotelCRMWebSDK(accessToken, userId, autoConnect)
+// Docs: https://github.com/exotel/exotel-voip-websdk-crm-sample-app
 async function initSDK() {
   if (sdkInitDone) return;
   sdkInitDone = true;
@@ -213,7 +207,7 @@ async function initSDK() {
   setStatus('Connecting...');
 
   try {
-    // 1. Wait for crmBundle.js to load
+    // 1. Wait for crmBundle.js to define ExotelCRMWebSDK
     let wait = 0;
     while (typeof ExotelCRMWebSDK === 'undefined') {
       if (wait++ > 20) throw new Error('crmBundle.js did not load after 10s');
@@ -226,39 +220,26 @@ async function initSDK() {
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
 
-    if (!data.app_token)  throw new Error('No app_token: '  + JSON.stringify(data));
-    if (!data.sip_id)     throw new Error('No sip_id: '     + JSON.stringify(data));
-    if (!data.sip_secret) throw new Error('No sip_secret: ' + JSON.stringify(data));
+    if (!data.access_token) throw new Error('No access_token in /token response: ' + JSON.stringify(data));
+    if (!data.app_user_id)  throw new Error('No app_user_id in /token response: '  + JSON.stringify(data));
 
-    // Use sip_domain from server (set by Exotel usermapping API), with fallback
-    const sipDomain = data.sip_domain || 'voip.in1.exotel.com';
-    log('Credentials: sip_id=' + data.sip_id + ' sipdomain=' + sipDomain);
+    log('Credentials: access_token=<hidden> app_user_id=' + data.app_user_id);
 
-    // 3. Build sipAccountInfo using server-provided values
-    const sipAccountInfo = {
-      userName:    data.sip_id,     // e.g. "exo_usr_xxxx"
-      password:    data.sip_secret, // SIP secret from usermapping
-      sipdomain:   sipDomain,       // from Exotel API — do NOT hardcode
-      port:        '5061',          // TLS SIP port
-      displayName: data.sip_id,
-      appToken:    data.app_token   // app-level JWT
-    };
+    // 3. Instantiate with official constructor signature:
+    //    new ExotelCRMWebSDK(accessToken, userId, autoConnectVOIP)
+    //    accessToken: JWT from /v2/accounts/{sid}/configuration/basicauth
+    //    userId:      Exotel AppUserId (e.g. "123")
+    //    autoConnect: true → SDK calls DoRegister automatically
+    const sdk = new ExotelCRMWebSDK(data.access_token, data.app_user_id, true);
 
-    log('sipAccountInfo built — sipdomain: ' + sipAccountInfo.sipdomain);
-
-    // 4. Instantiate with NO arguments (constructor ignores them)
-    const sdk = new ExotelCRMWebSDK();
-
-    // 5. Initialize with sipAccountInfo + all 3 required callbacks
+    // 4. Initialize — returns Promise<ExotelWebPhoneSDK>
     webPhone = await sdk.Initialize(
-      sipAccountInfo,
-
-      // callListener — fires on call state changes
+      // callListener — inbound/outbound call state changes
       function callListener(event) {
         handleCallEvent(event);
       },
 
-      // regListener — SIP registration result (success or failure)
+      // regListener — SIP registration result
       function regListener(event) {
         const evStr = JSON.stringify(event);
         log('regListener fired: ' + evStr.slice(0, 200));
@@ -276,7 +257,6 @@ async function initSDK() {
         setReg('registered');
         setStatus('✅ Ready');
 
-        // Drain any queued outbound call that arrived before SDK was ready
         if (queuedCall) {
           const n = queuedCall;
           queuedCall = null;
@@ -285,7 +265,7 @@ async function initSDK() {
         }
       },
 
-      // sessionListener — required by SDK signature
+      // sessionListener
       function sessionListener(event) {
         log('Session event: ' + JSON.stringify(event).slice(0, 80));
       }
@@ -293,8 +273,6 @@ async function initSDK() {
 
     log('SDK.Initialize() resolved — webPhone=' + (webPhone ? 'object' : String(webPhone)));
 
-    // If Initialize() itself returns the ready phone object (some SDK versions),
-    // treat that as registration success immediately
     if (webPhone && !sdkReady) {
       log('Initialize returned webPhone directly — marking sdkReady=true');
       sdkReady = true;
@@ -308,12 +286,12 @@ async function initSDK() {
       }
     }
 
-    // Timeout guard — if regListener never fires in 15s, surface the error
+    // 15s guard — if regListener never fires
     setTimeout(() => {
       if (!sdkReady) {
-        log('⚠️ regListener never fired after 15s — SIP registration hung or wrong domain/port');
+        log('⚠️ regListener never fired after 15s — check access_token or Exotel app config');
         setReg('failed');
-        setStatus('❌ SIP timed out — check sipdomain (' + sipDomain + ') and port');
+        setStatus('❌ SIP timed out — verify access_token and Exotel app user');
       }
     }, 15000);
 

@@ -10,10 +10,10 @@ app.use(express.urlencoded({ extended: true }));
 const BASE            = 'https://integrationscore.mum1.exotel.com/v2/integrations';
 const CUSTOMER_ID     = process.env.EXOTEL_CUSTOMER_ID;
 const CUSTOMER_SECRET = process.env.EXOTEL_CUSTOMER_SECRET;
-const ACCOUNT_SID     = process.env.EXOTEL_ACCOUNT_SID;
+const ACCOUNT_SID     = process.env.EXOTEL_ACCOUNT_SID;   // e.g. jkstar1
 const API_KEY         = process.env.EXOTEL_API_KEY;
 const API_TOKEN       = process.env.EXOTEL_API_TOKEN;
-const DOMAIN          = process.env.EXOTEL_DOMAIN || 'singapore';   // e.g. "singapore"
+const DOMAIN          = process.env.EXOTEL_DOMAIN || 'singapore';
 const APP_ID          = process.env.EXOTEL_APP_ID;
 const APP_SECRET      = process.env.EXOTEL_APP_SECRET;
 const APP_USER_ID     = process.env.EXOTEL_APP_USER_ID || '123';
@@ -23,10 +23,21 @@ const BX24_WEBHOOK    = process.env.BX24_WEBHOOK_URL || '';
 const BX24_USER_ID    = process.env.BX24_USER_ID || '1';
 const BX24_DOMAIN     = process.env.BX24_DOMAIN   || 'gsdny.bitrix24.in';
 
+// Singapore account: SIP gateway is voip.sgp1.exotel.com:443 (WSS)
+// Mumbai account:    SIP gateway is voip.in1.exotel.com:443 (WSS)
+const SIP_DOMAIN_FALLBACK = (DOMAIN === 'mumbai' || DOMAIN === 'india')
+  ? 'voip.in1.exotel.com'
+  : 'voip.sgp1.exotel.com';   // default = Singapore
+
+// CCM API base — Singapore uses ccm-api.exotel.com, Mumbai uses ccm-api.in.exotel.com
+const CCM_BASE = (DOMAIN === 'mumbai' || DOMAIN === 'india')
+  ? 'https://ccm-api.in.exotel.com'
+  : 'https://ccm-api.exotel.com';   // Singapore
+
 // ── In-memory state ─────────────────────────────────────────────
-let pendingOutboundCall = null;   // set by /bx24-call-start, consumed by /pending-call
-let pendingInboundCall  = null;   // set by /incoming-call,   consumed by /pending-inbound
-const inboundCallMap    = {};     // exotelSid → BX24 CALL_ID
+let pendingOutboundCall = null;
+let pendingInboundCall  = null;
+const inboundCallMap    = {};
 let pollCount = 0;
 
 // ── Exotel token helpers ─────────────────────────────────────────
@@ -52,6 +63,30 @@ async function getAppToken() {
   return data.Data;
 }
 
+// ── Generate a real CCM access token for the WebSDK ──────────────
+// This calls POST /v2/accounts/{sid}/configuration/basicauth
+// Returns a short-lived JWT that ExotelCRMWebSDK constructor expects.
+async function getCCMAccessToken() {
+  if (!ACCOUNT_SID || !API_KEY || !API_TOKEN) {
+    throw new Error('EXOTEL_ACCOUNT_SID, EXOTEL_API_KEY, EXOTEL_API_TOKEN must all be set');
+  }
+  const credentials = Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
+  const url = `${CCM_BASE}/v2/accounts/${ACCOUNT_SID}/configuration/basicauth`;
+  const res = await fetch(url, {
+    method:  'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Basic ${credentials}`
+    }
+  });
+  const data = JSON.parse(await res.text());
+  if (!res.ok) throw new Error(`CCM basicauth failed [${res.status}]: ${JSON.stringify(data)}`);
+  // Response shape: { "access_token": "<jwt>" }
+  const token = data.access_token || data.data?.access_token || data.Data?.access_token;
+  if (!token) throw new Error('CCM basicauth returned no access_token: ' + JSON.stringify(data));
+  return token;
+}
+
 // ── Bitrix24 REST helper ─────────────────────────────────────────
 async function bx24Call(method, params) {
   if (!BX24_WEBHOOK) throw new Error('BX24_WEBHOOK_URL not set');
@@ -66,12 +101,11 @@ async function bx24Call(method, params) {
   return data.result;
 }
 
-// ── Serve HTML files (handle both GET and POST) ──────────────────
+// ── Serve HTML files ─────────────────────────────────────────────
 app.all('/popup.html',      (req, res) => res.sendFile(path.join(__dirname, 'public', 'popup.html')));
 app.all('/background.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'background.html')));
 
 // ── Install ──────────────────────────────────────────────────────
-// Registers CRM_ACTIVITY_SIDEBAR placement + telephony line + event handler
 app.all('/install', (req, res) => {
   console.log('[Install] Called');
   res.send(`<!DOCTYPE html>
@@ -84,10 +118,6 @@ app.all('/install', (req, res) => {
   <p id="msg">Installing Exotel Dialer...</p>
   <script>
     BX24.init(function() {
-
-      // Step 1: Register the popup dialer inside CRM sidebar
-      // This is a VISIBLE iframe so microphone permission works correctly.
-      // The SDK (WebRTC) runs here, not in a hidden background worker.
       BX24.callMethod('placement.bind', {
         PLACEMENT: 'CRM_ACTIVITY_SIDEBAR',
         HANDLER:   'https://exotel-websdk.onrender.com/popup.html',
@@ -99,9 +129,6 @@ app.all('/install', (req, res) => {
         } else {
           console.log('[Install] CRM_ACTIVITY_SIDEBAR registered');
         }
-
-        // Step 2: Register Exotel as an external telephony line in Bitrix24.
-        // This makes phone number clicks in CRM route to our app via OnExternalCallStart.
         BX24.callMethod('telephony.externalLine.add', {
           LINE_NAME: 'Exotel',
           APP_ID:    BX24.getAuth().client_id
@@ -112,10 +139,6 @@ app.all('/install', (req, res) => {
           } else {
             console.log('[Install] External telephony line registered:', r2.data());
           }
-
-          // Step 3: Subscribe to outbound call event.
-          // Fires when agent clicks a phone number in CRM — our server receives it,
-          // stores the number, and popup.js picks it up via /pending-call poll.
           BX24.callMethod('event.bind', {
             EVENT:   'OnExternalCallStart',
             HANDLER: 'https://exotel-websdk.onrender.com/bx24-call-start'
@@ -132,12 +155,7 @@ app.all('/install', (req, res) => {
 </html>`);
 });
 
-// ── OnExternalCallStart (agent clicked phone number in CRM) ──────
-// Bitrix24 posts here when an agent clicks a phone number.
-// We store the number so popup.js can pick it up via /pending-call.
-// NOTE: We do NOT make a server-side Exotel call here anymore.
-//       The WebRTC SDK in popup.js calls MakeCall() directly —
-//       no need for the agent to accept a separate softphone ring.
+// ── OnExternalCallStart ──────────────────────────────────────────
 app.post('/bx24-call-start', async (req, res) => {
   console.log('[BX24-CallStart] Received:', JSON.stringify(req.body));
   try {
@@ -145,12 +163,8 @@ app.post('/bx24-call-start', async (req, res) => {
     const phoneNumber = eventData.PHONE_NUMBER || '';
     const userId      = eventData.USER_ID      || BX24_USER_ID;
     const callId      = eventData.CALL_ID      || ('ext_' + Date.now());
-
     console.log(`[BX24-CallStart] Outbound to: ${phoneNumber}, userId: ${userId}, callId: ${callId}`);
-
-    // Store for popup.js to consume via /pending-call
     pendingOutboundCall = { number: phoneNumber, userId, callId, ts: Date.now() };
-
     res.json({ status: 'ok' });
   } catch (err) {
     console.error('[BX24-CallStart] Error:', err.message);
@@ -158,14 +172,13 @@ app.post('/bx24-call-start', async (req, res) => {
   }
 });
 
-// ── /pending-call — popup.js polls this for BX24-originated outbound calls ──
+// ── /pending-call ────────────────────────────────────────────────
 app.get('/pending-call', (req, res) => {
   pollCount++;
   if (pollCount % 20 === 1) console.log('[Poll] /pending-call hit #' + pollCount + ' (popup.js alive)');
-
   if (pendingOutboundCall && (Date.now() - pendingOutboundCall.ts) < 30000) {
     const call      = pendingOutboundCall;
-    pendingOutboundCall = null;  // consume
+    pendingOutboundCall = null;
     console.log('[Poll] /pending-call → delivering:', call.number);
     res.json({ pending: true, number: call.number, callId: call.callId });
   } else {
@@ -174,54 +187,40 @@ app.get('/pending-call', (req, res) => {
   }
 });
 
-// ── /incoming-call — Exotel posts/gets here when an inbound call arrives ────
-// Set this URL in Exotel App Bazaar → your app → Popup URL:
-//   https://exotel-websdk.onrender.com/incoming-call
-// Exotel fires GET with query params. We register the call in BX24 and
-// store it so popup.js can show the ringing UI via /pending-inbound.
+// ── /incoming-call ───────────────────────────────────────────────
 app.all('/incoming-call', async (req, res) => {
   const params = Object.assign({}, req.query, req.body);
   console.log('[Incoming] Received:', JSON.stringify(params));
-
-  // Exotel sends multiple events (ringing, terminal, free…) — only handle ringing
   const eventType = (params.EventType || params.Status || '').toLowerCase();
   if (['free', 'terminal', 'completed', 'busy', 'noanswer'].includes(eventType)) {
     console.log('[Incoming] Ignoring terminal event:', eventType);
     return res.json({ status: 'ignored' });
   }
-
   try {
     const callerNumber = params.From || params.CallFrom || params.caller_id ||
                          params.CallerId || params.callerid || 'Unknown';
     const callSid      = params.CallSid || params.call_sid || ('in_' + Date.now());
     const toNumber     = params.To || params.DialWhomNumber || params.CallTo ||
                          VIRTUAL_NUMBER || 'Unknown';
-
     console.log(`[Incoming] From: ${callerNumber}, To: ${toNumber}, EventType: ${eventType}`);
-
     if (BX24_WEBHOOK) {
-      // Register with BX24 — SHOW:1 pops the native BX24 call notification
       const result = await bx24Call('telephony.externalcall.register', {
         USER_ID:         BX24_USER_ID,
         PHONE_NUMBER:    callerNumber,
-        TYPE:            2,              // 2 = inbound
+        TYPE:            2,
         CALL_START_DATE: new Date().toISOString(),
         CRM_CREATE:      true,
         LINE_NUMBER:     toNumber,
-        SHOW:            1               // shows BX24 native call popup
+        SHOW:            1
       });
-
       const bxCallId = (result && result.CALL_ID) || callSid;
       console.log('[Incoming] BX24 registered, CALL_ID:', bxCallId);
       inboundCallMap[callSid] = bxCallId;
-
-      // Store so popup.js polls and shows ringing UI
       pendingInboundCall = { from: callerNumber, callSid: bxCallId, ts: Date.now() };
     } else {
       console.warn('[Incoming] BX24_WEBHOOK not set — skipping BX24 notification');
       pendingInboundCall = { from: callerNumber, callSid, ts: Date.now() };
     }
-
     res.json({ status: 'received' });
   } catch (err) {
     console.error('[Incoming] Error:', err.message);
@@ -229,11 +228,11 @@ app.all('/incoming-call', async (req, res) => {
   }
 });
 
-// ── /pending-inbound — popup.js polls this for inbound calls ────
+// ── /pending-inbound ─────────────────────────────────────────────
 app.get('/pending-inbound', (req, res) => {
   if (pendingInboundCall && (Date.now() - pendingInboundCall.ts) < 30000) {
     const call     = pendingInboundCall;
-    pendingInboundCall = null;  // consume
+    pendingInboundCall = null;
     console.log('[Poll] /pending-inbound → delivering from:', call.from);
     res.json({ pending: true, from: call.from, callSid: call.callSid });
   } else {
@@ -242,8 +241,7 @@ app.get('/pending-inbound', (req, res) => {
   }
 });
 
-// ── /call-callback — Exotel posts here when any call ends ───────
-// Configure in Exotel: StatusCallback = https://exotel-websdk.onrender.com/call-callback
+// ── /call-callback ───────────────────────────────────────────────
 app.all('/call-callback', async (req, res) => {
   const params = Object.assign({}, req.query, req.body);
   console.log('[Callback] Call ended:', JSON.stringify(params));
@@ -251,11 +249,8 @@ app.all('/call-callback', async (req, res) => {
     const exotelSid = params.CallSid || params.call_sid || '';
     const duration  = parseInt(params.Duration || params.duration || '0');
     const status    = params.Status  || params.status   || 'completed';
-
-    // Resolve BX24 CALL_ID — inbound calls are mapped, outbound used BX24's callId
-    const bxCallId = inboundCallMap[exotelSid] || exotelSid;
+    const bxCallId  = inboundCallMap[exotelSid] || exotelSid;
     if (inboundCallMap[exotelSid]) delete inboundCallMap[exotelSid];
-
     if (BX24_WEBHOOK && bxCallId) {
       await bx24Call('telephony.externalcall.finish', {
         CALL_ID:     bxCallId,
@@ -265,7 +260,6 @@ app.all('/call-callback', async (req, res) => {
       });
       console.log('[Callback] BX24 call finished, CALL_ID:', bxCallId, 'duration:', duration + 's');
     }
-
     res.json({ status: 'received' });
   } catch (err) {
     console.error('[Callback] Error:', err.message);
@@ -273,7 +267,7 @@ app.all('/call-callback', async (req, res) => {
   }
 });
 
-// ── Client-side log relay (popup.js → Render logs) ──────────────
+// ── Client-side log relay ────────────────────────────────────────
 app.post('/client-log', (req, res) => {
   console.log('[ClientLog]', JSON.stringify(req.body));
   res.json({ status: 'ok' });
@@ -282,6 +276,7 @@ app.post('/client-log', (req, res) => {
 // ── Health check ─────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
   status:              'ok',
+  account_sid:         ACCOUNT_SID || 'NOT SET',
   customer_id_set:     !!CUSTOMER_ID,
   customer_secret_set: !!CUSTOMER_SECRET,
   app_id_set:          !!APP_ID,
@@ -291,11 +286,13 @@ app.get('/health', (req, res) => res.json({
   bx24_webhook_set:    !!BX24_WEBHOOK,
   bx24_user_id:        BX24_USER_ID,
   domain:              DOMAIN,
+  sip_domain_fallback: SIP_DOMAIN_FALLBACK,
+  ccm_base:            CCM_BASE,
   app_user_id:         APP_USER_ID,
   virtual_number_set:  !!VIRTUAL_NUMBER
 }));
 
-// ── Debug / Setup endpoints ──────────────────────────────────────
+// ── Debug endpoints ──────────────────────────────────────────────
 app.get('/debug',     async (req, res) => {
   try { await getCustomerToken(); res.json({ success: true, message: '✅ Customer token OK' }); }
   catch(e) { res.status(500).json({ error: e.message }); }
@@ -304,6 +301,13 @@ app.get('/debug',     async (req, res) => {
 app.get('/debug-app', async (req, res) => {
   try { await getAppToken(); res.json({ success: true, message: '✅ App token OK' }); }
   catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/debug-ccm-token', async (req, res) => {
+  try {
+    const token = await getCCMAccessToken();
+    res.json({ success: true, message: '✅ CCM access_token obtained', token_preview: token.slice(0, 30) + '...' });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/debug-token', async (req, res) => {
@@ -353,13 +357,13 @@ app.post('/create-user', async (req, res) => {
       method:  'POST',
       headers: { 'Authorization': at, 'Content-Type': 'application/json' },
       body:    JSON.stringify([{
-        AppUserId:       appUserId,
-        AppUsername:     appUsername,
-        Email:           email,
+        AppUserId:        appUserId,
+        AppUsername:      appUsername,
+        Email:            email,
         ExotelAccountSid: ACCOUNT_SID,
-        ExotelUserName:  appUsername,
-        AgentNumber:     agentNumber || '',
-        VirtualNumber:   virtualNumber
+        ExotelUserName:   appUsername,
+        AgentNumber:      agentNumber || '',
+        VirtualNumber:    virtualNumber
       }])
     });
     const data = JSON.parse(await r.text());
@@ -368,38 +372,24 @@ app.post('/create-user', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── /token — WebRTC SDK credential endpoint ──────────────────────
-// Returns app_token (for SDK auth) + sip_id + sip_secret (SIP credentials).
-// popup.js passes credentials via sipAccountInfo to sdk.Initialize()
+// ── /token — WebSDK credential endpoint ─────────────────────────
+// Returns CCM access_token (JWT) for ExotelCRMWebSDK constructor +
+// app_user_id for the second constructor argument.
+// The SDK itself fetches SIP credentials internally using the access_token.
 app.get('/token', async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
 
-    const at   = await getAppToken();
-    const r    = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(user_id)}`, {
-      headers: { 'Authorization': at }
-    });
-    const data = JSON.parse(await r.text());
-    if (!r.ok) throw new Error(`Usermapping failed [${r.status}]: ${JSON.stringify(data)}`);
+    // Generate CCM JWT — this is what ExotelCRMWebSDK(accessToken, ...) needs
+    const accessToken = await getCCMAccessToken();
 
-    // Handle both response shapes the API returns
-    let user = data.Data?.Users?.length > 0
-      ? data.Data.Users[0]
-      : (data.Data?.SipId ? data.Data : null);
-
-    if (!user) throw new Error('User not found in usermapping: ' + JSON.stringify(data));
-
-    console.log('[Token] Returning credentials for user', user_id, '| sip_id:', user.SipId);
+    console.log('[Token] Returning CCM access_token for user', user_id);
 
     res.json({
-      success:        true,
-      app_token:      at,
-      sip_id:         user.SipId,
-      sip_secret:     user.SipSecret,
-      sip_domain:     user.SipDomain || 'voip.in1.exotel.com',
-      virtual_number: user.VirtualNumber,
-      user_id:        user.AppUserId
+      success:       true,
+      access_token:  accessToken,   // ← ExotelCRMWebSDK constructor arg 1
+      app_user_id:   user_id        // ← ExotelCRMWebSDK constructor arg 2
     });
   } catch(e) {
     console.error('[Token] Error:', e.message);
