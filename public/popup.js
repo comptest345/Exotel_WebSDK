@@ -277,8 +277,15 @@ async function initSDK() {
     );
 
     log('SDK.Initialize() awaited — waiting for regListener...');
+    // Timeout guard — if regListener doesn't fire in 15s, surface the failure
+setTimeout(() => {
+  if (!sdkReady) {
+    log('⚠️ regListener never fired after 15s — SIP registration hung');
+    setReg('failed');
+    setStatus('❌ SIP registration timed out — check sipdomain/port/credentials');
+  }
+}, 15000);
     startPolling();
-
   } catch (err) {
     log('SDK init FAILED: ' + err.message);
     setReg('failed');
