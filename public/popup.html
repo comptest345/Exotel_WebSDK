@@ -1,87 +1,129 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Exotel Dialer</title>
+  <script src="/crmBundle.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: Arial, sans-serif; background: #f0f2f5; display: flex; justify-content: center; padding: 16px; }
-    .dialer { background: white; border-radius: 12px; padding: 20px; width: 100%; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); }
-    .header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; border-bottom: 1px solid #eee; padding-bottom: 12px; }
-    .header h3 { font-size: 16px; color: #333; }
-    .reg-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #666; margin-bottom: 14px; }
-    .dot { width: 9px; height: 9px; border-radius: 50%; background: #ccc; flex-shrink: 0; }
-    .dot.green  { background: #4CAF50; }
-    .dot.red    { background: #f44336; }
-    .dot.yellow { background: #FFC107; animation: pulse 1s infinite; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #f4f5f7; display: flex; justify-content: center;
+           align-items: flex-start; padding: 20px; min-height: 100vh; }
+    .card { background: #fff; border-radius: 12px; box-shadow: 0 2px 16px rgba(0,0,0,0.12);
+            padding: 24px; width: 100%; max-width: 360px; }
+    .header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px;
+              padding-bottom: 14px; border-bottom: 1px solid #eee; }
+    .header svg { color: #e11d48; }
+    .header h2 { font-size: 16px; font-weight: 600; color: #1a1a2e; }
+    .reg-row { display: flex; align-items: center; gap: 6px; margin-bottom: 16px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #aaa; }
+    .dot.green  { background: #22c55e; }
+    .dot.yellow { background: #f59e0b; animation: pulse 1s infinite; }
+    .dot.red    { background: #ef4444; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    #regText { font-size: 13px; color: #555; }
 
-    #incomingPanel { display:none; background:#fff3e0; border:2px solid #FF9800; border-radius:10px; padding:16px; text-align:center; margin-bottom:14px; animation: ring 0.6s infinite alternate; }
-    @keyframes ring { from{border-color:#FF9800} to{border-color:#f44336} }
-    .caller-label { font-size:11px; color:#888; margin-bottom:4px; }
-    .caller-from  { font-size:18px; font-weight:bold; color:#333; margin-bottom:14px; }
-    .ibtn { display:flex; gap:10px; }
-    .ibtn button { flex:1; padding:12px; border:none; border-radius:8px; font-size:14px; cursor:pointer; color:white; font-weight:bold; }
-    .ibtn .acc { background:#4CAF50; }
-    .ibtn .rej { background:#f44336; }
+    /* Mic warning */
+    #micWarning { display:none; background:#fff3cd; border:1px solid #ffc107;
+                  border-radius:6px; padding:8px 12px; font-size:12px; color:#856404;
+                  margin-bottom:12px; }
 
-    #activePanel { display:none; background:#e8f5e9; border-radius:8px; padding:12px; text-align:center; margin-bottom:12px; }
-    .active-label { font-size:11px; color:#888; }
-    .active-num   { font-size:15px; font-weight:bold; color:#333; margin:4px 0; }
-    .active-timer { color:#4CAF50; font-size:13px; }
+    /* Dialer panel */
+    #dialerPanel input { width:100%; padding:10px 14px; border:1px solid #ddd;
+                         border-radius:8px; font-size:15px; outline:none; margin-bottom:10px; }
+    #dialerPanel input:focus { border-color:#2563eb; }
+    .btn-call { width:100%; padding:12px; background:#22c55e; color:#fff; border:none;
+                border-radius:8px; font-size:15px; font-weight:600; cursor:pointer;
+                display:flex; align-items:center; justify-content:center; gap:8px; }
+    .btn-call:hover { background:#16a34a; }
+    .btn-call:disabled { background:#86efac; cursor:not-allowed; }
 
-    input[type=tel] { width:100%; padding:11px; margin-bottom:10px; border:1px solid #ddd; border-radius:8px; font-size:16px; outline:none; }
-    input[type=tel]:focus { border-color:#4CAF50; }
-    #callBtn   { width:100%; padding:12px; background:#4CAF50; color:white; border:none; border-radius:8px; font-size:15px; cursor:pointer; font-weight:bold; }
-    #callBtn:disabled { background:#aaa; cursor:not-allowed; }
-    #hangupBtn { width:100%; padding:12px; background:#f44336; color:white; border:none; border-radius:8px; font-size:15px; cursor:pointer; margin-top:8px; display:none; font-weight:bold; }
-    #status { margin-top:10px; font-size:12px; color:#666; text-align:center; min-height:16px; }
+    /* Incoming panel */
+    #incomingPanel { display:none; }
+    .incoming-box { background:#fff8e1; border:2px solid #f59e0b; border-radius:10px;
+                    padding:16px; text-align:center; }
+    .incoming-label { font-size:11px; color:#92400e; text-transform:uppercase;
+                      letter-spacing:.5px; margin-bottom:4px; }
+    .caller-num { font-size:20px; font-weight:700; color:#1a1a2e; margin-bottom:14px; }
+    .btn-row { display:flex; gap:10px; }
+    .btn-accept { flex:1; padding:11px; background:#22c55e; color:#fff; border:none;
+                  border-radius:8px; font-size:14px; font-weight:600; cursor:pointer; }
+    .btn-accept:hover { background:#16a34a; }
+    .btn-reject { flex:1; padding:11px; background:#ef4444; color:#fff; border:none;
+                  border-radius:8px; font-size:14px; font-weight:600; cursor:pointer; }
+    .btn-reject:hover { background:#dc2626; }
+
+    /* Active panel */
+    #activePanel { display:none; text-align:center; }
+    .active-label { font-size:11px; color:#2563eb; text-transform:uppercase;
+                    letter-spacing:.5px; margin-bottom:4px; }
+    #activeNum { font-size:18px; font-weight:600; color:#1a1a2e; margin-bottom:6px; }
+    #timerEl { font-size:22px; font-weight:700; color:#2563eb; font-variant-numeric:tabular-nums;
+               margin-bottom:14px; }
+    .btn-hangup { width:100%; padding:12px; background:#ef4444; color:#fff; border:none;
+                  border-radius:8px; font-size:15px; font-weight:600; cursor:pointer; }
+    .btn-hangup:hover { background:#dc2626; }
+
+    #status { font-size:12px; color:#888; margin-top:10px; min-height:16px; text-align:center; }
   </style>
 </head>
 <body>
-<div class="dialer">
+<div class="card">
   <div class="header">
-    <span style="font-size:20px;">📞</span>
-    <h3>Exotel Dialer</h3>
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 013.07 9.81
+               a19.79 19.79 0 01-3.07-8.68A2 2 0 012 0h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81
+               a2 2 0 01-.45 2.11L6.09 7.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45
+               c.907.339 1.85.573 2.81.7A2 2 0 0122 14.92z"/>
+    </svg>
+    <h2>Exotel Dialer</h2>
   </div>
 
-  <div class="reg-status">
-    <span class="dot yellow" id="regDot"></span>
-    <span id="regText">Initializing...</span>
+  <div class="reg-row">
+    <div class="dot yellow" id="regDot"></div>
+    <span id="regText">Connecting...</span>
   </div>
 
+  <!-- Mic warning -->
+  <div id="micWarning">⚠️ Microphone access is required. Please allow mic in your browser and reload.</div>
+
+  <!-- Incoming call panel (INBOUND ONLY) -->
   <div id="incomingPanel">
-    <div class="caller-label">📲 Incoming Call</div>
-    <div class="caller-from" id="callerNum">Unknown</div>
-    <div class="ibtn">
-      <button class="acc" onclick="acceptCall()">✅ Accept</button>
-      <button class="rej" onclick="rejectCall()">❌ Reject</button>
+    <div class="incoming-box">
+      <div class="incoming-label">📞 Incoming Call</div>
+      <div class="caller-num" id="callerNum">Unknown</div>
+      <div class="btn-row">
+        <button class="btn-accept" onclick="acceptCall()">✅ Accept</button>
+        <button class="btn-reject" onclick="rejectCall()">✖ Reject</button>
+      </div>
     </div>
   </div>
 
+  <!-- Active call panel -->
   <div id="activePanel">
-    <div class="active-label">🔴 Call Active</div>
-    <div class="active-num" id="activeNum"></div>
-    <div class="active-timer" id="timerEl">00:00</div>
+    <div class="active-label">🔵 In Call</div>
+    <div id="activeNum"></div>
+    <div id="timerEl">00:00</div>
+    <button class="btn-hangup" id="hangupBtn" onclick="hangUp()">📵 Hang Up</button>
   </div>
 
+  <!-- Dialer panel (idle) -->
   <div id="dialerPanel">
     <input type="tel" id="phone" placeholder="e.g. 09876543210" />
-    <button id="callBtn" onclick="makeCall()">📞 Call</button>
-    <button id="hangupBtn" onclick="hangUp()">📵 Hang Up</button>
+    <button class="btn-call" id="callBtn" onclick="makeCall()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 013.07 9.81
+                 a19.79 19.79 0 01-3.07-8.68A2 2 0 012 0h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81
+                 a2 2 0 01-.45 2.11L6.09 7.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45
+                 c.907.339 1.85.573 2.81.7A2 2 0 0122 14.92z"/>
+      </svg>
+      Call
+    </button>
   </div>
 
   <div id="status"></div>
 </div>
-
-<script src="//api.bitrix24.com/api/v1/"></script>
-<!-- crmBundle.js loads the ExotelCRMWebSDK class. The SDK instance now lives -->
-<!-- HERE in popup.js (a visible iframe, so microphone permission works), not -->
-<!-- in the hidden background.js worker, which never reliably ran and likely -->
-<!-- couldn't get mic permission anyway. There is only ONE SDK instance now, -->
-<!-- so there is no double-registration / double-call risk. -->
-<script src="/target/crmBundle.js"></script>
 <script src="/popup.js"></script>
 </body>
 </html>
