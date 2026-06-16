@@ -370,7 +370,7 @@ app.post('/create-user', async (req, res) => {
 
 // ── /token — WebRTC SDK credential endpoint ──────────────────────
 // Returns app_token (for SDK auth) + sip_id + sip_secret (SIP credentials).
-// popup.js calls: new ExotelCRMWebSDK(data.app_token, EXOTEL_APP_USER_ID, false)
+// popup.js passes credentials via sipAccountInfo to sdk.Initialize()
 app.get('/token', async (req, res) => {
   try {
     const { user_id } = req.query;
@@ -393,14 +393,14 @@ app.get('/token', async (req, res) => {
     console.log('[Token] Returning credentials for user', user_id, '| sip_id:', user.SipId);
 
     res.json({
-  success: true,
-  app_token:      at,
-  sip_id:         user.SipId,
-  sip_secret:     user.SipSecret,
-  sip_domain:     user.SipDomain || 'voip.in1.exotel.com', // ADD THIS
-  virtual_number: user.VirtualNumber,
-  user_id:        user.AppUserId
-});
+      success:        true,
+      app_token:      at,
+      sip_id:         user.SipId,
+      sip_secret:     user.SipSecret,
+      sip_domain:     user.SipDomain || 'voip.in1.exotel.com',
+      virtual_number: user.VirtualNumber,
+      user_id:        user.AppUserId
+    });
   } catch(e) {
     console.error('[Token] Error:', e.message);
     res.status(500).json({ error: e.message });
