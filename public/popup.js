@@ -1,16 +1,38 @@
 // ═══════════════════════════════════════════════════════════════
-// popup.js — Pure UI. Zero SDK. Zero SIP.
-// Polls /call-state every second and sends actions via /call-action.
-// background.js owns the single SDK instance and all WebRTC audio.
+// popup.js — Owns the ONLY SDK instance (single SIP registration).
+//
+// This loads inside CRM_ACTIVITY_SIDEBAR — a VISIBLE iframe open
+// while the agent works a lead/contact/deal — so getUserMedia()
+// (microphone) actually has a normal permission context, unlike a
+// hidden PAGE_BACKGROUND_WORKER page.
+//
+// Outbound calls from typing a number in this UI, or from clicking
+// a phone number elsewhere in BX24 (which fires OnExternalCallStart
+// -> our server webhook -> /pending-call), both result in a direct
+// local webPhone.MakeCall() call — no relay through another page.
 // ═══════════════════════════════════════════════════════════════
 
+let webPhone      = null;
+let sdkReady      = false;
+let queuedCall    = null;       // a call that arrived before the SDK was ready
+let currentUIState = 'idle';    // tracks last rendered state to avoid flicker
 let timerInterval = null;
-let timerSec = 0;
-let currentUIState = 'idle'; // tracks last rendered state to avoid flicker
-let statePoller = null;
+let timerSec      = 0;
+let pollInterval  = null;
 
-function log(msg) { console.log('[Dialer]', msg); }
-function setStatus(msg) { document.getElementById('status').textContent = msg; log(msg); }
+const EXOTEL_APP_USER_ID = '123';
+
+// ── Logging — also mirrored to the server so Render logs show what's happening ──
+function log(msg, extra) {
+  console.log('[Dialer]', msg, extra || '');
+  fetch('/client-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source: 'popup.js', message: msg, extra: extra || null, ts: Date.now() })
+  }).catch(() => {});
+}
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
 
 function setReg(state) {
   const dot = document.getElementById('regDot');
@@ -32,7 +54,7 @@ function showIncoming(from) {
   document.getElementById('dialerPanel').style.display   = 'block';
   document.getElementById('hangupBtn').style.display     = 'none';
   document.getElementById('callBtn').style.display       = 'block';
-  try { new Audio('/target/ringtone.wav').play(); } catch(e) {}
+  try { new Audio('/target/ringtone.wav').play(); } catch (e) {}
 }
 
 function showActive(num) {
@@ -68,88 +90,172 @@ function stopTimer() {
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
-// ── Call action helpers ────────────────────────────────────────
-async function postAction(action, number) {
-  try {
-    await fetch('/call-action', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action, number })
-    });
-  } catch(e) { log('postAction error: ' + e.message); }
+// ── Mirror state to server (for logging / so /call-state stays accurate) ──
+function postState(state) {
+  fetch('/update-call-state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(state)
+  }).catch(() => {});
 }
 
-// ── Outbound call ──────────────────────────────────────────────
+// ── Place an outbound call — directly via the local SDK instance ──
+function executeMakeCall(number) {
+  if (sdkReady && webPhone) {
+    log('MakeCall firing for ' + number);
+    try {
+      webPhone.MakeCall(number);
+      log('MakeCall returned without throwing for ' + number);
+    } catch (e) {
+      log('MakeCall THREW: ' + e.message, { stack: e.stack });
+    }
+    showActive(number);
+    currentUIState = 'active';
+    postState({ state: 'active', number });
+  } else {
+    log('SDK not ready yet — queuing call to ' + number, { sdkReady, webPhoneExists: !!webPhone });
+    queuedCall = number;
+    setStatus('Connecting... will call ' + number + ' once ready');
+  }
+}
+
+// ── Outbound call from the dialer's own input box ──
 async function makeCall() {
   const number = document.getElementById('phone').value.trim();
   if (!number) { setStatus('Enter a number'); return; }
   setStatus('Calling ' + number + '...');
-  await postAction('makecall', number);
+  executeMakeCall(number);
 }
 
-// ── Accept incoming ────────────────────────────────────────────
+// ── Accept incoming call — direct local SDK call ──
 async function acceptCall() {
-  await postAction('answer');
+  if (sdkReady && webPhone) {
+    try { webPhone.AcceptCall(); log('AcceptCall fired'); }
+    catch (e) { log('AcceptCall threw: ' + e.message); }
+  } else {
+    log('AcceptCall skipped — SDK not ready', { sdkReady, webPhoneExists: !!webPhone });
+  }
   showActive(document.getElementById('callerNum').textContent);
   currentUIState = 'active';
+  postState({ state: 'active' });
   setStatus('');
 }
 
-// ── Reject incoming ────────────────────────────────────────────
+// ── Reject incoming call ──
 async function rejectCall() {
-  await postAction('hangup');
+  if (webPhone) {
+    try { webPhone.HangupCall(); log('HangupCall (reject) fired'); }
+    catch (e) { log('HangupCall (reject) threw: ' + e.message); }
+  }
   showDialer();
   currentUIState = 'idle';
   setStatus('Call rejected');
+  postState({ state: 'idle', from: '', number: '' });
 }
 
-// ── Hang up ────────────────────────────────────────────────────
+// ── Hang up an active call ──
 async function hangUp() {
-  await postAction('hangup');
+  if (webPhone) {
+    try { webPhone.HangupCall(); log('HangupCall fired'); }
+    catch (e) { log('HangupCall threw: ' + e.message); }
+  }
   showDialer();
   currentUIState = 'idle';
   setStatus('Call ended');
+  postState({ state: 'idle', from: '', number: '' });
 }
 
-// ── Init — start polling /call-state ──────────────────────────
-function init() {
+// ── Handle SDK call events (i_new_call, accept_reject, connected, terminated) ──
+function handleSDKCallEvent(event) {
+  const raw = JSON.stringify(event).toLowerCase();
+  log('SDK event: ' + raw.slice(0, 200));
+
+  if (raw.includes('incoming') || raw.includes('ringing') || raw.includes('i_new_call')) {
+    const from = (event && (event.callFromNumber || event.FromNumber || event.from)) || 'Unknown';
+    if (currentUIState !== 'incoming') { showIncoming(from); currentUIState = 'incoming'; }
+    postState({ state: 'incoming', from });
+
+  } else if (raw.includes('accept') || raw.includes('connect') || raw.includes('active') || raw.includes('connected')) {
+    if (currentUIState !== 'active') {
+      showActive(document.getElementById('callerNum').textContent || '');
+      currentUIState = 'active';
+    }
+    postState({ state: 'active' });
+
+  } else if (raw.includes('end') || raw.includes('disconnect') || raw.includes('terminal') || raw.includes('bye') || raw.includes('terminated')) {
+    showDialer();
+    currentUIState = 'idle';
+    postState({ state: 'idle', from: '', number: '' });
+  }
+}
+
+// ── Poll for BX24-initiated outbound calls (agent clicked a phone number in CRM) ──
+// This is the one thing that genuinely has to go through the server, since the
+// OnExternalCallStart event fires to a server webhook, not to this page directly.
+function startPollingPendingCall() {
+  if (pollInterval) return;
+  pollInterval = setInterval(async () => {
+    try {
+      const res = await fetch('/pending-call');
+      const data = await res.json();
+      if (data.pending && data.number) {
+        log('BX24 outbound pending: ' + data.number);
+        executeMakeCall(data.number);
+      }
+    } catch (e) { /* network hiccup, ignore and retry next tick */ }
+  }, 1000);
+}
+
+// ── SDK init — retries until it succeeds, queues any call that arrives meanwhile ──
+async function initSDK() {
   setReg('connecting');
   setStatus('Connecting...');
 
-  let firstPoll = true;
-
-  statePoller = setInterval(async () => {
+  while (true) {
     try {
-      const res  = await fetch('/call-state');
+      if (typeof ExotelCRMWebSDK === 'undefined') {
+        throw new Error('ExotelCRMWebSDK not defined yet — crmBundle.js still loading');
+      }
+
+      const res = await fetch('/token?user_id=' + encodeURIComponent(EXOTEL_APP_USER_ID));
+      if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
       const data = await res.json();
+      if (!data.app_token) throw new Error('No app_token in response: ' + JSON.stringify(data));
 
-      if (firstPoll) {
-        firstPoll = false;
-        setReg('registered');
-        setStatus('✅ Ready');
-      }
+      log('Token fetched, initializing SDK...');
 
-      // Only update UI when state actually changes to avoid flicker
-      if (data.state !== currentUIState) {
-        log('State change: ' + currentUIState + ' → ' + data.state);
-        currentUIState = data.state;
-
-        if (data.state === 'incoming') {
-          showIncoming(data.from);
-          setStatus('');
-        } else if (data.state === 'active') {
-          showActive(data.number || data.from);
-          setStatus('');
-        } else if (data.state === 'idle') {
-          showDialer();
-          setStatus('Ready');
+      const sdk = new ExotelCRMWebSDK(data.app_token, EXOTEL_APP_USER_ID, false);
+      webPhone = await sdk.Initialize(
+        function callListener(event) {
+          handleSDKCallEvent(event);
+        },
+        function regListener(event) {
+          log('SIP REGISTERED — SDK is now ready');
+          sdkReady = true;
+          setReg('registered');
+          setStatus('✅ Ready');
+          if (queuedCall) {
+            const n = queuedCall;
+            queuedCall = null;
+            log('Executing queued call now that SDK is ready: ' + n);
+            executeMakeCall(n);
+          }
         }
-      }
+      );
 
-    } catch(e) {
-      log('Poll error: ' + e.message);
+      log('SDK object created (waiting for SIP registration callback)');
+      break; // success — exit retry loop
+
+    } catch (err) {
+      log('SDK init error: ' + err.message + ' — retrying in 5s', { stack: err.stack });
+      await new Promise(r => setTimeout(r, 5000));
     }
-  }, 1000);
+  }
+}
+
+function init() {
+  startPollingPendingCall();
+  initSDK();
 }
 
 window.onload = init;
