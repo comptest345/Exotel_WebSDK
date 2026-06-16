@@ -74,7 +74,7 @@ app.all('/background.html', (req, res) => res.sendFile(path.join(__dirname, 'pub
 // ── Install ───────────────────────────────────────────────────────
 app.all('/install', (req, res) => {
   console.log('[Install] Called');
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><script src="//api.bitrix24.com/api/v1/"></script></head><body><p id="msg">Installing Exotel Dialer...</p><script>BX24.init(function(){BX24.callMethod('placement.bind',{PLACEMENT:'CRM_ACTIVITY_SIDEBAR',HANDLER:'https://exotel-websdk.onrender.com/popup.html',TITLE:'Exotel Dialer'},function(r1){BX24.callMethod('telephony.externalLine.add',{LINE_NAME:'Exotel',APP_ID:BX24.getAuth().client_id},function(r2){BX24.callMethod('event.bind',{EVENT:'OnExternalCallStart',HANDLER:'https://exotel-websdk.onrender.com/bx24-call-start'},function(r3){document.getElementById('msg').innerText='\u2705 Installed!';BX24.installFinish();});});});});<\/script></body></html>`);
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><script src="//api.bitrix24.com/api/v1/"></script></head><body><p id="msg">Installing Exotel Dialer...</p><script>BX24.init(function(){BX24.callMethod('placement.bind',{PLACEMENT:'CRM_ACTIVITY_SIDEBAR',HANDLER:'https://exotel-websdk.onrender.com/popup.html',TITLE:'Exotel Dialer'},function(r1){BX24.callMethod('telephony.externalLine.add',{LINE_NAME:'Exotel',APP_ID:BX24.getAuth().client_id},function(r2){BX24.callMethod('event.bind',{EVENT:'OnExternalCallStart',HANDLER:'https://exotel-websdk.onrender.com/bx24-call-start'},function(r3){document.getElementById('msg').innerText='\\u2705 Installed!';BX24.installFinish();});});});});<\\/script></body></html>`);
 });
 
 // ── BX24 outbound call trigger ────────────────────────────────────
@@ -217,15 +217,10 @@ app.post('/create-user', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── /token — called by popup.js & background.js on load ──────────
-// Returns: app_token (JWT for ExotelCRMWebSDK constructor)
-//          sip_id, sip_secret (from Exotel usermapping — used by SDK for SIP registration)
-//          virtual_number, user_id
-//
-// FIX: The old CCM basicauth approach (POST /v2/accounts/.../configuration/basicauth)
-//      was failing with 500. The correct approach is to use getAppToken() which returns
-//      a JWT that ExotelCRMWebSDK accepts as the first constructor argument, and to pass
-//      the SIP credentials from usermapping so the SDK can register.
+// ── /token — called by popup.js, background.js, AND by ExotelCRMWebSDK internally ──
+// IMPORTANT: The Exotel crmBundle.js SDK makes its own internal fetch to /token
+// and expects the field to be named "access_token" (not "app_token").
+// popup.js also checks for data.sip_id — both are returned here.
 app.get('/token', async (req, res) => {
   try {
     const { user_id } = req.query;
@@ -249,12 +244,16 @@ app.get('/token', async (req, res) => {
 
     console.log('[Token] Issued for user_id:', user_id, 'SipId:', user.SipId);
 
-    // Return exactly what popup.js & background.js expect
+    // Return with BOTH field names so SDK internal fetch AND popup.js both work:
+    // - access_token: required by ExotelCRMWebSDK internal fetch (crmBundle.js)
+    // - app_token:    used by popup.js constructor call as fallback
+    // - sip_id / sip_secret: used by popup.js credential check
     res.json({
       success:        true,
-      app_token:      appToken,          // → ExotelCRMWebSDK constructor arg 1
-      sip_id:         user.SipId,        // → used internally by SDK for SIP registration
-      sip_secret:     user.SipSecret,    // → used internally by SDK for SIP auth
+      access_token:   appToken,          // ← SDK (crmBundle.js) internal fetch expects THIS name
+      app_token:      appToken,          // ← kept for backward compat with popup.js check
+      sip_id:         user.SipId,
+      sip_secret:     user.SipSecret,
       virtual_number: user.VirtualNumber,
       user_id:        user.AppUserId
     });
