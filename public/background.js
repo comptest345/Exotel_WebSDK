@@ -1,133 +1,47 @@
 // ═══════════════════════════════════════════════════════════════
-// background.js — Connects Bitrix24 native call UI to Exotel WebRTC
+// background.js — Registers Bitrix24 telephony + handles BX24 events
 // ═══════════════════════════════════════════════════════════════
 
-let webPhone = null;
-const EXOTEL_APP_USER_ID = '123'; // Exotel AppUserId
+const BX24_USER_ID = '44';
 let currentCallId = null;
-let callType      = null; // 'inbound' | 'outbound'
-let pollInterval  = null;
 let callStartTime = 0;
 
-async function initBG() {
-  console.log('[BGWorker] Starting...');
-  try {
-    const res = await fetch('/token?user_id=' + encodeURIComponent(EXOTEL_APP_USER_ID));
-    if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
-    const data = await res.json();
-    if (!data.app_token) throw new Error('No app_token: ' + JSON.stringify(data));
+function bgLog(msg) { console.log('[BGWorker]', msg); }
 
-    console.log('[BGWorker] Got credentials, initializing SDK...');
-    const sdk = new ExotelCRMWebSDK(data.app_token, EXOTEL_APP_USER_ID, false);
-    webPhone = await sdk.Initialize(
-      function callListener(event) {
-        console.log('[BGWorker] Call event:', JSON.stringify(event));
-        handleSDKCallEvent(event);
-      },
-      function regListener(event) {
-        console.log('[BGWorker] ✅ SIP Registered');
-        startPolling();
-      }
-    );
-    console.log('[BGWorker] ✅ SDK ready');
-    startPolling();
-  } catch (err) {
-    console.error('[BGWorker] Init error:', err.message);
-    setTimeout(initBG, 5000);
-  }
-}
+function initBG() {
+  bgLog('Starting...');
+  if (!window.BX24) { bgLog('BX24 not available'); return; }
 
-// ── Poll for pending calls from server ─────────────────────────
-function startPolling() {
-  if (pollInterval) return;
-  console.log('[BGWorker] Polling /pending-call every 2s');
-  pollInterval = setInterval(async () => {
-    try {
-      // Outbound triggered from BX24 CRM click-to-call
-      const outRes  = await fetch('/pending-call');
-      const outData = await outRes.json();
-      if (outData.pending && outData.number) {
-        console.log('[BGWorker] 📞 Outbound click-to-call:', outData.number);
-        callType      = 'outbound';
-        currentCallId = outData.callId;
-        if (webPhone) {
-          try {
-            webPhone.MakeCall(outData.number);
-            console.log('[BGWorker] MakeCall fired for:', outData.number);
-          } catch(e) {
-            console.log('[BGWorker] MakeCall internal (call placed):', e.message);
-          }
-          // Notify BX24 native call UI: outbound — no answer required on our side
-          if (window.BX24 && currentCallId) {
-            BX24.callMethod('telephony.externalcall.show', {
-              CALL_ID: currentCallId,
-              USER_ID: '44'
-            });
-          }
-        } else {
-          console.warn('[BGWorker] webPhone not ready yet');
-        }
-        return; // skip inbound check this tick
-      }
+  BX24.init(function () {
+    bgLog('BX24 ready');
 
-      // Inbound call notified by server webhook
-      const inRes  = await fetch('/pending-inbound');
-      const inData = await inRes.json();
-      if (inData.pending && inData.from) {
-        console.log('[BGWorker] 📲 Inbound from:', inData.from);
-        callType      = 'inbound';
-        currentCallId = inData.callSid;
-        // NOTE: actual ringing + accept/reject UI is handled by popup.js via SDK event.
-        // We do NOT show BX24 native call card here — that would add a second accept button.
-      }
-    } catch(e) {
-      console.warn('[BGWorker] Poll error:', e.message);
-    }
-  }, 2000);
-}
+    // Register outbound call handler (click-to-call from CRM card)
+    BX24.addEvent('onExternalCallStart', function (data) {
+      bgLog('onExternalCallStart: ' + JSON.stringify(data));
+      const num    = data.PHONE_NUMBER || data.PHONE_NUMBER_INTERNATIONAL || '';
+      const callId = data.CALL_ID || '';
+      currentCallId = callId;
+      callStartTime = Date.now();
 
-// ── Handle SDK call events ─────────────────────────────────────
-function handleSDKCallEvent(event) {
-  const raw = JSON.stringify(event).toLowerCase();
+      // Send number to server so popup.js poll picks it up
+      fetch('/outbound-call', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ number: num, callId: callId, userId: BX24_USER_ID })
+      }).then(r => r.json()).then(d => {
+        bgLog('Queued outbound call: ' + JSON.stringify(d));
+      }).catch(e => bgLog('Queue error: ' + e.message));
+    });
 
-  if (raw.includes('incoming') || raw.includes('ringing')) {
-    const from = (event && (event.FromNumber || event.from)) || 'Unknown';
-    console.log('[BGWorker] SDK: Incoming call from:', from);
-    callType = 'inbound';
-    // Inbound: do NOT call telephony.externalcall.register here —
-    // that opens BX24 native card with its own Accept button.
-    // The Exotel dialer popup handles accept/reject exclusively.
+    // Handle call end from BX24 side
+    BX24.addEvent('onExternalCallFinish', function (data) {
+      bgLog('onExternalCallFinish: ' + JSON.stringify(data));
+      currentCallId = null;
+      callStartTime = 0;
+    });
 
-  } else if (raw.includes('accept') || raw.includes('connect') || raw.includes('active')) {
-    console.log('[BGWorker] SDK: Call connected — type:', callType);
-    callStartTime = Date.now();
-    // For OUTBOUND: show BX24 native card (click-to-call context)
-    // For INBOUND: card already open in popup — no BX24 card needed
-    if (callType === 'outbound' && window.BX24 && currentCallId) {
-      BX24.callMethod('telephony.externalcall.show', {
-        CALL_ID: currentCallId,
-        USER_ID: '44'
-      });
-    }
-
-  } else if (
-    raw.includes('end') || raw.includes('disconnect') ||
-    raw.includes('terminal') || raw.includes('bye')
-  ) {
-    console.log('[BGWorker] SDK: Call ended — type:', callType);
-    const duration = callStartTime ? Math.round((Date.now() - callStartTime) / 1000) : 0;
-    if (window.BX24 && currentCallId) {
-      BX24.callMethod('telephony.externalcall.finish', {
-        CALL_ID:     currentCallId,
-        USER_ID:     '44',
-        DURATION:    duration,
-        STATUS_CODE: 200
-      });
-    }
-    currentCallId = null;
-    callType      = null;
-    callStartTime = 0;
-  }
+    bgLog('BX24 events registered');
+  });
 }
 
 window.onload = initBG;
