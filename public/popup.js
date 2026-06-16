@@ -198,65 +198,91 @@ function startPolling() {
 async function initSDK() {
   if (sdkInitDone) return;
   sdkInitDone = true;
-
   setReg('connecting');
   setStatus('Connecting...');
 
   try {
-    // Wait for crmBundle.js to load ExotelCRMWebSDK
+    // 1. Wait for crmBundle.js
     let wait = 0;
     while (typeof ExotelCRMWebSDK === 'undefined') {
-      if (wait++ > 20) throw new Error('crmBundle.js did not load (ExotelCRMWebSDK undefined after 10s)');
+      if (wait++ > 20) throw new Error('crmBundle.js did not load after 10s');
       await new Promise(r => setTimeout(r, 500));
     }
     log('ExotelCRMWebSDK class loaded');
 
-    // Fetch app_token + SIP credentials
+    // 2. Fetch credentials
     const res = await fetch('/token?user_id=' + encodeURIComponent(EXOTEL_APP_USER_ID));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
 
     if (!data.app_token) throw new Error('No app_token: ' + JSON.stringify(data));
-    if (!data.sip_id)    throw new Error('No sip_id: ' + JSON.stringify(data));
+    if (!data.sip_id)    throw new Error('No sip_id: '    + JSON.stringify(data));
+    if (!data.sip_secret) throw new Error('No sip_secret: ' + JSON.stringify(data));
 
-    log('Credentials OK — sip_id: ' + data.sip_id + ', initializing SDK...');
+    log('Credentials: sip_id=' + data.sip_id);
 
-    // ── This is EXACTLY how the working file calls it ──────────
-    // ExotelCRMWebSDK(app_token, app_user_id, enableAutoAudioDeviceChangeHandling)
-    const sdk = new ExotelCRMWebSDK(data.app_token, EXOTEL_APP_USER_ID, false);
+    // 3. Build sipAccountInfo — THIS IS THE FIX
+    // sipdomain must match exactly what Exotel API returns (voip.in1.exotel.com)
+    const sipAccountInfo = {
+      userName:   data.sip_id,        // e.g. "exo_usr_xxxx"
+      password:   data.sip_secret,    // SIP secret from usermapping
+      sipdomain:  'voip.in1.exotel.com', // your MUM1 cluster domain
+      port:       '5061',             // TLS SIP port (use '5060' if TCP)
+      displayName: data.sip_id,
+      // If the SDK requires app_token separately, add:
+      appToken:   data.app_token
+    };
 
+    log('sipAccountInfo built — sipdomain: ' + sipAccountInfo.sipdomain);
+
+    // 4. Instantiate with NO arguments (constructor ignores them)
+    const sdk = new ExotelCRMWebSDK();
+
+    // 5. Initialize with the ACTUAL sipAccountInfo + all 3 callbacks
     webPhone = await sdk.Initialize(
-      // callListener — SDK call state events
+      sipAccountInfo,
+
+      // callListener
       function callListener(event) {
         handleCallEvent(event);
       },
-      // regListener — fires when SIP registration completes
+
+      // regListener — SIP registration result
       function regListener(event) {
-        log('SIP registered! event: ' + JSON.stringify(event).slice(0, 100));
+        log('regListener fired: ' + JSON.stringify(event).slice(0, 120));
+        const evStr = JSON.stringify(event).toLowerCase();
+        if (evStr.includes('fail') || evStr.includes('error') || evStr.includes('403') || evStr.includes('401')) {
+          log('SIP registration FAILED: ' + JSON.stringify(event));
+          setReg('failed');
+          setStatus('❌ SIP registration failed — check credentials');
+          return;
+        }
         sdkReady = true;
         setReg('registered');
         setStatus('✅ Ready');
 
-        // Fire any queued call
+        // Drain queued call
         if (queuedCall) {
           const n = queuedCall;
           queuedCall = null;
-          log('Firing queued call: ' + n);
+          log('Draining queued call: ' + n);
           setTimeout(() => executeMakeCall(n), 300);
         }
+      },
+
+      // sessionListener (optional but required by SDK signature)
+      function sessionListener(event) {
+        log('Session event: ' + JSON.stringify(event).slice(0, 80));
       }
     );
 
-    log('SDK.Initialize() returned — waiting for regListener');
-
-    // Start polling for BX24-origin outbound + inbound calls right away
-    // (don't wait for registration — outbound via BX24 click may arrive fast)
+    log('SDK.Initialize() awaited — waiting for regListener...');
     startPolling();
 
   } catch (err) {
     log('SDK init FAILED: ' + err.message);
     setReg('failed');
-    setStatus('❌ ' + err.message + ' — please refresh');
+    setStatus('❌ ' + err.message);
   }
 }
 
