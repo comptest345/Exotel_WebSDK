@@ -10,7 +10,7 @@ app.use(express.urlencoded({ extended: true }));
 const BASE            = 'https://integrationscore.mum1.exotel.com/v2/integrations';
 const CUSTOMER_ID     = process.env.EXOTEL_CUSTOMER_ID;
 const CUSTOMER_SECRET = process.env.EXOTEL_CUSTOMER_SECRET;
-const ACCOUNT_SID     = process.env.EXOTEL_ACCOUNT_SID;   // e.g. jkstar1
+const ACCOUNT_SID     = process.env.EXOTEL_ACCOUNT_SID;   // jkstar1
 const API_KEY         = process.env.EXOTEL_API_KEY;
 const API_TOKEN       = process.env.EXOTEL_API_TOKEN;
 const DOMAIN          = process.env.EXOTEL_DOMAIN || 'singapore';
@@ -23,24 +23,25 @@ const BX24_WEBHOOK    = process.env.BX24_WEBHOOK_URL || '';
 const BX24_USER_ID    = process.env.BX24_USER_ID || '1';
 const BX24_DOMAIN     = process.env.BX24_DOMAIN   || 'gsdny.bitrix24.in';
 
-// Singapore account: SIP gateway is voip.sgp1.exotel.com:443 (WSS)
-// Mumbai account:    SIP gateway is voip.in1.exotel.com:443 (WSS)
-const SIP_DOMAIN_FALLBACK = (DOMAIN === 'mumbai' || DOMAIN === 'india')
-  ? 'voip.in1.exotel.com'
-  : 'voip.sgp1.exotel.com';   // default = Singapore
+// ── Exotel region config ─────────────────────────────────────────
+// Singapore: subdomain = api.exotel.com  → CCM base = https://api.exotel.com
+// Mumbai:    subdomain = api.in.exotel.com → CCM base = https://api.in.exotel.com
+//
+// CCM basicauth endpoint:
+//   POST https://<subdomain>/v2/accounts/<sid>/configuration/basicauth
+//   Auth: Basic base64(API_KEY:API_TOKEN)
+//
+const isIndia = (DOMAIN === 'mumbai' || DOMAIN === 'india');
+const CCM_BASE       = isIndia ? 'https://api.in.exotel.com'  : 'https://api.exotel.com';
+const SIP_DOMAIN_FB  = isIndia ? 'voip.in1.exotel.com'        : 'voip.sgp1.exotel.com';
 
-// CCM API base — Singapore uses ccm-api.exotel.com, Mumbai uses ccm-api.in.exotel.com
-const CCM_BASE = (DOMAIN === 'mumbai' || DOMAIN === 'india')
-  ? 'https://ccm-api.in.exotel.com'
-  : 'https://ccm-api.exotel.com';   // Singapore
-
-// ── In-memory state ─────────────────────────────────────────────
+// ── In-memory state ──────────────────────────────────────────────
 let pendingOutboundCall = null;
 let pendingInboundCall  = null;
 const inboundCallMap    = {};
 let pollCount = 0;
 
-// ── Exotel token helpers ─────────────────────────────────────────
+// ── Exotel integration token helpers ────────────────────────────
 async function getCustomerToken() {
   const res  = await fetch(`${BASE}/token`, {
     method:  'POST',
@@ -63,27 +64,43 @@ async function getAppToken() {
   return data.Data;
 }
 
-// ── Generate a real CCM access token for the WebSDK ──────────────
-// This calls POST /v2/accounts/{sid}/configuration/basicauth
-// Returns a short-lived JWT that ExotelCRMWebSDK constructor expects.
+// ── CCM access token for WebRTC SDK ─────────────────────────────
+// Singapore: POST https://api.exotel.com/v2/accounts/jkstar1/configuration/basicauth
+// Returns: { "access_token": "<jwt>" }
 async function getCCMAccessToken() {
   if (!ACCOUNT_SID || !API_KEY || !API_TOKEN) {
     throw new Error('EXOTEL_ACCOUNT_SID, EXOTEL_API_KEY, EXOTEL_API_TOKEN must all be set');
   }
   const credentials = Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
   const url = `${CCM_BASE}/v2/accounts/${ACCOUNT_SID}/configuration/basicauth`;
-  const res = await fetch(url, {
+
+  console.log('[CCM] POST', url);
+
+  const res  = await fetch(url, {
     method:  'POST',
     headers: {
       'Content-Type':  'application/json',
       'Authorization': `Basic ${credentials}`
     }
   });
-  const data = JSON.parse(await res.text());
+
+  const raw  = await res.text();
+  console.log('[CCM] status:', res.status, 'body:', raw.slice(0, 300));
+
+  let data;
+  try { data = JSON.parse(raw); } catch(e) { throw new Error(`CCM returned non-JSON [${res.status}]: ${raw.slice(0,200)}`); }
+
   if (!res.ok) throw new Error(`CCM basicauth failed [${res.status}]: ${JSON.stringify(data)}`);
-  // Response shape: { "access_token": "<jwt>" }
-  const token = data.access_token || data.data?.access_token || data.Data?.access_token;
-  if (!token) throw new Error('CCM basicauth returned no access_token: ' + JSON.stringify(data));
+
+  const token = data.access_token
+    || data.AccessToken
+    || data.token
+    || data.data?.access_token
+    || data.Data?.access_token
+    || data.data?.AccessToken
+    || data.Data?.AccessToken;
+
+  if (!token) throw new Error('CCM basicauth returned no access_token. Full response: ' + JSON.stringify(data));
   return token;
 }
 
@@ -286,14 +303,14 @@ app.get('/health', (req, res) => res.json({
   bx24_webhook_set:    !!BX24_WEBHOOK,
   bx24_user_id:        BX24_USER_ID,
   domain:              DOMAIN,
-  sip_domain_fallback: SIP_DOMAIN_FALLBACK,
   ccm_base:            CCM_BASE,
+  sip_domain_fb:       SIP_DOMAIN_FB,
   app_user_id:         APP_USER_ID,
   virtual_number_set:  !!VIRTUAL_NUMBER
 }));
 
 // ── Debug endpoints ──────────────────────────────────────────────
-app.get('/debug',     async (req, res) => {
+app.get('/debug', async (req, res) => {
   try { await getCustomerToken(); res.json({ success: true, message: '✅ Customer token OK' }); }
   catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -303,10 +320,11 @@ app.get('/debug-app', async (req, res) => {
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// Test CCM token — visit this after deploy to verify access_token works
 app.get('/debug-ccm-token', async (req, res) => {
   try {
     const token = await getCCMAccessToken();
-    res.json({ success: true, message: '✅ CCM access_token obtained', token_preview: token.slice(0, 30) + '...' });
+    res.json({ success: true, message: '✅ CCM access_token obtained', token_preview: token.slice(0, 40) + '...' });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -372,24 +390,20 @@ app.post('/create-user', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── /token — WebSDK credential endpoint ─────────────────────────
-// Returns CCM access_token (JWT) for ExotelCRMWebSDK constructor +
-// app_user_id for the second constructor argument.
-// The SDK itself fetches SIP credentials internally using the access_token.
+// ── /token — popup.js calls this on load ─────────────────────────
+// Returns CCM JWT (access_token) + app_user_id for SDK constructor.
 app.get('/token', async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
 
-    // Generate CCM JWT — this is what ExotelCRMWebSDK(accessToken, ...) needs
     const accessToken = await getCCMAccessToken();
-
-    console.log('[Token] Returning CCM access_token for user', user_id);
+    console.log('[Token] CCM access_token issued for user_id:', user_id);
 
     res.json({
-      success:       true,
-      access_token:  accessToken,   // ← ExotelCRMWebSDK constructor arg 1
-      app_user_id:   user_id        // ← ExotelCRMWebSDK constructor arg 2
+      success:      true,
+      access_token: accessToken,  // → ExotelCRMWebSDK constructor arg 1
+      app_user_id:  user_id       // → ExotelCRMWebSDK constructor arg 2
     });
   } catch(e) {
     console.error('[Token] Error:', e.message);
@@ -401,4 +415,4 @@ app.get('/token', async (req, res) => {
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Exotel WebSDK server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Exotel WebSDK server running on port ${PORT} | CCM: ${CCM_BASE} | SIP: ${SIP_DOMAIN_FB}`));
