@@ -6,15 +6,16 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const BASE         = 'https://integrationscore.mum1.exotel.com/v2/integrations';
-const CUSTOMER_ID  = process.env.EXOTEL_CUSTOMER_ID;
+const BASE            = 'https://integrationscore.mum1.exotel.com/v2/integrations';
+const CUSTOMER_ID     = process.env.EXOTEL_CUSTOMER_ID;
 const CUSTOMER_SECRET = process.env.EXOTEL_CUSTOMER_SECRET;
-const ACCOUNT_SID  = process.env.EXOTEL_ACCOUNT_SID;
-const API_KEY      = process.env.EXOTEL_API_KEY;
-const API_TOKEN    = process.env.EXOTEL_API_TOKEN;
-const DOMAIN       = process.env.EXOTEL_DOMAIN || 'singapore';
-const APP_ID       = process.env.EXOTEL_APP_ID;
-const APP_SECRET   = process.env.EXOTEL_APP_SECRET;
+const ACCOUNT_SID     = process.env.EXOTEL_ACCOUNT_SID;
+const API_KEY         = process.env.EXOTEL_API_KEY;
+const API_TOKEN       = process.env.EXOTEL_API_TOKEN;
+const DOMAIN          = process.env.EXOTEL_DOMAIN || 'singapore';
+const SUBDOMAIN       = process.env.EXOTEL_SUBDOMAIN || 'api.exotel.com';
+const APP_ID          = process.env.EXOTEL_APP_ID;
+const APP_SECRET      = process.env.EXOTEL_APP_SECRET;
 const EXOTEL_APP_USER_ID = process.env.EXOTEL_APP_USER_ID || '123';
 const EXOTEL_VIRTUAL_NUMBER = process.env.EXOTEL_VIRTUAL_NUMBER || '';
 
@@ -22,13 +23,23 @@ const BX24_WEBHOOK = process.env.BX24_WEBHOOK_URL || '';
 const BX24_USER_ID = process.env.BX24_USER_ID || '1';
 const BX24_DOMAIN  = process.env.BX24_DOMAIN || 'gsdny.bitrix24.in';
 
-// ── In-memory call state (background.js is the single source of truth for SDK) ──
+// Build the SIP WebSocket domain from env:
+// EXOTEL_DOMAIN=singapore → SIP domain = "singapore.exotel.com"
+// The SDK builds: wss://singapore.exotel.com:8089/ws
+function getSipDomain() {
+  // If DOMAIN already contains a dot (e.g. "api.exotel.com"), use as-is
+  if (DOMAIN.includes('.')) return DOMAIN;
+  // Otherwise append ".exotel.com"
+  return DOMAIN + '.exotel.com';
+}
+
 let callState = { state: 'idle', from: '', number: '', callId: '' };
-
-// ── Pending action: popup → server → background.js ────────────
 let pendingAction = null;
+let pendingOutboundCall = null;
+let pollCount = 0;
+const inboundCallMap = {};
 
-// ── Exotel token helpers ───────────────────────────────────────
+// ── Exotel token helpers ────────────────────────────────────────
 async function getCustomerToken() {
   const res = await fetch(`${BASE}/token`, {
     method: 'POST',
@@ -51,7 +62,7 @@ async function getAppToken() {
   return data.Data;
 }
 
-// ── Bitrix24 REST helper ───────────────────────────────────────
+// ── Bitrix24 REST helper ────────────────────────────────────────
 async function bx24Call(method, params) {
   if (!BX24_WEBHOOK) throw new Error('BX24_WEBHOOK_URL not set in env');
   const url = `${BX24_WEBHOOK}${method}.json`;
@@ -65,11 +76,10 @@ async function bx24Call(method, params) {
   return data.result;
 }
 
-// ── FIX: Handle POST to static HTML files ─────────────────────
-app.all('/popup.html',     (req, res) => res.sendFile(path.join(__dirname, 'public', 'popup.html')));
-app.all('/background.html',(req, res) => res.sendFile(path.join(__dirname, 'public', 'background.html')));
+app.all('/popup.html',      (req, res) => res.sendFile(path.join(__dirname, 'public', 'popup.html')));
+app.all('/background.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'background.html')));
 
-// ── Install — registers placements ────────────────────────────
+// ── Install ─────────────────────────────────────────────────────
 app.all('/install', (req, res) => {
   console.log('[Install] Called');
   res.send(`<!DOCTYPE html>
@@ -82,17 +92,12 @@ app.all('/install', (req, res) => {
   <p id="msg">Installing Exotel Dialer...</p>
   <script>
     BX24.init(function() {
-
-      // SDK now lives in popup.js (CRM_ACTIVITY_SIDEBAR) instead of a hidden
-      // background worker, so register the sidebar directly.
       BX24.callMethod('placement.bind', {
         PLACEMENT: 'CRM_ACTIVITY_SIDEBAR',
         HANDLER: 'https://exotel-websdk.onrender.com/popup.html',
         TITLE: 'Exotel Dialer'
       }, function(rs) {
           console.log('[Install] Sidebar registered');
-
-          // Step 2: Register external telephony line
           BX24.callMethod('telephony.externalLine.add', {
             LINE_NAME: 'Exotel',
             APP_ID: BX24.getAuth().client_id
@@ -103,8 +108,6 @@ app.all('/install', (req, res) => {
             } else {
               console.log('[Install] External telephony line registered:', r2.data());
             }
-
-            // Step 3: Subscribe to outbound call event
             BX24.callMethod('event.bind', {
               EVENT: 'OnExternalCallStart',
               HANDLER: 'https://exotel-websdk.onrender.com/bx24-call-start'
@@ -121,9 +124,7 @@ app.all('/install', (req, res) => {
 </html>`);
 });
 
-// ── OnExternalCallStart webhook ────────────────────────────────
-// Bitrix24 hits this when agent clicks a phone number in CRM.
-// Server stores the pending call — background.js does the actual MakeCall() via WebRTC.
+// ── OnExternalCallStart webhook ─────────────────────────────────
 app.post('/bx24-call-start', async (req, res) => {
   console.log('[BX24-CallStart] Event received:', JSON.stringify(req.body));
   try {
@@ -133,10 +134,8 @@ app.post('/bx24-call-start', async (req, res) => {
     const callId      = eventData.CALL_ID || ('ext_' + Date.now());
 
     console.log(`[BX24-CallStart] Outbound to: ${phoneNumber} by user: ${userId}`);
-
-    // Store pending call — background.js will pick this up and call MakeCall()
     pendingOutboundCall = { number: phoneNumber, userId, callId, ts: Date.now() };
-    console.log('[BX24-CallStart] Pending call stored, background.js will handle MakeCall()');
+    console.log('[BX24-CallStart] Pending call stored');
 
     res.json({ status: 'ok' });
   } catch (err) {
@@ -145,20 +144,13 @@ app.post('/bx24-call-start', async (req, res) => {
   }
 });
 
-// Temporary store for pending outbound call (picked up by background.js poll)
-let pendingOutboundCall = null;
-
-// ── Background worker polls this to get pending outbound call ──
-// Counts incoming polls so we can prove background.js is hitting the server
-// even when there's nothing pending to deliver (logged every 15th tick = ~15s).
-let pollCount = 0;
-
+// ── Poll endpoints ──────────────────────────────────────────────
 app.get('/pending-call', (req, res) => {
   pollCount++;
-  if (pollCount % 15 === 1) console.log('[Poll] /pending-call hit #' + pollCount + ' (background.js is alive)');
+  if (pollCount % 15 === 1) console.log('[Poll] /pending-call hit #' + pollCount + ' (popup.js is alive)');
   if (pendingOutboundCall && (Date.now() - pendingOutboundCall.ts) < 60000) {
     const call = pendingOutboundCall;
-    pendingOutboundCall = null; // consume it
+    pendingOutboundCall = null;
     console.log('[Poll] /pending-call → delivered:', call.number);
     res.json({ pending: true, number: call.number, callId: call.callId });
   } else {
@@ -167,23 +159,14 @@ app.get('/pending-call', (req, res) => {
   }
 });
 
-// ── Call state endpoints ───────────────────────────────────────
+app.get('/call-state', (req, res) => res.json(callState));
 
-// GET /call-state — popup polls this every second to update its UI
-app.get('/call-state', (req, res) => {
-  res.json(callState);
-});
-
-// POST /update-call-state — background.js posts SDK state changes here
 app.post('/update-call-state', (req, res) => {
   callState = Object.assign(callState, req.body);
   console.log('[CallState] Updated:', JSON.stringify(callState));
   res.json({ status: 'ok' });
 });
 
-// ── Action endpoints (popup → server → background.js) ─────────
-
-// POST /call-action — popup sends user actions (answer / hangup / makecall)
 app.post('/call-action', (req, res) => {
   const { action, number } = req.body;
   pendingAction = { action, number };
@@ -191,24 +174,20 @@ app.post('/call-action', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// GET /pending-action — background.js polls this; consumed on read
 app.get('/pending-action', (req, res) => {
   const action = pendingAction;
-  pendingAction = null; // consume it
+  pendingAction = null;
   if (action) console.log('[Poll] /pending-action → delivered:', JSON.stringify(action));
   res.json(action || null);
 });
 
-// Map: Exotel CallSid → BX24 CALL_ID
-const inboundCallMap = {};
-
-// ── Inbound call webhook (Exotel hits this as popup URL) ───────
+// ── Inbound call webhook ────────────────────────────────────────
 app.all('/incoming-call', async (req, res) => {
   const params = Object.assign({}, req.query, req.body);
   console.log('[Incoming] Call received:', JSON.stringify(params));
 
   const eventType = (params.EventType || params.Status || '').toLowerCase();
-  if (eventType && (eventType === 'free' || eventType === 'terminal' || eventType === 'completed' || eventType === 'busy' || eventType === 'noanswer')) {
+  if (eventType && ['free', 'terminal', 'completed', 'busy', 'noanswer'].includes(eventType)) {
     console.log('[Incoming] Ignoring terminal event:', eventType);
     return res.json({ status: 'ignored' });
   }
@@ -231,15 +210,10 @@ app.all('/incoming-call', async (req, res) => {
         LINE_NUMBER:     toNumber,
         SHOW:            1
       });
-
       const bxCallId = (registerResult && registerResult.CALL_ID) || callSid;
       console.log('[Incoming] Registered in BX24, CALL_ID:', bxCallId);
-
       inboundCallMap[callSid] = bxCallId;
-
-      // Update shared call state so popup can show incoming panel
       callState = { state: 'incoming', from: callerNumber, number: toNumber, callId: bxCallId };
-      console.log('[Incoming] callState updated to incoming');
     } else {
       console.warn('[Incoming] BX24_WEBHOOK not set — skipping Bitrix24 notification');
     }
@@ -251,7 +225,7 @@ app.all('/incoming-call', async (req, res) => {
   }
 });
 
-// ── Call ended webhook ─────────────────────────────────────────
+// ── Call ended webhook ──────────────────────────────────────────
 app.all('/call-callback', async (req, res) => {
   const params = Object.assign({}, req.query, req.body);
   console.log('[Callback] Call ended:', JSON.stringify(params));
@@ -259,8 +233,7 @@ app.all('/call-callback', async (req, res) => {
     const exotelSid = params.CallSid || params.call_sid || '';
     const duration  = parseInt(params.Duration || params.duration || '0');
     const status    = params.Status  || params.status   || 'completed';
-
-    const bxCallId = inboundCallMap[exotelSid] || exotelSid;
+    const bxCallId  = inboundCallMap[exotelSid] || exotelSid;
     if (inboundCallMap[exotelSid]) delete inboundCallMap[exotelSid];
 
     if (BX24_WEBHOOK && bxCallId) {
@@ -273,10 +246,7 @@ app.all('/call-callback', async (req, res) => {
       console.log('[Callback] Call finished in BX24, CALL_ID:', bxCallId, 'duration:', duration);
     }
 
-    // Reset call state
     callState = { state: 'idle', from: '', number: '', callId: '' };
-    console.log('[Callback] callState reset to idle');
-
     res.json({ status: 'received' });
   } catch (err) {
     console.error('[Callback] Error:', err.message);
@@ -284,31 +254,18 @@ app.all('/call-callback', async (req, res) => {
   }
 });
 
-// ── Diagnostic: verify PAGE_BACKGROUND_WORKER is actually bound ──
-app.get('/check-placements', async (req, res) => {
-  try {
-    const bgResult  = await bx24Call('placement.get', { PLACEMENT: 'PAGE_BACKGROUND_WORKER' });
-    const sideResult = await bx24Call('placement.get', { PLACEMENT: 'CRM_ACTIVITY_SIDEBAR' });
-    res.json({ PAGE_BACKGROUND_WORKER: bgResult, CRM_ACTIVITY_SIDEBAR: sideResult });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Client-side error/log reporting ────────────────────────────
-// background.js runs in a hidden iframe with no visible console.
-// It POSTs here so we can see what's happening in Render logs.
+// ── Client-side log reporting ───────────────────────────────────
 app.post('/client-log', (req, res) => {
   console.log('[ClientLog]', JSON.stringify(req.body));
   res.json({ status: 'ok' });
 });
 
-// ── Heartbeat: background.js pings this every 10s ─────────────
-// Use Render logs to verify background.js is alive and SDK state.
 app.post('/heartbeat', (req, res) => {
-  console.log('[Heartbeat] BGWorker alive — sdkReady:', req.body.sdkReady);
+  console.log('[Heartbeat] alive — sdkReady:', req.body.sdkReady);
   res.json({ status: 'ok' });
 });
 
-// ── Health ─────────────────────────────────────────────────────
+// ── Health ──────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
   status:              'ok',
   customer_id_set:     !!CUSTOMER_ID,
@@ -320,12 +277,12 @@ app.get('/health', (req, res) => res.json({
   bx24_webhook_set:    !!BX24_WEBHOOK,
   bx24_user_id:        BX24_USER_ID,
   domain:              DOMAIN,
-  app_id_value:        APP_ID || 'NOT SET',
+  sip_domain:          getSipDomain(),
   call_state:          callState
 }));
 
-app.get('/debug',     async (req, res) => { try { const t = await getCustomerToken(); res.json({ success: true, message: '✅ Customer token OK' }); } catch(e) { res.status(500).json({ error: e.message }); } });
-app.get('/debug-app', async (req, res) => { try { const t = await getAppToken();     res.json({ success: true, message: '✅ App token OK' });      } catch(e) { res.status(500).json({ error: e.message }); } });
+app.get('/debug',     async (req, res) => { try { await getCustomerToken(); res.json({ success: true, message: '✅ Customer token OK' }); } catch(e) { res.status(500).json({ error: e.message }); } });
+app.get('/debug-app', async (req, res) => { try { await getAppToken();     res.json({ success: true, message: '✅ App token OK' });      } catch(e) { res.status(500).json({ error: e.message }); } });
 
 app.get('/setup', async (req, res) => {
   try {
@@ -341,29 +298,6 @@ app.get('/setup', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/create-app', async (req, res) => {
-  try {
-    if (APP_ID && APP_SECRET) return res.status(400).json({ error: 'Already configured.', APP_ID });
-    const ct = await getCustomerToken();
-    const r  = await fetch(`${BASE}/app`, { method: 'POST', headers: { 'Authorization': ct, 'Content-Type': 'application/json' }, body: JSON.stringify({ AppName: 'BitrixDialer', ExotelAccountSid: ACCOUNT_SID, ExotelApiKey: API_KEY, ExotelApiToken: API_TOKEN, ExotelDomain: DOMAIN, IsActive: true }) });
-    const data = JSON.parse(await r.text());
-    if (!r.ok) throw new Error(JSON.stringify(data));
-    res.json({ success: true, message: '✅ SAVE THESE NOW!', EXOTEL_APP_ID: data.Data.AppID, EXOTEL_APP_SECRET: data.Data.AppSecret });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/create-user', async (req, res) => {
-  try {
-    const { appUserId, appUsername, email, agentNumber, virtualNumber } = req.body;
-    if (!appUserId || !appUsername || !email || !virtualNumber) return res.status(400).json({ error: 'Missing fields' });
-    const at = await getAppToken();
-    const r  = await fetch(`${BASE}/usermapping`, { method: 'POST', headers: { 'Authorization': at, 'Content-Type': 'application/json' }, body: JSON.stringify([{ AppUserId: appUserId, AppUsername: appUsername, Email: email, ExotelAccountSid: ACCOUNT_SID, ExotelUserName: appUsername, AgentNumber: agentNumber || '', VirtualNumber: virtualNumber }]) });
-    const data = JSON.parse(await r.text());
-    if (!r.ok) throw new Error(JSON.stringify(data));
-    res.json({ success: true, data });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
 app.get('/list-users', async (req, res) => {
   try {
     const at = await getAppToken();
@@ -372,22 +306,68 @@ app.get('/list-users', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── RUNTIME: Token for WebRTC SDK ─────────────────────────────
+// ── RUNTIME: Token for WebRTC SDK ───────────────────────────────
+// Returns sip_id, sip_secret PLUS sip_domain and sip_port so
+// popup.js can build the full sipAccountInfo the SDK needs.
 app.get('/token', async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
+
     const at   = await getAppToken();
     const r    = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(user_id)}`, { headers: { 'Authorization': at } });
     const data = JSON.parse(await r.text());
     if (!r.ok) throw new Error(`Failed [${r.status}]: ${JSON.stringify(data)}`);
-    let user = data.Data?.Users?.length > 0 ? data.Data.Users[0] : (data.Data?.SipId ? data.Data : null);
-    if (!user) throw new Error('User not found');
-    res.json({ success: true, app_token: at, sip_id: user.SipId, sip_secret: user.SipSecret, virtual_number: user.VirtualNumber, user_id: user.AppUserId });
+
+    let user = data.Data?.Users?.length > 0
+      ? data.Data.Users[0]
+      : (data.Data?.SipId ? data.Data : null);
+    if (!user) throw new Error('User not found in usermapping response: ' + JSON.stringify(data));
+
+    const sipDomain = getSipDomain();
+
+    console.log('[Token] Returning SIP credentials for user', user_id, {
+      sip_id: user.SipId,
+      sip_domain: sipDomain,
+      sip_port: 8089
+    });
+
+    res.json({
+      success:        true,
+      app_token:      at,
+      sip_id:         user.SipId,
+      sip_secret:     user.SipSecret,
+      sip_domain:     sipDomain,   // e.g. "singapore.exotel.com"
+      sip_port:       8089,        // WSS port (SDK uses wss://domain:8089/ws)
+      virtual_number: user.VirtualNumber,
+      user_id:        user.AppUserId
+    });
+  } catch(e) {
+    console.error('[Token] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Diagnostic endpoints ────────────────────────────────────────
+app.get('/check-placements', async (req, res) => {
+  try {
+    const sideResult = await bx24Call('placement.get', { PLACEMENT: 'CRM_ACTIVITY_SIDEBAR' });
+    res.json({ CRM_ACTIVITY_SIDEBAR: sideResult });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Static files LAST ──────────────────────────────────────────
+// Debug: what does /token return right now?
+app.get('/debug-token', async (req, res) => {
+  try {
+    const user_id = req.query.user_id || EXOTEL_APP_USER_ID;
+    const at = await getAppToken();
+    const r  = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(user_id)}`, { headers: { 'Authorization': at } });
+    const raw = await r.text();
+    res.json({ status: r.status, raw_response: JSON.parse(raw), sip_domain_computed: getSipDomain() });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Static files LAST ────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
