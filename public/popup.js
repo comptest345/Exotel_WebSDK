@@ -123,13 +123,24 @@ function executeMakeCall(number) {
     return;
   }
   log('MakeCall → ' + number);
+  setStatus('Calling ' + number + '...');
   try {
     webPhone.MakeCall(number);
+    showActive(number);
   } catch (e) {
-    // SDK throws internally but call still goes through
-    log('MakeCall internal (expected): ' + e.message);
+    log('MakeCall threw: ' + e.message + ' — retrying in 1s');
+    // Some SDK versions throw but the call still connects; retry once
+    setTimeout(() => {
+      try {
+        webPhone.MakeCall(number);
+        showActive(number);
+        log('MakeCall retry succeeded for ' + number);
+      } catch (e2) {
+        log('MakeCall retry also threw: ' + e2.message);
+        setStatus('❌ Call failed — ' + e2.message);
+      }
+    }, 1000);
   }
-  showActive(number);
 }
 
 async function makeCall() {
@@ -202,7 +213,7 @@ async function initSDK() {
   setStatus('Connecting...');
 
   try {
-    // 1. Wait for crmBundle.js
+    // 1. Wait for crmBundle.js to load
     let wait = 0;
     while (typeof ExotelCRMWebSDK === 'undefined') {
       if (wait++ > 20) throw new Error('crmBundle.js did not load after 10s');
@@ -210,27 +221,27 @@ async function initSDK() {
     }
     log('ExotelCRMWebSDK class loaded');
 
-    // 2. Fetch credentials
+    // 2. Fetch credentials from our server
     const res = await fetch('/token?user_id=' + encodeURIComponent(EXOTEL_APP_USER_ID));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
 
-    if (!data.app_token) throw new Error('No app_token: ' + JSON.stringify(data));
-    if (!data.sip_id)    throw new Error('No sip_id: '    + JSON.stringify(data));
+    if (!data.app_token)  throw new Error('No app_token: '  + JSON.stringify(data));
+    if (!data.sip_id)     throw new Error('No sip_id: '     + JSON.stringify(data));
     if (!data.sip_secret) throw new Error('No sip_secret: ' + JSON.stringify(data));
 
-    log('Credentials: sip_id=' + data.sip_id);
+    // Use sip_domain from server (set by Exotel usermapping API), with fallback
+    const sipDomain = data.sip_domain || 'voip.in1.exotel.com';
+    log('Credentials: sip_id=' + data.sip_id + ' sipdomain=' + sipDomain);
 
-    // 3. Build sipAccountInfo — THIS IS THE FIX
-    // sipdomain must match exactly what Exotel API returns (voip.in1.exotel.com)
+    // 3. Build sipAccountInfo using server-provided values
     const sipAccountInfo = {
-      userName:   data.sip_id,        // e.g. "exo_usr_xxxx"
-      password:   data.sip_secret,    // SIP secret from usermapping
-      sipdomain:  'voip.in1.exotel.com', // your MUM1 cluster domain
-      port:       '5061',             // TLS SIP port (use '5060' if TCP)
+      userName:    data.sip_id,     // e.g. "exo_usr_xxxx"
+      password:    data.sip_secret, // SIP secret from usermapping
+      sipdomain:   sipDomain,       // from Exotel API — do NOT hardcode
+      port:        '5061',          // TLS SIP port
       displayName: data.sip_id,
-      // If the SDK requires app_token separately, add:
-      appToken:   data.app_token
+      appToken:    data.app_token   // app-level JWT
     };
 
     log('sipAccountInfo built — sipdomain: ' + sipAccountInfo.sipdomain);
@@ -238,54 +249,76 @@ async function initSDK() {
     // 4. Instantiate with NO arguments (constructor ignores them)
     const sdk = new ExotelCRMWebSDK();
 
-    // 5. Initialize with the ACTUAL sipAccountInfo + all 3 callbacks
+    // 5. Initialize with sipAccountInfo + all 3 required callbacks
     webPhone = await sdk.Initialize(
       sipAccountInfo,
 
-      // callListener
+      // callListener — fires on call state changes
       function callListener(event) {
         handleCallEvent(event);
       },
 
-      // regListener — SIP registration result
+      // regListener — SIP registration result (success or failure)
       function regListener(event) {
-        log('regListener fired: ' + JSON.stringify(event).slice(0, 120));
-        const evStr = JSON.stringify(event).toLowerCase();
-        if (evStr.includes('fail') || evStr.includes('error') || evStr.includes('403') || evStr.includes('401')) {
-          log('SIP registration FAILED: ' + JSON.stringify(event));
+        const evStr = JSON.stringify(event);
+        log('regListener fired: ' + evStr.slice(0, 200));
+        const evLow = evStr.toLowerCase();
+        if (evLow.includes('fail') || evLow.includes('error') ||
+            evLow.includes('403')  || evLow.includes('401')   ||
+            evLow.includes('reject')) {
+          log('SIP registration FAILED: ' + evStr);
           setReg('failed');
-          setStatus('❌ SIP registration failed — check credentials');
+          setStatus('❌ SIP registration failed — check credentials/domain');
           return;
         }
+        log('SIP registration SUCCESS');
         sdkReady = true;
         setReg('registered');
         setStatus('✅ Ready');
 
-        // Drain queued call
+        // Drain any queued outbound call that arrived before SDK was ready
         if (queuedCall) {
           const n = queuedCall;
           queuedCall = null;
-          log('Draining queued call: ' + n);
+          log('Draining queued call → ' + n);
           setTimeout(() => executeMakeCall(n), 300);
         }
       },
 
-      // sessionListener (optional but required by SDK signature)
+      // sessionListener — required by SDK signature
       function sessionListener(event) {
         log('Session event: ' + JSON.stringify(event).slice(0, 80));
       }
     );
 
-    log('SDK.Initialize() awaited — waiting for regListener...');
-    // Timeout guard — if regListener doesn't fire in 15s, surface the failure
-setTimeout(() => {
-  if (!sdkReady) {
-    log('⚠️ regListener never fired after 15s — SIP registration hung');
-    setReg('failed');
-    setStatus('❌ SIP registration timed out — check sipdomain/port/credentials');
-  }
-}, 15000);
+    log('SDK.Initialize() resolved — webPhone=' + (webPhone ? 'object' : String(webPhone)));
+
+    // If Initialize() itself returns the ready phone object (some SDK versions),
+    // treat that as registration success immediately
+    if (webPhone && !sdkReady) {
+      log('Initialize returned webPhone directly — marking sdkReady=true');
+      sdkReady = true;
+      setReg('registered');
+      setStatus('✅ Ready');
+      if (queuedCall) {
+        const n = queuedCall;
+        queuedCall = null;
+        log('Draining queued call (post-init) → ' + n);
+        setTimeout(() => executeMakeCall(n), 300);
+      }
+    }
+
+    // Timeout guard — if regListener never fires in 15s, surface the error
+    setTimeout(() => {
+      if (!sdkReady) {
+        log('⚠️ regListener never fired after 15s — SIP registration hung or wrong domain/port');
+        setReg('failed');
+        setStatus('❌ SIP timed out — check sipdomain (' + sipDomain + ') and port');
+      }
+    }, 15000);
+
     startPolling();
+
   } catch (err) {
     log('SDK init FAILED: ' + err.message);
     setReg('failed');
