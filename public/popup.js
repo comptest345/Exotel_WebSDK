@@ -39,10 +39,12 @@ function setReg(state) {
 }
 
 // ── Mic permission ────────────────────────────────────────────
+let micStream = null; // global
+
 async function requestMic() {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach(t => t.stop());
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // DO NOT stop tracks here — let SDK reuse or release it
     micGranted = true;
     clog('Mic permission granted');
   } catch (e) {
@@ -139,6 +141,11 @@ async function init() {
         }
       }
     );
+    // After webPhone = await crmWebSDK.Initialize(...)
+if (micStream) {
+  micStream.getTracks().forEach(t => t.stop());
+  micStream = null;
+}
 
     clog('Initialize resolved. webPhone=' + (webPhone ? typeof webPhone : 'null/void'));
 
