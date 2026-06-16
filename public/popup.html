@@ -76,9 +76,12 @@
 </div>
 
 <script src="//api.bitrix24.com/api/v1/"></script>
-<!-- crmBundle.js intentionally NOT loaded here. -->
-<!-- background.js owns the single SDK instance — loading it here would -->
-<!-- create a second SIP registration and cause double-calls. -->
+<!-- crmBundle.js loads the ExotelCRMWebSDK class. The SDK instance now lives -->
+<!-- HERE in popup.js (a visible iframe, so microphone permission works), not -->
+<!-- in the hidden background.js worker, which never reliably ran and likely -->
+<!-- couldn't get mic permission anyway. There is only ONE SDK instance now, -->
+<!-- so there is no double-registration / double-call risk. -->
+<script src="/target/crmBundle.js"></script>
 <script src="/popup.js"></script>
 </body>
 </html>
