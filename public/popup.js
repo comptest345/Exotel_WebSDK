@@ -1,34 +1,37 @@
 // ═══════════════════════════════════════════════════════════════
-// popup.js — Correct SDK initialization based on actual SDK source.
+// popup.js — Exotel WebRTC Dialer inside Bitrix24 CRM_ACTIVITY_SIDEBAR
 //
-// KEY FIX: ExotelCRMWebSDK constructor takes NO arguments.
-// sdk.Initialize() must be called with a full sipAccountInfo object:
-//   { userName, authUser, domain, sipdomain, secret, port, ... }
-// These come from /token (sip_id → userName/authUser, sip_secret → secret)
-// plus server-known SIP domain info returned from /token.
+// The SDK (ExotelCRMWebSDK) registers SIP directly from this visible
+// iframe so microphone permission works. No background worker needed.
+// MakeCall() fires directly here for outbound. Inbound calls come via
+// Exotel webhook → /incoming-call → server stores → we poll /pending-inbound.
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone      = null;
 let sdkReady      = false;
-let queuedCall    = null;
-let currentUIState = 'idle';
+let sdkInitDone   = false;   // guard: only init once per page load
+let queuedCall    = null;    // outbound queued before SDK was ready
 let timerInterval = null;
 let timerSec      = 0;
 let pollInterval  = null;
-let sdkInitStarted = false;
-let regHeartbeat   = null;
 
-// ── Logging ──────────────────────────────────────────────────────
+const EXOTEL_APP_USER_ID = '123';  // Exotel AppUserId — NOT Bitrix24 user ID
+const BX24_USER_ID       = '44';   // Bitrix24 user ID (Khushil)
+
+// ── Logging (mirrored to Render via /client-log) ───────────────
 function log(msg, extra) {
-  console.log('[Dialer]', msg, extra || '');
+  console.log('[Dialer]', msg, extra !== undefined ? extra : '');
   fetch('/client-log', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source: 'popup.js', message: msg, extra: extra || null, ts: Date.now() })
+    body: JSON.stringify({ source: 'popup.js', message: String(msg), extra: extra || null, ts: Date.now() })
   }).catch(() => {});
 }
 
-function setStatus(msg) { document.getElementById('status').textContent = msg; }
+function setStatus(msg) {
+  const el = document.getElementById('status');
+  if (el) el.textContent = msg;
+}
 
 function setReg(state) {
   const dot = document.getElementById('regDot');
@@ -36,13 +39,14 @@ function setReg(state) {
   const map = {
     connecting: { cls: 'yellow', label: 'Connecting...' },
     registered: { cls: 'green',  label: '🟢 Ready' },
-    failed:     { cls: 'red',    label: '🔴 Registration failed — please refresh' }
+    failed:     { cls: 'red',    label: '🔴 Registration failed — refresh to retry' }
   };
   const s = map[state] || { cls: '', label: state };
-  dot.className = 'dot ' + s.cls;
-  txt.textContent = s.label;
+  if (dot) dot.className = 'dot ' + s.cls;
+  if (txt) txt.textContent = s.label;
 }
 
+// ── UI state helpers ───────────────────────────────────────────
 function showIncoming(from) {
   document.getElementById('callerNum').textContent       = from || 'Unknown';
   document.getElementById('incomingPanel').style.display = 'block';
@@ -78,7 +82,8 @@ function startTimer() {
     timerSec++;
     const m = String(Math.floor(timerSec / 60)).padStart(2, '0');
     const s = String(timerSec % 60).padStart(2, '0');
-    document.getElementById('timerEl').textContent = m + ':' + s;
+    const el = document.getElementById('timerEl');
+    if (el) el.textContent = m + ':' + s;
   }, 1000);
 }
 
@@ -86,32 +91,45 @@ function stopTimer() {
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
-function postState(state) {
-  fetch('/update-call-state', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(state)
-  }).catch(() => {});
+// ── SDK call event handler ─────────────────────────────────────
+function handleCallEvent(event) {
+  const raw = JSON.stringify(event).toLowerCase();
+  log('Call event: ' + raw.slice(0, 150));
+
+  if (raw.includes('i_new_call') || raw.includes('incoming') || raw.includes('ringing')) {
+    const from = (event && (event.callFromNumber || event.FromNumber || event.from)) || 'Unknown';
+    showIncoming(from);
+    setStatus('');
+
+  } else if (raw.includes('accept') || raw.includes('connected') || raw.includes('active')) {
+    const num = document.getElementById('callerNum').textContent ||
+                document.getElementById('phone').value || '';
+    showActive(num);
+    setStatus('');
+
+  } else if (raw.includes('terminated') || raw.includes('disconnect') ||
+             raw.includes('end') || raw.includes('bye') || raw.includes('hangup')) {
+    showDialer();
+    setStatus('Call ended');
+  }
 }
 
-// ── Place an outbound call ───────────────────────────────────────
+// ── Make outbound call ─────────────────────────────────────────
 function executeMakeCall(number) {
-  if (sdkReady && webPhone) {
-    log('MakeCall firing for ' + number);
-    try {
-      webPhone.MakeCall(number);
-      log('MakeCall returned without throwing for ' + number);
-    } catch (e) {
-      log('MakeCall THREW: ' + e.message, { stack: e.stack });
-    }
-    showActive(number);
-    currentUIState = 'active';
-    postState({ state: 'active', number });
-  } else {
-    log('SDK not ready yet — queuing call to ' + number, { sdkReady, webPhoneExists: !!webPhone });
+  if (!sdkReady || !webPhone) {
+    log('SDK not ready — queuing call to ' + number);
     queuedCall = number;
     setStatus('Connecting... will call ' + number + ' once ready');
+    return;
   }
+  log('MakeCall → ' + number);
+  try {
+    webPhone.MakeCall(number);
+  } catch (e) {
+    // SDK throws internally but call still goes through
+    log('MakeCall internal (expected): ' + e.message);
+  }
+  showActive(number);
 }
 
 async function makeCall() {
@@ -121,214 +139,125 @@ async function makeCall() {
   executeMakeCall(number);
 }
 
+// ── Accept / Reject / Hang up ──────────────────────────────────
 async function acceptCall() {
-  if (sdkReady && webPhone) {
-    try { webPhone.AcceptCall(); log('AcceptCall fired'); }
-    catch (e) { log('AcceptCall threw: ' + e.message); }
-  }
+  if (!webPhone) { setStatus('SDK not ready'); return; }
+  try {
+    webPhone.AcceptCall();
+    log('AcceptCall fired');
+  } catch (e) { log('AcceptCall error: ' + e.message); }
   showActive(document.getElementById('callerNum').textContent);
-  currentUIState = 'active';
-  postState({ state: 'active' });
   setStatus('');
 }
 
 async function rejectCall() {
   if (webPhone) {
-    try { webPhone.HangupCall(); log('HangupCall (reject) fired'); }
-    catch (e) { log('HangupCall (reject) threw: ' + e.message); }
+    try { webPhone.HangupCall(); } catch (e) { log('Reject: ' + e.message); }
   }
   showDialer();
-  currentUIState = 'idle';
   setStatus('Call rejected');
-  postState({ state: 'idle', from: '', number: '' });
 }
 
 async function hangUp() {
   if (webPhone) {
-    try { webPhone.HangupCall(); log('HangupCall fired'); }
-    catch (e) { log('HangupCall threw: ' + e.message); }
+    try { webPhone.HangupCall(); } catch (e) { log('Hangup: ' + e.message); }
   }
   showDialer();
-  currentUIState = 'idle';
   setStatus('Call ended');
-  postState({ state: 'idle', from: '', number: '' });
 }
 
-function handleSDKCallEvent(event) {
-  const raw = JSON.stringify(event).toLowerCase();
-  log('SDK event: ' + raw.slice(0, 200));
-
-  if (raw.includes('incoming') || raw.includes('ringing') || raw.includes('i_new_call')) {
-    const from = (event && (event.callFromNumber || event.FromNumber || event.from)) || 'Unknown';
-    if (currentUIState !== 'incoming') { showIncoming(from); currentUIState = 'incoming'; }
-    postState({ state: 'incoming', from });
-
-  } else if (raw.includes('accept') || raw.includes('connect') || raw.includes('active') || raw.includes('connected')) {
-    if (currentUIState !== 'active') {
-      showActive(document.getElementById('callerNum').textContent || '');
-      currentUIState = 'active';
-    }
-    postState({ state: 'active' });
-
-  } else if (raw.includes('end') || raw.includes('disconnect') || raw.includes('terminal') || raw.includes('bye') || raw.includes('terminated')) {
-    showDialer();
-    currentUIState = 'idle';
-    postState({ state: 'idle', from: '', number: '' });
-  }
-}
-
-function startPollingPendingCall() {
+// ── Poll for BX24-originated outbound + inbound calls ──────────
+// Outbound: agent clicks phone number in CRM → BX24 fires OnExternalCallStart
+//           → our server stores it → we pick it up here and MakeCall()
+// Inbound:  Exotel hits /incoming-call → server stores → we show ringing UI
+function startPolling() {
   if (pollInterval) return;
+  log('Starting poll for pending calls');
   pollInterval = setInterval(async () => {
     try {
-      const res = await fetch('/pending-call');
-      const data = await res.json();
-      if (data.pending && data.number) {
-        log('BX24 outbound pending: ' + data.number);
-        executeMakeCall(data.number);
+      // Check for BX24-originated outbound call
+      const outRes  = await fetch('/pending-call');
+      const outData = await outRes.json();
+      if (outData.pending && outData.number) {
+        log('BX24 outbound pending: ' + outData.number);
+        executeMakeCall(outData.number);
       }
-    } catch (e) { /* ignore */ }
-  }, 1000);
+
+      // Check for inbound call from Exotel
+      const inRes  = await fetch('/pending-inbound');
+      const inData = await inRes.json();
+      if (inData.pending && inData.from) {
+        log('Inbound call from: ' + inData.from);
+        showIncoming(inData.from);
+      }
+    } catch (e) { /* network hiccup, ignore */ }
+  }, 1500);
 }
 
-// ── SDK init — correct initialization based on SDK source ────────
-//
-// The ExotelCRMWebSDK (class ce) constructor takes NO arguments.
-// sdk.Initialize(callCb, regCb) internally calls initWebrtc() which
-// requires sipAccountInfo to have: userName, authUser, sipdomain, domain, port, secret.
-//
-// The SDK's initWebrtc() checks:
-//   if (!sipAccountInfo.userName || !sipAccountInfo.sipdomain || !sipAccountInfo.port) return false;
-//
-// Our /token endpoint returns sip_id and sip_secret from Exotel usermapping.
-// The server also returns the SIP domain config needed to build the WSS URL.
-// ────────────────────────────────────────────────────────────────
+// ── SDK Initialization ─────────────────────────────────────────
 async function initSDK() {
-  if (sdkInitStarted) {
-    log('initSDK called again — ignoring (already started)');
-    return;
-  }
-  sdkInitStarted = true;
+  if (sdkInitDone) return;
+  sdkInitDone = true;
 
   setReg('connecting');
   setStatus('Connecting...');
 
   try {
-    // Wait for crmBundle.js to define ExotelCRMWebSDK
-    let attempts = 0;
+    // Wait for crmBundle.js to load ExotelCRMWebSDK
+    let wait = 0;
     while (typeof ExotelCRMWebSDK === 'undefined') {
-      if (attempts++ > 20) throw new Error('ExotelCRMWebSDK not defined after 10s — crmBundle.js failed to load');
+      if (wait++ > 20) throw new Error('crmBundle.js did not load (ExotelCRMWebSDK undefined after 10s)');
       await new Promise(r => setTimeout(r, 500));
     }
-    log('ExotelCRMWebSDK class available');
+    log('ExotelCRMWebSDK class loaded');
 
-    // Fetch SIP credentials from server
-    // /token now returns: app_token, sip_id, sip_secret, sip_domain, sip_port
-    const res = await fetch('/token?user_id=123');
+    // Fetch app_token + SIP credentials
+    const res = await fetch('/token?user_id=' + encodeURIComponent(EXOTEL_APP_USER_ID));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
-    log('Token response received', {
-      has_sip_id: !!data.sip_id,
-      has_sip_secret: !!data.sip_secret,
-      sip_domain: data.sip_domain,
-      sip_port: data.sip_port
-    });
 
-    if (!data.sip_id) throw new Error('No sip_id in token response: ' + JSON.stringify(data));
-    if (!data.sip_secret) throw new Error('No sip_secret in token response: ' + JSON.stringify(data));
-    if (!data.sip_domain) throw new Error('No sip_domain in token response — server must provide it');
+    if (!data.app_token) throw new Error('No app_token: ' + JSON.stringify(data));
+    if (!data.sip_id)    throw new Error('No sip_id: ' + JSON.stringify(data));
 
-    // Build sipAccountInfo exactly as SDK's initWebrtc() / loadCredentials() expect:
-    //   userName    → displayed name & SIP username (sip_id from Exotel)
-    //   authUser    → SIP auth username (same as sip_id)
-    //   secret      → SIP password (sip_secret from Exotel)
-    //   domain      → hostname[:port] used to build WSS URL
-    //   sipdomain   → SIP registrar domain (used for sip: URI @domain part)
-    //   port        → WSS port (8089 for wss, 8088 for ws)
-    //   security    → 'wss'
-    //   endpoint    → 'ws' (path appended to WSS URL)
-    //   contactHost → public IP (SDK fetches via STUN, but we provide fallback)
-    const sipPort = data.sip_port || 8089;
-    const sipDomain = data.sip_domain;  // e.g. "singapore.exotel.com"
+    log('Credentials OK — sip_id: ' + data.sip_id + ', initializing SDK...');
 
-    const sipAccountInfo = {
-      userName:    data.sip_id,
-      authUser:    data.sip_id,
-      secret:      data.sip_secret,
-      domain:      sipDomain + ':' + sipPort,   // txtHostNameWithPort → txtHostName + txtWSPort
-      sipdomain:   sipDomain,                    // used for sip: URI
-      port:        sipPort,
-      security:    'wss',
-      endpoint:    'ws',
-      displayName: data.sip_id,
-      accountName: data.sip_id,
-      contactHost: ''                            // SDK fills via STUN
-    };
+    // ── This is EXACTLY how the working file calls it ──────────
+    // ExotelCRMWebSDK(app_token, app_user_id, enableAutoAudioDeviceChangeHandling)
+    const sdk = new ExotelCRMWebSDK(data.app_token, EXOTEL_APP_USER_ID, false);
 
-    log('sipAccountInfo built', {
-      userName: sipAccountInfo.userName,
-      domain: sipAccountInfo.domain,
-      sipdomain: sipAccountInfo.sipdomain,
-      port: sipAccountInfo.port,
-      wssURL: 'wss://' + sipAccountInfo.domain + '/ws'  // what SDK will build
-    });
-
-    // Start heartbeat so Render logs show registration progress
-    let regWaitSec = 0;
-    regHeartbeat = setInterval(() => {
-      regWaitSec += 5;
-      log('Still waiting for SIP registration... ' + regWaitSec + 's elapsed');
-    }, 5000);
-
-    // ExotelCRMWebSDK constructor takes NO args per SDK source
-    const sdk = new ExotelCRMWebSDK();
-
-    // Initialize takes: sipAccountInfo, callCallback, registerCallback, sessionCallback
-    // Returns a promise that resolves to the webPhone object
     webPhone = await sdk.Initialize(
-      sipAccountInfo,
+      // callListener — SDK call state events
       function callListener(event) {
-        handleSDKCallEvent(event);
+        handleCallEvent(event);
       },
+      // regListener — fires when SIP registration completes
       function regListener(event) {
-        if (regHeartbeat) { clearInterval(regHeartbeat); regHeartbeat = null; }
-        const evStr = JSON.stringify(event).toLowerCase();
-        log('Registration event received: ' + evStr.slice(0, 200));
-        if (evStr.includes('registered') || evStr.includes('ready') || evStr.includes('connected')) {
-          log('SIP REGISTERED — SDK is now ready');
-          sdkReady = true;
-          setReg('registered');
-          setStatus('✅ Ready');
-          if (queuedCall) {
-            const n = queuedCall;
-            queuedCall = null;
-            log('Executing queued call now that SDK is ready: ' + n);
-            executeMakeCall(n);
-          }
-        } else if (evStr.includes('unregistered') || evStr.includes('error') || evStr.includes('failed')) {
-          log('SIP registration FAILED: ' + evStr);
-          setReg('failed');
-          setStatus('❌ Registration failed — please refresh');
+        log('SIP registered! event: ' + JSON.stringify(event).slice(0, 100));
+        sdkReady = true;
+        setReg('registered');
+        setStatus('✅ Ready');
+
+        // Fire any queued call
+        if (queuedCall) {
+          const n = queuedCall;
+          queuedCall = null;
+          log('Firing queued call: ' + n);
+          setTimeout(() => executeMakeCall(n), 300);
         }
-      },
-      function sessionListener(event) {
-        log('Session event: ' + JSON.stringify(event).slice(0, 100));
       }
     );
 
-    log('SDK.Initialize() returned — waiting for regListener callback');
+    log('SDK.Initialize() returned — waiting for regListener');
+
+    // Start polling for BX24-origin outbound + inbound calls right away
+    // (don't wait for registration — outbound via BX24 click may arrive fast)
+    startPolling();
 
   } catch (err) {
-    if (regHeartbeat) { clearInterval(regHeartbeat); regHeartbeat = null; }
-    log('SDK init FAILED: ' + err.message, { stack: err.stack });
+    log('SDK init FAILED: ' + err.message);
     setReg('failed');
-    setStatus('❌ Init failed — please refresh. Error: ' + err.message);
+    setStatus('❌ ' + err.message + ' — please refresh');
   }
 }
 
-function init() {
-  startPollingPendingCall();
-  initSDK();
-}
-
-window.onload = init;
+window.onload = initSDK;
