@@ -83,29 +83,16 @@ app.all('/install', (req, res) => {
   <script>
     BX24.init(function() {
 
-      // Step 1: Register background worker
+      // SDK now lives in popup.js (CRM_ACTIVITY_SIDEBAR) instead of a hidden
+      // background worker, so register the sidebar directly.
       BX24.callMethod('placement.bind', {
-        PLACEMENT: 'PAGE_BACKGROUND_WORKER',
-        HANDLER: 'https://exotel-websdk.onrender.com/background.html',
-        TITLE: 'Exotel Background Worker',
-        OPTIONS: { errorHandlerUrl: 'https://exotel-websdk.onrender.com/error-handler.html' }
-      }, function(r1) {
-        var e1 = r1.error ? r1.error() : null;
-        if (e1 && e1.toString().indexOf('ERROR_PLACEMENT_MAX_COUNT') === -1) {
-          console.warn('[Install] background placement warning:', e1.toString());
-        } else {
-          console.log('[Install] Background worker registered');
-        }
-
-        // Step 2: Register CRM sidebar dialer
-        BX24.callMethod('placement.bind', {
-          PLACEMENT: 'CRM_ACTIVITY_SIDEBAR',
-          HANDLER: 'https://exotel-websdk.onrender.com/popup.html',
-          TITLE: 'Exotel Dialer'
-        }, function(rs) {
+        PLACEMENT: 'CRM_ACTIVITY_SIDEBAR',
+        HANDLER: 'https://exotel-websdk.onrender.com/popup.html',
+        TITLE: 'Exotel Dialer'
+      }, function(rs) {
           console.log('[Install] Sidebar registered');
 
-          // Step 3: Register external telephony line
+          // Step 2: Register external telephony line
           BX24.callMethod('telephony.externalLine.add', {
             LINE_NAME: 'Exotel',
             APP_ID: BX24.getAuth().client_id
@@ -117,7 +104,7 @@ app.all('/install', (req, res) => {
               console.log('[Install] External telephony line registered:', r2.data());
             }
 
-            // Step 4: Subscribe to outbound call event
+            // Step 3: Subscribe to outbound call event
             BX24.callMethod('event.bind', {
               EVENT: 'OnExternalCallStart',
               HANDLER: 'https://exotel-websdk.onrender.com/bx24-call-start'
@@ -129,7 +116,6 @@ app.all('/install', (req, res) => {
           });
         });
       });
-    });
   </script>
 </body>
 </html>`);
