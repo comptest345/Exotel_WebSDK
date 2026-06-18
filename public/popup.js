@@ -1,17 +1,17 @@
 // ═══════════════════════════════════════════════════════════════
 // popup.js — Multi-agent version
-// Identifies logged-in Bitrix24 user by EMAIL, fetches their own
-// SIP credentials from Exotel, and registers with per-user SIP.
+// FIX: Uses BX24 auth token passed via iframe URL (?bx24_user_id=)
+//      as fallback when BX24.init() is unavailable (Marketplace page).
+//      Also supports legacy email lookup via /token?user_id=email
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone      = null;
 let sdkReady      = false;
 let timerInterval = null;
 let timerSec      = 0;
-let callDirection = null; // 'inbound' | 'outbound' | null
+let callDirection = null;
 let micGranted    = false;
 
-// These are set dynamically from BX24 — NOT hardcoded anymore
 let currentUserEmail  = null;
 let currentBx24UserId = null;
 
@@ -33,28 +33,24 @@ function setReg(state) {
   const txt = document.getElementById('regText');
   const map = {
     connecting: { cls: 'yellow', label: 'Connecting...' },
-    registered: { cls: 'green',  label: '🟢 Ready' },
-    failed:     { cls: 'red',    label: '🔴 Registration failed' }
+    registered: { cls: 'green',  label: '\uD83D\uDFE2 Ready' },
+    failed:     { cls: 'red',    label: '\uD83D\uDD34 Registration failed' }
   };
   const s = map[state] || { cls: '', label: state };
   if (dot) dot.className = 'dot ' + s.cls;
   if (txt) txt.textContent = s.label;
 }
 
-// ── Get logged-in Bitrix24 user's email ──────────────────────────
+// ── Get logged-in Bitrix24 user email ───────────────────────────────────────────
 function getBx24CurrentUser() {
   return new Promise((resolve, reject) => {
     let attempts = 0;
-    const MAX    = 5; // retry up to 5 times with 1s gap
-
+    const MAX    = 5;
     function tryInit() {
       attempts++;
       if (!window.BX24) {
-        if (attempts < MAX) {
-          setTimeout(tryInit, 1000);
-        } else {
-          reject(new Error('BX24 not available'));
-        }
+        if (attempts < MAX) { setTimeout(tryInit, 1000); }
+        else { reject(new Error('BX24 not available')); }
         return;
       }
       BX24.init(function () {
@@ -62,19 +58,32 @@ function getBx24CurrentUser() {
           if (result.error()) { reject(new Error(String(result.error()))); return; }
           const data = result.data();
           resolve({
-            email: data.EMAIL  || null,
-            id:    data.ID     || null,
+            email: data.EMAIL || null,
+            id:    data.ID    || null,
             name:  (data.NAME + ' ' + (data.LAST_NAME || '')).trim()
           });
         });
       });
     }
-
     tryInit();
   });
 }
 
-// ── Mic permission ────────────────────────────────────────────────
+// ── FIX: Parse bx24_user_id from iframe URL query params ─────────────────────────────
+function getBx24UserIdFromUrl() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const placementOptions = params.get('PLACEMENT_OPTIONS');
+    if (placementOptions) {
+      const opts = JSON.parse(decodeURIComponent(placementOptions));
+      if (opts.USER_ID) return String(opts.USER_ID);
+    }
+    const userId = params.get('USER_ID') || params.get('user_id');
+    if (userId) return String(userId);
+  } catch(e) {}
+  return null;
+}
+
 let micStream = null;
 
 async function requestMic() {
@@ -85,13 +94,12 @@ async function requestMic() {
   } catch (e) {
     micGranted = false;
     clog('Mic DENIED: ' + e.message);
-    setStatus('⚠️ Allow microphone and reload.');
+    setStatus('\u26A0\uFE0F Allow microphone and reload.');
     const w = document.getElementById('micWarning');
     if (w) w.style.display = 'block';
   }
 }
 
-// ── UI states ─────────────────────────────────────────────────────
 function showIncoming(from) {
   callDirection = 'inbound';
   const el = document.getElementById('callerNum');
@@ -140,52 +148,63 @@ function stopTimer() {
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
-// ── Init ──────────────────────────────────────────────────────────
 async function init() {
   setReg('connecting');
   setStatus('Identifying user...');
 
-  // Step 1: Get logged-in BX24 user's email
-  // This MUST succeed — if BX24 is not available, we cannot identify the agent
-  // and must not fall through to another user's credentials.
+  let tokenLookupId = null;
+
   try {
     const bxUser = await getBx24CurrentUser();
     currentUserEmail  = bxUser.email;
     currentBx24UserId = bxUser.id;
     clog('BX24 user: ' + bxUser.name + ' <' + currentUserEmail + '> id=' + currentBx24UserId);
     if (!currentUserEmail) throw new Error('BX24 returned no email for this user');
+    tokenLookupId = currentUserEmail;
     setStatus('Hello ' + bxUser.name.split(' ')[0] + '! Requesting microphone...');
   } catch (e) {
-    // BX24 not available — this happens when popup is opened from Marketplace page
-    // instead of from inside a CRM contact card/sidebar.
     clog('BX24 user detection failed: ' + e.message);
-    setReg('failed');
-    setStatus('⚠️ Please open the dialer from a CRM contact, not the Marketplace page.');
-    console.error('[Dialer] BX24 user detection failed:', e.message);
-    return; // STOP — do not register with wrong user's SIP
+    const urlBx24Id = getBx24UserIdFromUrl();
+    if (urlBx24Id) {
+      clog('Using bx24_user_id from URL params: ' + urlBx24Id);
+      currentBx24UserId = urlBx24Id;
+      tokenLookupId = null;
+      setStatus('User ' + urlBx24Id + ': Requesting microphone...');
+    } else {
+      setReg('failed');
+      setStatus('\u26A0\uFE0F Please open the dialer from a CRM contact, not the Marketplace page.');
+      console.error('[Dialer] BX24 user detection failed:', e.message);
+      return;
+    }
   }
 
-  // Step 2: Mic
   await requestMic();
   if (!micGranted) return;
 
-  // Step 3: Fetch SIP credentials for this specific user by email
   setStatus('Fetching credentials...');
   try {
-    // Always use email — never fall back to a hardcoded ID
-    const lookupId = currentUserEmail;
-    const res  = await fetch('/token?user_id=' + encodeURIComponent(lookupId));
+    let tokenUrl;
+    if (tokenLookupId) {
+      tokenUrl = '/token?user_id=' + encodeURIComponent(tokenLookupId);
+    } else if (currentBx24UserId) {
+      tokenUrl = '/token?bx24_user_id=' + encodeURIComponent(currentBx24UserId);
+    } else {
+      throw new Error('Cannot identify user — no email or bx24_user_id');
+    }
+
+    const res  = await fetch(tokenUrl);
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
     if (data.error) throw new Error(data.error);
 
-    clog('Token OK, app_user_id=' + data.app_user_id + ' email=' + data.email);
+    if (!currentUserEmail && data.email) currentUserEmail = data.email;
+
+    clog('Token OK, app_user_id=' + data.app_user_id);
 
     const accessToken = data.access_token || data.app_token;
     const appUserId   = data.app_user_id  || data.user_id;
     if (!accessToken) throw new Error('No access_token in response');
 
-    // Step 4: Init SDK
     setStatus('Initializing SDK...');
     if (typeof ExotelCRMWebSDK === 'undefined') throw new Error('ExotelCRMWebSDK not loaded — check /target/crmBundle.js path');
 
@@ -198,25 +217,21 @@ async function init() {
         if (!sdkReady) {
           sdkReady = true;
           setReg('registered');
-          setStatus('✅ Ready');
-          clog('SIP registered ✅ as ' + appUserId);
+          setStatus('\u2705 Ready');
+          clog('SIP registered \u2705 as ' + appUserId);
           startPoll();
         }
       }
     );
 
-    // Release pre-acquired mic — SDK now manages it
-    if (micStream) {
-      micStream.getTracks().forEach(t => t.stop());
-      micStream = null;
-    }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
 
     clog('Initialize resolved. webPhone=' + (webPhone ? typeof webPhone : 'null/void'));
 
     if (webPhone && !sdkReady) {
       sdkReady = true;
       setReg('registered');
-      setStatus('✅ Ready');
+      setStatus('\u2705 Ready');
       startPoll();
     }
 
@@ -228,7 +243,6 @@ async function init() {
   }
 }
 
-// ── Poll for BX24 click-to-call (per agent email) ────────────────
 let pollCount = 0;
 let pollTimer = null;
 function startPoll() {
@@ -236,12 +250,18 @@ function startPoll() {
   pollTimer = setInterval(doPoll, 2000);
 }
 async function doPoll() {
-  if (!currentUserEmail) return;
+  if (!currentUserEmail && !currentBx24UserId) return;
   try {
-    const res  = await fetch('/pending-call?email=' + encodeURIComponent(currentUserEmail));
+    let pollUrl;
+    if (currentUserEmail) {
+      pollUrl = '/pending-call?email=' + encodeURIComponent(currentUserEmail);
+    } else {
+      pollUrl = '/pending-call?bx24_user_id=' + encodeURIComponent(currentBx24UserId);
+    }
+    const res  = await fetch(pollUrl);
     const data = await res.json();
     pollCount++;
-    if (pollCount % 30 === 1) clog('poll #' + pollCount + ' email=' + currentUserEmail);
+    if (pollCount % 30 === 1) clog('poll #' + pollCount + ' email=' + currentUserEmail + ' bx24Id=' + currentBx24UserId);
     if (data.pending && data.number) {
       clog('BX24 click-to-call: ' + data.number);
       callDirection = 'outbound';
@@ -253,127 +273,69 @@ async function doPoll() {
   } catch (e) { /* silent */ }
 }
 
-// ── Outbound call ─────────────────────────────────────────────────
 async function triggerOutboundCall(number) {
   if (!webPhone) { setStatus('SDK not ready'); clog('webPhone is null!'); return; }
   callDirection = 'outbound';
-  clog('MakeCall → ' + number);
-  try {
-    await webPhone.MakeCall(number, null, null);
-  } catch (e) {
-    clog('MakeCall error: ' + e.message);
-  }
+  clog('MakeCall \u2192 ' + number);
+  try { await webPhone.MakeCall(number, null, null); }
+  catch (e) { clog('MakeCall error: ' + e.message); }
 }
 
-// ── Call event handler ────────────────────────────────────────────
 function handleCallEvent(event) {
   clog('callEvent: ' + JSON.stringify(event));
-
-  const evtType = (
-    (event && event.event) ||
-    (event && event.type)  ||
-    (event && event.EventType) ||
-    ''
-  ).toLowerCase();
-
+  const evtType = ((event && event.event) || (event && event.type) || (event && event.EventType) || '').toLowerCase();
   const evtStr = JSON.stringify(event).toLowerCase();
-
   clog('evtType=' + evtType + ' direction=' + callDirection);
 
-  // Incoming / Ringing
-  if (evtType.includes('incoming') || evtType.includes('ringing') ||
-      evtStr.includes('incoming')  || evtStr.includes('ringing')) {
-
-    if (callDirection === 'outbound') {
-      clog('Outbound SIP leg incoming → silent AcceptCall');
-      silentAcceptOutbound();
-    } else {
-      const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown';
-      showIncoming(from);
-      setStatus('');
-    }
-
-  // Connected / Answered
-  } else if (evtType.includes('connect') || evtType.includes('answer') ||
-             evtType.includes('accept')  || evtType.includes('active') ||
-             evtStr.includes('call_answered') || evtStr.includes('connected')) {
-
-    const num = callDirection === 'inbound'
-      ? (document.getElementById('callerNum')?.textContent || '')
-      : (document.getElementById('phone')?.value || '');
-    showActive(num);
-    setStatus('');
-
-  // Ended
-  } else if (evtType.includes('end')   || evtType.includes('complet') ||
-             evtType.includes('bye')   || evtType.includes('terminal') ||
-             evtStr.includes('callended') || evtStr.includes('call_completed') ||
-             evtStr.includes('disconnect')) {
-    showDialer();
-    setStatus('Call ended');
+  if (evtType.includes('incoming') || evtType.includes('ringing') || evtStr.includes('incoming') || evtStr.includes('ringing')) {
+    if (callDirection === 'outbound') { clog('Outbound SIP leg incoming \u2192 silent AcceptCall'); silentAcceptOutbound(); }
+    else { const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown'; showIncoming(from); setStatus(''); }
+  } else if (evtType.includes('connect') || evtType.includes('answer') || evtType.includes('accept') || evtType.includes('active') || evtStr.includes('call_answered') || evtStr.includes('connected')) {
+    const num = callDirection === 'inbound' ? (document.getElementById('callerNum')?.textContent || '') : (document.getElementById('phone')?.value || '');
+    showActive(num); setStatus('');
+  } else if (evtType.includes('end') || evtType.includes('complet') || evtType.includes('bye') || evtType.includes('terminal') || evtStr.includes('callended') || evtStr.includes('call_completed') || evtStr.includes('disconnect')) {
+    showDialer(); setStatus('Call ended');
   }
 }
 
-// Silently open mic for outbound SIP leg
 async function silentAcceptOutbound() {
   if (!webPhone) return;
-  try {
-    await webPhone.AcceptCall();
-    clog('silentAccept OK');
-    const num = document.getElementById('phone')?.value || '';
-    showActive(num);
-  } catch (e) {
-    clog('silentAccept error: ' + e.message);
-    const num = document.getElementById('phone')?.value || '';
-    showActive(num);
-  }
+  try { await webPhone.AcceptCall(); clog('silentAccept OK'); }
+  catch (e) { clog('silentAccept error: ' + e.message); }
+  const num = document.getElementById('phone')?.value || '';
+  showActive(num);
 }
 
-// ── Manual call button ────────────────────────────────────────────
 async function makeCall() {
   const number = document.getElementById('phone').value.trim();
   if (!number)    { setStatus('Enter a number'); return; }
   if (!webPhone)  { setStatus('SDK not ready'); return; }
-  if (!micGranted){ setStatus('⚠️ Allow microphone first!'); return; }
+  if (!micGranted){ setStatus('\u26A0\uFE0F Allow microphone first!'); return; }
   document.getElementById('callBtn').disabled = true;
   await triggerOutboundCall(number);
   document.getElementById('callBtn').disabled = false;
 }
 
-// ── Accept inbound ────────────────────────────────────────────────
 async function acceptCall() {
   if (!webPhone) { setStatus('SDK not ready'); return; }
-  if (!micGranted) {
-    await requestMic();
-    if (!micGranted) { setStatus('⚠️ Mic required'); return; }
-  }
+  if (!micGranted) { await requestMic(); if (!micGranted) { setStatus('\u26A0\uFE0F Mic required'); return; } }
   clog('AcceptCall (inbound)');
-  try {
-    await webPhone.AcceptCall();
-    showActive(document.getElementById('callerNum')?.textContent || '');
-    setStatus('');
-  } catch (err) {
-    clog('AcceptCall error: ' + err.message);
-    setStatus('Accept failed: ' + err.message);
-  }
+  try { await webPhone.AcceptCall(); showActive(document.getElementById('callerNum')?.textContent || ''); setStatus(''); }
+  catch (err) { clog('AcceptCall error: ' + err.message); setStatus('Accept failed: ' + err.message); }
 }
 
-// ── Reject inbound ────────────────────────────────────────────────
 async function rejectCall() {
   if (!webPhone) return;
   clog('RejectCall');
   try { await webPhone.HangupCall(); } catch (e) { clog('Reject err: ' + e.message); }
-  showDialer();
-  setStatus('Call rejected');
+  showDialer(); setStatus('Call rejected');
 }
 
-// ── Hang up ───────────────────────────────────────────────────────
 async function hangUp() {
   if (!webPhone) return;
   clog('HangupCall');
   try { await webPhone.HangupCall(); } catch (e) { clog('Hangup err: ' + e.message); }
-  showDialer();
-  setStatus('Call ended');
+  showDialer(); setStatus('Call ended');
 }
 
 window.onload = init;
