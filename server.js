@@ -264,45 +264,83 @@ app.post('/client-log', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// ── Shared helper: fetch all usermapping users (deduped) ────────
+// Exotel pagination: LastEvaluatedValue = AppUserId of last item on page.
+// STOP when: count returned < PAGE_SIZE (last page) OR key repeats (loop guard).
+// Dedupe by AppUserId as final safety net.
+const PAGE_SIZE = 20;
+async function fetchAllMappedUsers(appToken) {
+  const seen    = new Set();   // tracks AppUserId to prevent duplicates
+  const seenKey = new Set();   // tracks pagination keys to prevent infinite loop
+  let allUsers  = [];
+  let lastKey   = null;
+  let page      = 0;
+
+  do {
+    const url  = lastKey
+      ? `${BASE}/usermapping?last_evaluated_value=${encodeURIComponent(lastKey)}`
+      : `${BASE}/usermapping`;
+    const r    = await fetch(url, { headers: { 'Authorization': appToken } });
+    const data = JSON.parse(await r.text());
+    if (!r.ok) throw new Error(`Usermapping failed [${r.status}]: ${JSON.stringify(data)}`);
+
+    const users  = (data.Data && data.Data.Users) ? data.Data.Users : [];
+    const newKey = (data.Data && data.Data.LastEvaluatedValue) ? data.Data.LastEvaluatedValue : null;
+
+    let addedThisPage = 0;
+    for (const u of users) {
+      if (!seen.has(u.AppUserId)) {
+        seen.add(u.AppUserId);
+        allUsers.push(u);
+        addedThisPage++;
+      }
+    }
+
+    console.log(`[Pagination] page=${page} got=${users.length} newUnique=${addedThisPage} nextKey=${newKey}`);
+
+    // STOP conditions:
+    // 1. No next key returned
+    // 2. Fewer items than page size means this was the last page
+    // 3. We've seen this key before (infinite loop guard)
+    if (!newKey || users.length < PAGE_SIZE || seenKey.has(newKey)) {
+      break;
+    }
+
+    seenKey.add(newKey);
+    lastKey = newKey;
+    page++;
+  } while (page < 20); // absolute safety cap
+
+  console.log(`[Pagination] Done. Total unique users: ${allUsers.length}`);
+  return allUsers;
+}
+
 // ── /token — per-user SIP credentials, looked up by email ────────
 // popup.js calls GET /token?user_id=<email-of-logged-in-BX24-user>
-// We fetch ALL usermapping users and find the one whose Email matches.
+// Matches by Email field (case-insensitive) in Exotel usermapping.
 app.get('/token', async (req, res) => {
   try {
     const { user_id } = req.query;
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
 
+    // STRICT: only accept email-format user_id — never a bare numeric ID or 'default'
+    // This prevents Arjun from accidentally getting Khushil's SIP credentials.
+    if (!user_id.includes('@')) {
+      return res.status(400).json({
+        error: 'user_id must be an email address. BX24 user detection may have failed — open the dialer from inside a CRM contact card, not the Marketplace page.'
+      });
+    }
+
     const appToken = await getAppToken();
+    const allUsers = await fetchAllMappedUsers(appToken);
 
-    // Fetch all users from usermapping (paginate if needed)
-    let allUsers = [];
-    let lastKey  = null;
-    let page     = 0;
-
-    do {
-      const url = lastKey
-        ? `${BASE}/usermapping?last_evaluated_value=${encodeURIComponent(lastKey)}`
-        : `${BASE}/usermapping`;
-      const r    = await fetch(url, { headers: { 'Authorization': appToken } });
-      const data = JSON.parse(await r.text());
-      if (!r.ok) throw new Error(`Usermapping failed [${r.status}]: ${JSON.stringify(data)}`);
-
-      const users = (data.Data && data.Data.Users) ? data.Data.Users : [];
-      allUsers = allUsers.concat(users);
-      lastKey  = (data.Data && data.Data.LastEvaluatedValue && users.length > 0) ? data.Data.LastEvaluatedValue : null;
-      page++;
-    } while (lastKey && page < 20); // safety cap
-
-    // Match by email (case-insensitive) OR by AppUserId (backward compat for "123" etc.)
+    // Match ONLY by email — strict, no AppUserId fallback
     const needle = user_id.toLowerCase();
-    const user = allUsers.find(u =>
-      (u.Email      && u.Email.toLowerCase()      === needle) ||
-      (u.AppUserId  && u.AppUserId.toLowerCase()  === needle)
-    );
+    const user   = allUsers.find(u => u.Email && u.Email.toLowerCase() === needle);
 
     if (!user) throw new Error(`No Exotel user found matching "${user_id}". Add them via /create-user or Postman.`);
 
-    console.log('[Token] Issued for', user_id, '→ SipId:', user.SipId);
+    console.log('[Token] Issued for', user_id, '→', user.Email, '→ SipId:', user.SipId);
 
     res.json({
       success:        true,
@@ -368,22 +406,8 @@ app.get('/setup', async (req, res) => {
 // ── List all mapped users ─────────────────────────────────────────
 app.get('/list-users', async (req, res) => {
   try {
-    const at = await getAppToken();
-    // Paginate through all users
-    let allUsers = [];
-    let lastKey  = null;
-    let page     = 0;
-    do {
-      const url = lastKey
-        ? `${BASE}/usermapping?last_evaluated_value=${encodeURIComponent(lastKey)}`
-        : `${BASE}/usermapping`;
-      const r    = await fetch(url, { headers: { 'Authorization': at } });
-      const data = JSON.parse(await r.text());
-      const users = (data.Data && data.Data.Users) ? data.Data.Users : [];
-      allUsers = allUsers.concat(users);
-      lastKey  = (data.Data && data.Data.LastEvaluatedValue && users.length > 0) ? data.Data.LastEvaluatedValue : null;
-      page++;
-    } while (lastKey && page < 20);
+    const at       = await getAppToken();
+    const allUsers = await fetchAllMappedUsers(at);
     res.json({ total: allUsers.length, users: allUsers });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -424,6 +448,82 @@ app.post('/outbound-call', (req, res) => {
   const { number, callId, userId } = req.body;
   pendingOutboundCalls[userId || 'legacy'] = { number, callId, ts: Date.now() };
   res.json({ status: 'ok' });
+});
+
+// ── /cleanup-duplicates — remove duplicate usermapping entries ────
+// Exotel's pagination bug caused the same users to be added 20x.
+// This endpoint finds all duplicates by AppUserId and deletes extras,
+// keeping only the first (oldest) entry per AppUserId.
+// Hit once: GET https://exotel-websdk.onrender.com/cleanup-duplicates
+app.get('/cleanup-duplicates', async (req, res) => {
+  console.log('[Cleanup] Starting duplicate removal...');
+  try {
+    const at = await getAppToken();
+
+    // Fetch ALL raw pages without deduplication to see true state
+    const seen    = new Map(); // AppUserId -> first occurrence
+    const dupes   = [];        // AppUserIds to delete (extras)
+    let lastKey   = null;
+    let page      = 0;
+    const seenKey = new Set();
+
+    do {
+      const url  = lastKey
+        ? `${BASE}/usermapping?last_evaluated_value=${encodeURIComponent(lastKey)}`
+        : `${BASE}/usermapping`;
+      const r    = await fetch(url, { headers: { 'Authorization': at } });
+      const data = JSON.parse(await r.text());
+      const users  = (data.Data && data.Data.Users) ? data.Data.Users : [];
+      const newKey = (data.Data && data.Data.LastEvaluatedValue) ? data.Data.LastEvaluatedValue : null;
+
+      for (const u of users) {
+        if (!seen.has(u.AppUserId)) {
+          seen.set(u.AppUserId, u);
+        } else {
+          // Duplicate — mark for deletion
+          if (!dupes.includes(u.AppUserId)) dupes.push(u.AppUserId);
+        }
+      }
+
+      if (!newKey || users.length < PAGE_SIZE || seenKey.has(newKey)) break;
+      seenKey.add(newKey);
+      lastKey = newKey;
+      page++;
+    } while (page < 30);
+
+    console.log(`[Cleanup] Unique users: ${seen.size}, Duplicate AppUserIds: ${dupes.length}`);
+
+    if (dupes.length === 0) {
+      return res.json({ status: 'ok', message: 'No duplicates found.', unique: seen.size });
+    }
+
+    // Delete all duplicate AppUserIds
+    const results = [];
+    for (const appUserId of dupes) {
+      try {
+        const r = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(appUserId)}`, {
+          method: 'DELETE', headers: { 'Authorization': at }
+        });
+        const d = JSON.parse(await r.text());
+        console.log(`[Cleanup] Deleted duplicate ${appUserId}:`, r.status);
+        results.push({ appUserId, status: r.ok ? 'deleted' : 'error', data: d });
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 200));
+      } catch (e) {
+        results.push({ appUserId, status: 'error', message: e.message });
+      }
+    }
+
+    res.json({
+      status:  'ok',
+      unique:  seen.size,
+      deleted: results.filter(r => r.status === 'deleted').length,
+      results
+    });
+  } catch (e) {
+    console.error('[Cleanup] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── /sync-users — auto-register Exotel co-workers into usermapping ─
@@ -473,21 +573,8 @@ app.get('/sync-users', async (req, res) => {
     const ccmUsers = await fetchAllCcmUsers();
     console.log(`[Sync] CCM users found: ${ccmUsers.length}`);
 
-    // Step 2: Get all already-mapped users from usermapping
-    let mappedUsers = [];
-    let lastKey = null;
-    let page = 0;
-    do {
-      const url = lastKey
-        ? `${BASE}/usermapping?last_evaluated_value=${encodeURIComponent(lastKey)}`
-        : `${BASE}/usermapping`;
-      const r    = await fetch(url, { headers: { 'Authorization': appToken } });
-      const data = JSON.parse(await r.text());
-      const users = (data.Data && data.Data.Users) ? data.Data.Users : [];
-      mappedUsers = mappedUsers.concat(users);
-      lastKey = (data.Data && data.Data.LastEvaluatedValue && users.length > 0) ? data.Data.LastEvaluatedValue : null;
-      page++;
-    } while (lastKey && page < 20);
+    // Step 2: Get all already-mapped users from usermapping (deduped)
+    const mappedUsers = await fetchAllMappedUsers(appToken);
 
     const mappedEmails = new Set(mappedUsers.map(u => (u.Email || '').toLowerCase()));
     console.log(`[Sync] Already mapped: ${mappedUsers.length} — emails: ${[...mappedEmails].join(', ')}`);
