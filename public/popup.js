@@ -146,27 +146,34 @@ async function init() {
   setStatus('Identifying user...');
 
   // Step 1: Get logged-in BX24 user's email
+  // This MUST succeed — if BX24 is not available, we cannot identify the agent
+  // and must not fall through to another user's credentials.
   try {
     const bxUser = await getBx24CurrentUser();
     currentUserEmail  = bxUser.email;
     currentBx24UserId = bxUser.id;
     clog('BX24 user: ' + bxUser.name + ' <' + currentUserEmail + '> id=' + currentBx24UserId);
+    if (!currentUserEmail) throw new Error('BX24 returned no email for this user');
     setStatus('Hello ' + bxUser.name.split(' ')[0] + '! Requesting microphone...');
   } catch (e) {
-    // Fallback: if not running inside BX24 (e.g. testing directly in browser)
-    clog('BX24 user detection failed: ' + e.message + ' — using env fallback');
-    setStatus('Requesting microphone...');
+    // BX24 not available — this happens when popup is opened from Marketplace page
+    // instead of from inside a CRM contact card/sidebar.
+    clog('BX24 user detection failed: ' + e.message);
+    setReg('failed');
+    setStatus('⚠️ Please open the dialer from a CRM contact, not the Marketplace page.');
+    console.error('[Dialer] BX24 user detection failed:', e.message);
+    return; // STOP — do not register with wrong user's SIP
   }
 
   // Step 2: Mic
   await requestMic();
   if (!micGranted) return;
 
-  // Step 3: Fetch SIP credentials for this user
+  // Step 3: Fetch SIP credentials for this specific user by email
   setStatus('Fetching credentials...');
   try {
-    // Use email as user_id so server can match by Email field in Exotel usermapping
-    const lookupId = currentUserEmail || window._EXOTEL_APP_USER_ID || '123';
+    // Always use email — never fall back to a hardcoded ID
+    const lookupId = currentUserEmail;
     const res  = await fetch('/token?user_id=' + encodeURIComponent(lookupId));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
