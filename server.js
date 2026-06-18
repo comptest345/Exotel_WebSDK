@@ -36,13 +36,26 @@ let pollCount = 0;
 let _appTokenCache = null;
 let _appTokenExp   = 0;
 
+// ── Safe JSON parse helper ──────────────────────────────────────────────
+// Strips BOM / leading whitespace and throws a clear error on parse failure.
+function safeParseJSON(text, label) {
+  const cleaned = (text || '').replace(/^\uFEFF/, '').trim();
+  if (!cleaned) throw new Error(`[${label}] Empty response body`);
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    const snippet = cleaned.slice(0, 120);
+    throw new Error(`[${label}] JSON parse failed: ${e.message} — body starts with: ${snippet}`);
+  }
+}
+
 async function getCustomerToken() {
   const res  = await fetch(`${BASE}/token`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ Id: CUSTOMER_ID, Secret: CUSTOMER_SECRET, Entity: 'customer' })
   });
-  const data = JSON.parse(await res.text());
+  const data = safeParseJSON(await res.text(), 'getCustomerToken');
   if (!res.ok) throw new Error(`Customer token failed: ${JSON.stringify(data)}`);
   return data.Data;
 }
@@ -55,7 +68,7 @@ async function getAppToken() {
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ Id: APP_ID, Secret: APP_SECRET, Entity: 'app' })
   });
-  const data = JSON.parse(await res.text());
+  const data = safeParseJSON(await res.text(), 'getAppToken');
   if (!res.ok) throw new Error(`App token failed: ${JSON.stringify(data)}`);
   _appTokenCache = data.Data;
   try {
@@ -257,37 +270,49 @@ app.get('/debug-token', async (req, res) => {
     const uid = req.query.user_id || APP_USER_ID;
     const at  = await getAppToken();
     const r   = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(uid)}`, { headers: { 'Authorization': at } });
-    res.json({ status: r.status, raw: JSON.parse(await r.text()) });
+    res.json({ status: r.status, raw: safeParseJSON(await r.text(), 'debug-token') });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/setup', async (req, res) => {
   try {
     const ct = await getCustomerToken();
     const r  = await fetch(`${BASE}/app?entity=customer`, { headers: { 'Authorization': ct } });
-    const d  = JSON.parse(await r.text());
+    const d  = safeParseJSON(await r.text(), 'setup');
     res.json({ APP_ID_in_env: APP_ID || 'NOT SET', apps: (d.Data||[]).map(a => ({ AppID: a.AppID, AppName: a.AppName, IsActive: a.IsActive, matched: a.AppID === APP_ID ? '\u2705' : '\u274c' })) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+// ── Helper: fetch ALL usermapping pages ──────────────────────────────────────
+async function fetchAllMappedUsers(at) {
+  let allUsers = [];
+  let seen     = new Set();
+  let nextKey  = null;
+  let page     = 0;
+  do {
+    const url = nextKey ? `${BASE}/usermapping?next_key=${nextKey}` : `${BASE}/usermapping`;
+    const r   = await fetch(url, { headers: { 'Authorization': at } });
+    const d   = safeParseJSON(await r.text(), 'fetchAllMappedUsers');
+    const users = (d.Data && d.Data.Users) || (Array.isArray(d.Data) ? d.Data : []);
+    const newU = users.filter(u => !seen.has(u.AppUserId));
+    newU.forEach(u => { seen.add(u.AppUserId); allUsers.push(u); });
+    console.log(`[Pagination] page=${page} got=${users.length} newUnique=${newU.length} nextKey=${(d.Data && d.Data.NextKey) || 'null'}`);
+    nextKey = (d.Data && d.Data.NextKey) || null;
+    page++;
+    if (page > 20) break;
+  } while (nextKey);
+  console.log(`[Pagination] Done. Total unique users: ${allUsers.length}`);
+  return allUsers;
+}
+
+// ── /list-users ──────────────────────────────────────────────────────────────
 app.get('/list-users', async (req, res) => {
   try {
-    const at = await getAppToken();
-    let allUsers = [];
-    let nextKey  = null;
-    let page     = 0;
-    do {
-      const url = nextKey ? `${BASE}/usermapping?next_key=${nextKey}` : `${BASE}/usermapping`;
-      const r   = await fetch(url, { headers: { 'Authorization': at } });
-      const d   = JSON.parse(await r.text());
-      const users = (d.Data && d.Data.Users) || (Array.isArray(d.Data) ? d.Data : []);
-      const newU = users.filter(u => !allUsers.find(x => x.AppUserId === u.AppUserId));
-      allUsers = allUsers.concat(newU);
-      nextKey  = (d.Data && d.Data.NextKey) || null;
-      page++;
-      if (page > 20) break;
-    } while (nextKey);
+    const at       = await getAppToken();
+    const allUsers = await fetchAllMappedUsers(at);
     res.json({ total: allUsers.length, users: allUsers });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
 app.post('/create-user', async (req, res) => {
   try {
     const { appUserId, appUsername, email, agentNumber, virtualNumber } = req.body;
@@ -298,7 +323,7 @@ app.post('/create-user', async (req, res) => {
       method: 'POST', headers: { 'Authorization': at, 'Content-Type': 'application/json' },
       body: JSON.stringify([{ AppUserId: appUserId, AppUsername: appUsername, Email: email, ExotelAccountSid: ACCOUNT_SID, ExotelUserName: appUsername, AgentNumber: agentNumber || '', VirtualNumber: virtualNumber }])
     });
-    const d = JSON.parse(await r.text());
+    const d = safeParseJSON(await r.text(), 'create-user');
     if (!r.ok) throw new Error(JSON.stringify(d));
     res.json({ success: true, data: d });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -345,7 +370,7 @@ app.get('/token', async (req, res) => {
     const r    = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(lookupId)}`, {
       headers: { 'Authorization': appToken }
     });
-    const data = JSON.parse(await r.text());
+    const data = safeParseJSON(await r.text(), 'token');
     if (!r.ok) throw new Error(`Usermapping failed [${r.status}]: ${JSON.stringify(data)}`);
 
     const user = (data.Data && data.Data.Users && data.Data.Users.length > 0)
@@ -372,42 +397,56 @@ app.get('/token', async (req, res) => {
   }
 });
 
-// ── Auto-sync Exotel CCM users to usermapping on startup ────────────────────
+// ── Manual sync trigger endpoint ─────────────────────────────────────────────
+app.post('/sync-users', async (req, res) => {
+  try {
+    const result = await syncExotelUsers();
+    res.json(result);
+  } catch(e) {
+    res.status(500).json({ status: 'error', message: e.message });
+  }
+});
+
+// ── Auto-sync Exotel CCM users to usermapping on startup ─────────────────────
+// Logic:
+//   1. Fetch all CCM co-workers from /user?entity=customer
+//   2. Fetch all currently mapped users from /usermapping (paginated)
+//   3. ADD:    CCM users with a verified SIP device not yet in usermapping
+//   4. REMOVE: Users in usermapping whose email no longer exists in CCM
+//              (skip removal of users with no email — may be manually added)
+//   5. UPDATE: Users in usermapping where the name differs from CCM (log only, no-op for now)
 async function syncExotelUsers() {
   console.log('[Sync] Starting user sync...');
   try {
-    const ct = await getCustomerToken();
-    const ccmRes  = await fetch(`${BASE}/user?entity=customer`, { headers: { 'Authorization': ct } });
-    const ccmData = JSON.parse(await ccmRes.text());
-    const ccmUsers = ccmData.Data || [];
+    // ── Step 1: Fetch CCM co-workers ────────────────────────────────────────
+    const ct       = await getCustomerToken();
+    const ccmRes   = await fetch(`${BASE}/user?entity=customer`, { headers: { 'Authorization': ct } });
+    const ccmRaw   = await ccmRes.text();
+    const ccmData  = safeParseJSON(ccmRaw, 'syncExotelUsers/ccm');
+    const ccmUsers = Array.isArray(ccmData.Data) ? ccmData.Data : [];
     console.log(`[Sync] CCM users found: ${ccmUsers.length}`);
 
-    const at = await getAppToken();
-    let mappedEmails = new Set();
-    let allMapped = [];
-    let nextKey = null;
-    let page = 0;
-    do {
-      const url = nextKey ? `${BASE}/usermapping?next_key=${nextKey}` : `${BASE}/usermapping`;
-      const r   = await fetch(url, { headers: { 'Authorization': at } });
-      const d   = JSON.parse(await r.text());
-      const users = (d.Data && d.Data.Users) || (Array.isArray(d.Data) ? d.Data : []);
-      const unique = users.filter(u => !mappedEmails.has(u.Email));
-      unique.forEach(u => { mappedEmails.add(u.Email); allMapped.push(u); });
-      console.log(`[Pagination] page=${page} got=${users.length} newUnique=${unique.length} nextKey=${(d.Data && d.Data.NextKey) || 'null'}`);
-      nextKey = (d.Data && d.Data.NextKey) || null;
-      page++;
-      if (page > 20) break;
-    } while (nextKey);
-    console.log(`[Pagination] Done. Total unique users: ${mappedEmails.size}`);
+    // Build a set of CCM emails for quick lookup
+    const ccmEmailSet = new Set(ccmUsers.filter(u => u.Email).map(u => u.Email.toLowerCase()));
+
+    // ── Step 2: Fetch all currently mapped users ─────────────────────────────
+    const at         = await getAppToken();
+    const allMapped  = await fetchAllMappedUsers(at);
+
+    const mappedByEmail = {};
+    allMapped.forEach(u => {
+      if (u.Email) mappedByEmail[u.Email.toLowerCase()] = u;
+    });
+    const mappedEmails = new Set(Object.keys(mappedByEmail));
     console.log(`[Sync] Already mapped: ${mappedEmails.size} — emails: ${[...mappedEmails].join(', ')}`);
 
-    const maxId = allMapped.length > 0 ? Math.max(...allMapped.map(u => parseInt(u.AppUserId) || 0)) : 126;
-    let nextId = maxId + 1;
+    const maxId  = allMapped.length > 0 ? Math.max(...allMapped.map(u => parseInt(u.AppUserId) || 0)) : 100;
+    let   nextId = maxId + 1;
 
+    // ── Step 3: ADD new users ────────────────────────────────────────────────
     const toAdd = ccmUsers.filter(u => {
       if (!u.Email) return false;
-      if (mappedEmails.has(u.Email)) return false;
+      if (mappedEmails.has(u.Email.toLowerCase())) return false;
       if (!u.SipDeviceID) {
         console.log(`[Sync] Skipping ${u.Email} — no verified SIP device yet`);
         return false;
@@ -415,29 +454,76 @@ async function syncExotelUsers() {
       return true;
     });
 
-    if (toAdd.length === 0) {
+    let addedUsers = [];
+    if (toAdd.length > 0) {
+      console.log(`[Sync] Adding ${toAdd.length} new users: ${toAdd.map(u => u.Email).join(', ')}`);
+      const payload = toAdd.map(u => ({
+        AppUserId:         String(nextId++),
+        AppUsername:       u.Name || u.Email,
+        Email:             u.Email,
+        ExotelAccountSid:  ACCOUNT_SID,
+        ExotelUserName:    u.Name || u.Email,
+        AgentNumber:       u.AgentNumber || '',
+        VirtualNumber:     VIRTUAL_NUMBER
+      }));
+
+      const addRes  = await fetch(`${BASE}/usermapping`, {
+        method: 'POST', headers: { 'Authorization': at, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const addData = safeParseJSON(await addRes.text(), 'syncExotelUsers/add');
+      console.log('[Sync] Add result:', JSON.stringify(addData));
+      addedUsers = toAdd.map((u, i) => ({ email: u.Email, appUserId: String(maxId + 1 + i), name: u.Name || u.Email }));
+    } else {
       console.log('[Sync] Nothing to add — all verified users already mapped.');
-      return { status: 'ok', message: 'All verified Exotel users are already in usermapping.', mapped: mappedEmails.size, ccm_total: ccmUsers.length };
     }
 
-    console.log(`[Sync] Adding ${toAdd.length} new users: ${toAdd.map(u => u.Email).join(', ')}`);
-    const payload = toAdd.map(u => ({
-      AppUserId:         String(nextId++),
-      AppUsername:       u.Name || u.Email,
-      Email:             u.Email,
-      ExotelAccountSid:  ACCOUNT_SID,
-      ExotelUserName:    u.Name || u.Email,
-      AgentNumber:       u.AgentNumber || '',
-      VirtualNumber:     VIRTUAL_NUMBER
-    }));
-
-    const addRes  = await fetch(`${BASE}/usermapping`, {
-      method: 'POST', headers: { 'Authorization': at, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+    // ── Step 4: REMOVE users no longer in CCM ────────────────────────────────
+    // Only remove mapped users whose email exists in the mapping AND is NOT
+    // present in CCM. Users with no email in the mapping are left alone.
+    const toRemove = allMapped.filter(u => {
+      if (!u.Email) return false;                                  // no email → skip
+      return !ccmEmailSet.has(u.Email.toLowerCase());             // not in CCM anymore
     });
-    const addData = JSON.parse(await addRes.text());
-    console.log('[Sync] Done:', JSON.stringify(addData));
-    return { status: 'ok', added: toAdd.length, users: toAdd.map((u, i) => ({ email: u.Email, appUserId: String(maxId + 1 + i), name: u.Name })), raw: addData };
+
+    let removedUsers = [];
+    for (const u of toRemove) {
+      try {
+        const delRes = await fetch(`${BASE}/usermapping/${encodeURIComponent(u.AppUserId)}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': at }
+        });
+        const delText = await delRes.text();
+        if (delRes.ok) {
+          console.log(`[Sync] Removed user no longer in CCM: ${u.Email} (AppUserId=${u.AppUserId})`);
+          removedUsers.push({ email: u.Email, appUserId: u.AppUserId });
+        } else {
+          console.warn(`[Sync] Failed to remove ${u.Email}: ${delText}`);
+        }
+      } catch(e) {
+        console.warn(`[Sync] Error removing ${u.Email}:`, e.message);
+      }
+    }
+
+    // ── Step 5: LOG name mismatches (no API update needed unless CCM provides a PATCH) ──
+    allMapped.forEach(mapped => {
+      if (!mapped.Email) return;
+      const ccm = ccmUsers.find(u => u.Email && u.Email.toLowerCase() === mapped.Email.toLowerCase());
+      if (ccm && ccm.Name && ccm.Name !== mapped.AppUsername) {
+        console.log(`[Sync] Name mismatch for ${mapped.Email}: mapped="${mapped.AppUsername}" ccm="${ccm.Name}" (update if API supports PATCH)`);
+      }
+    });
+
+    return {
+      status:       'ok',
+      added:        addedUsers.length,
+      removed:      removedUsers.length,
+      mapped_total: mappedEmails.size,
+      ccm_total:    ccmUsers.length,
+      users_added:  addedUsers,
+      users_removed: removedUsers
+    };
+
   } catch(e) {
     console.error('[Sync] Error:', e.message);
     return { status: 'error', message: e.message };
