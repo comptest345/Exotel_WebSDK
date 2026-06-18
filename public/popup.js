@@ -1,26 +1,8 @@
 // ═══════════════════════════════════════════════════════════════
-// popup.js — Exotel WebSDK + Bitrix24 Softphone
-// ROOT CAUSE FIX (all 5 bugs):
-//   1. ExotelCRMWebSDK constructor takes (accessToken, appUserId)
-//      where accessToken = APP token (not customer token)
-//      and appUserId = AppUserId string from /usermapping
-//   2. The SDK's Initialize() internally calls DoRegister()
-//      when autoConnect=true — no manual DoRegister needed.
-//   3. BX24 identity: try BX24.init() → postMessage → URL fallback
-//   4. /token endpoint must return { access_token, app_user_id }
-//      BOTH fields are required for ExotelCRMWebSDK constructor.
-//   5. regEvent fires 'registered'/'terminated' — match exactly.
-//
-// MIC BUG FIX:
-//   micStream must NOT be stopped before Initialize() resolves.
-//   The SDK grabs the MediaStream internally during setup.
-//   We keep it alive, and only release it AFTER Initialize() settles.
-//
-// WEBPHONE NULL FIX:
-//   Some ExotelCRMWebSDK versions return void/undefined from Initialize().
-//   We must not treat null webPhone as failure — the regEvent is the
-//   authoritative signal. If regEvent fires 'registered', we're good.
-//   Only bail if BOTH webPhone===null AND regEvent never fires.
+// popup.js — Dynamic multi-agent version
+// Resolves the logged-in BX24 user's email → fetches their
+// SIP credentials from /token → initializes ExotelCRMWebSDK
+// NO hardcoded user IDs anywhere.
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone      = null;
@@ -62,16 +44,15 @@ function setReg(state) {
   if (txt) txt.textContent = s.label;
 }
 
-// ── BX24 identity: Method 1 — BX24.init() API ────────────────────────────────
+// ── BX24 identity resolution ──────────────────────────────────
 function getBx24CurrentUser() {
   return new Promise((resolve, reject) => {
     let attempts = 0;
-    const MAX    = 10;
     function tryInit() {
       attempts++;
       if (typeof window.BX24 === 'undefined') {
-        if (attempts < MAX) return setTimeout(tryInit, 600);
-        return reject(new Error('BX24 JS bridge not loaded after ' + (MAX * 600) + 'ms'));
+        if (attempts < 10) return setTimeout(tryInit, 600);
+        return reject(new Error('BX24 JS bridge not loaded'));
       }
       try {
         BX24.init(function () {
@@ -86,7 +67,7 @@ function getBx24CurrentUser() {
           });
         });
       } catch (e) {
-        if (attempts < MAX) return setTimeout(tryInit, 600);
+        if (attempts < 10) return setTimeout(tryInit, 600);
         reject(e);
       }
     }
@@ -94,30 +75,10 @@ function getBx24CurrentUser() {
   });
 }
 
-// ── BX24 identity: Method 2 — postMessage ─────────────────────────────────────
-function getBx24UserViaPostMessage() {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('postMessage timeout')), 5000);
-    function handler(e) {
-      try {
-        const d = (typeof e.data === 'string') ? JSON.parse(e.data) : e.data;
-        if (d && d.BX24_AUTH && d.BX24_AUTH.user_id) {
-          clearTimeout(timeout);
-          window.removeEventListener('message', handler);
-          resolve({ id: String(d.BX24_AUTH.user_id), email: null, name: '' });
-        }
-      } catch (_) {}
-    }
-    window.addEventListener('message', handler);
-    try { window.parent.postMessage({ cmd: 'getAuth' }, '*'); } catch (_) {}
-  });
-}
-
-// ── BX24 identity: Method 3 — URL params ──────────────────────────────────────
 function getBx24UserIdFromUrl() {
   try {
     const params = new URLSearchParams(window.location.search);
-    const po     = params.get('PLACEMENT_OPTIONS');
+    const po = params.get('PLACEMENT_OPTIONS');
     if (po) {
       const opts = JSON.parse(decodeURIComponent(po));
       if (opts.USER_ID) return String(opts.USER_ID);
@@ -126,25 +87,27 @@ function getBx24UserIdFromUrl() {
   } catch (_) { return null; }
 }
 
-// ── Resolve BX24 identity (tries all methods) ─────────────────────────────────
 async function resolveBx24Identity() {
+  // Method 1: BX24.init API (most reliable)
   try {
     const u = await getBx24CurrentUser();
-    if (u.email || u.id) { clog('Identity via BX24.init: ' + u.name + ' <' + u.email + '> id=' + u.id); return u; }
-  } catch (e) { clog('BX24 user detection failed: ' + e.message); }
+    if (u.email || u.id) {
+      clog('Identity via BX24.init: ' + u.name + ' <' + u.email + '> id=' + u.id);
+      return u;
+    }
+  } catch (e) { clog('BX24.init failed: ' + e.message); }
 
-  try {
-    const u = await getBx24UserViaPostMessage();
-    if (u.id) { clog('Identity via postMessage: id=' + u.id); return u; }
-  } catch (e) { clog('postMessage failed: ' + e.message); }
-
+  // Method 2: URL params
   const urlId = getBx24UserIdFromUrl();
-  if (urlId) { clog('Identity via URL: id=' + urlId); return { id: urlId, email: null, name: '' }; }
+  if (urlId) {
+    clog('Identity via URL: id=' + urlId);
+    return { id: urlId, email: null, name: '' };
+  }
 
   throw new Error('Cannot identify BX24 user — all methods failed.');
 }
 
-// ── Microphone ────────────────────────────────────────────────────────────────
+// ── Microphone ────────────────────────────────────────────────
 async function requestMic() {
   try {
     micStream  = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -159,16 +122,15 @@ async function requestMic() {
   }
 }
 
-// Release mic stream (called AFTER Initialize() settles)
 function releaseMic() {
   if (micStream) {
     micStream.getTracks().forEach(t => t.stop());
     micStream = null;
-    clog('Mic stream released (SDK has taken over)');
+    clog('Mic stream released');
   }
 }
 
-// ── UI helpers ────────────────────────────────────────────────────────────────
+// ── UI helpers ────────────────────────────────────────────────
 function showIncoming(from) {
   callDirection = 'inbound';
   const el = document.getElementById('callerNum');
@@ -210,7 +172,7 @@ function startTimer() {
 }
 function stopTimer() { if (timerInterval) { clearInterval(timerInterval); timerInterval = null; } }
 
-// ── Main init ─────────────────────────────────────────────────────────────────
+// ── Main init ─────────────────────────────────────────────────
 async function init() {
   sdkReady      = false;
   webPhone      = null;
@@ -223,20 +185,20 @@ async function init() {
     identity = await resolveBx24Identity();
   } catch (e) {
     setReg('failed');
-    setStatus('⚠️ Open this from a CRM contact sidebar. (' + e.message + ')');
-    clog('Identity failed: ' + e.message);
+    setStatus('⚠️ Open from a CRM sidebar. (' + e.message + ')');
     scheduleRetry();
     return;
   }
   currentBx24UserId = identity.id    || null;
   currentUserEmail  = identity.email || null;
-  setStatus((identity.name ? 'Hello ' + identity.name.split(' ')[0] + '! ' : '') + 'Requesting mic...');
 
-  // Step 2: Microphone — request early, but DO NOT release until after Initialize()
+  setStatus('Requesting mic...');
   await requestMic();
   if (!micGranted) { scheduleRetry(); return; }
 
-  // Step 3: Fetch credentials from /token
+  // Step 2: Fetch credentials from /token
+  // Pass email if we have it (most reliable lookup key)
+  // Fall back to bx24_user_id so server can cache-resolve
   setStatus('Fetching credentials...');
   let tokenData;
   try {
@@ -244,14 +206,12 @@ async function init() {
       ? '/token?user_id=' + encodeURIComponent(currentUserEmail)
       : '/token?bx24_user_id=' + encodeURIComponent(currentBx24UserId);
     clog('Fetching: ' + url);
-    const res = await fetch(url);
+    const res  = await fetch(url);
     const body = await res.text();
     if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + body.slice(0, 200));
     tokenData = JSON.parse(body);
     if (tokenData.error) throw new Error(tokenData.error);
-    if (!currentUserEmail && tokenData.email)  currentUserEmail = tokenData.email;
-    if (!currentUserEmail && tokenData.sip_id) currentUserEmail = tokenData.sip_id;
-    clog('Token OK → app_user_id=' + tokenData.app_user_id + ' sip_id=' + tokenData.sip_id + ' sip_username=' + tokenData.sip_username);
+    clog('Token OK → AppUserId=' + tokenData.app_user_id + ' SipId=' + tokenData.sip_id);
   } catch (e) {
     setReg('failed');
     setStatus('Credentials error: ' + e.message);
@@ -260,73 +220,52 @@ async function init() {
     return;
   }
 
-  // CRITICAL: ExotelCRMWebSDK needs EXACTLY these two fields
   const accessToken = tokenData.access_token || tokenData.app_token;
   const appUserId   = String(tokenData.app_user_id || tokenData.user_id || '');
 
-  if (!accessToken) {
+  if (!accessToken || !appUserId) {
     setReg('failed');
-    setStatus('No access_token in /token response');
-    clog('Missing access_token in: ' + JSON.stringify(tokenData));
-    scheduleRetry();
-    return;
-  }
-  if (!appUserId) {
-    setReg('failed');
-    setStatus('No app_user_id in /token response');
-    clog('Missing app_user_id in: ' + JSON.stringify(tokenData));
+    setStatus('Missing token fields — check /list-users');
+    clog('Bad token response: ' + JSON.stringify(tokenData));
     scheduleRetry();
     return;
   }
 
-  // Step 4: Init ExotelCRMWebSDK
-  // Constructor: new ExotelCRMWebSDK(accessToken, userId, autoConnectVOIP)
-  // - accessToken = APP token (JWT from /v2/integrations/token entity=app)
-  // - userId = AppUserId from usermapping (numeric string)
-  // - autoConnectVOIP = true → SDK auto-calls DoRegister after Initialize
+  // Step 3: Init ExotelCRMWebSDK
   setStatus('Connecting softphone...');
   try {
     if (typeof ExotelCRMWebSDK === 'undefined') {
-      throw new Error('ExotelCRMWebSDK not loaded — /target/crmBundle.js missing');
+      throw new Error('ExotelCRMWebSDK not loaded — crmBundle.js missing');
     }
 
-    clog('new ExotelCRMWebSDK(token[0..20]=' + accessToken.slice(0,20) + '... userId=' + appUserId + ' autoConnect=true)');
+    clog('new ExotelCRMWebSDK(token[0..20]=' + accessToken.slice(0,20) + '... userId=' + appUserId + ')');
     const crmWebSDK = new ExotelCRMWebSDK(accessToken, appUserId, true);
 
-    // regEvent is the AUTHORITATIVE signal — not the webPhone return value.
-    // Some SDK versions return void/undefined from Initialize() even on success.
-    // Strategy:
-    //   - If regEvent fires 'registered' → success (regardless of webPhone value)
-    //   - If regEvent fires 'terminated'/'unregistered' → retry
-    //   - If regEvent never fires in 30s → show error and retry
-    //   - 'sent request' is a normal transient state — do NOT retry on it
     let regFired = false;
-    const regTimeoutHandle = setTimeout(() => {
+    const regTimeout = setTimeout(() => {
       if (!sdkReady && !regFired) {
-        clog('regEvent not fired in 30s — SDK stalled or wrong credentials');
+        clog('regEvent not fired in 30s — wrong credentials or network issue');
         setReg('failed');
-        setStatus('SIP register timeout — check credentials & network');
+        setStatus('SIP register timeout — retrying');
         scheduleRetry();
       }
     }, 30000);
 
     function registrationEventHandler(state, phone) {
       regFired = true;
-      clearTimeout(regTimeoutHandle);
+      clearTimeout(regTimeout);
       clog('regEvent state=' + state + ' phone=' + phone);
 
       if (state === 'registered') {
-        sdkReady = true;
+        sdkReady    = true;
         initRetries = 0;
-        // If Initialize() returned null/void, assign a minimal proxy so
-        // MakeCall / AcceptCall / HangupCall work via crmWebSDK directly
         if (!webPhone) {
+          // SDK returned void — create proxy
           webPhone = {
-            MakeCall:   (n, a, b)  => crmWebSDK.MakeCall   ? crmWebSDK.MakeCall(n, a, b)   : Promise.resolve(),
-            AcceptCall: ()         => crmWebSDK.AcceptCall  ? crmWebSDK.AcceptCall()         : Promise.resolve(),
-            HangupCall: ()         => crmWebSDK.HangupCall  ? crmWebSDK.HangupCall()         : Promise.resolve()
+            MakeCall:   (n, a, b) => crmWebSDK.MakeCall   ? crmWebSDK.MakeCall(n, a, b)   : Promise.resolve(),
+            AcceptCall: ()        => crmWebSDK.AcceptCall  ? crmWebSDK.AcceptCall()         : Promise.resolve(),
+            HangupCall: ()        => crmWebSDK.HangupCall  ? crmWebSDK.HangupCall()         : Promise.resolve()
           };
-          clog('webPhone was null — using crmWebSDK proxy');
         }
         setReg('registered');
         setStatus('✅ Ready — ' + (phone || appUserId));
@@ -335,29 +274,19 @@ async function init() {
         sdkReady = false;
         setReg('failed');
         setStatus('SIP ' + state + ' — retrying...');
-        clog('SIP ' + state + ' for ' + phone);
         scheduleRetry();
-      } else {
-        // 'sent request' and other transient states — wait, do not retry
-        clog('SIP transient state: ' + state + ' — waiting for final state');
       }
+      // 'sent request' / transient states: wait, don't retry
     }
 
-    // Keep micStream alive here — SDK may capture it during Initialize()
-    webPhone = await crmWebSDK.Initialize(
-      handleCallEvent,
-      registrationEventHandler
-    );
-
-    // ONLY release mic AFTER Initialize() has fully resolved
+    webPhone = await crmWebSDK.Initialize(handleCallEvent, registrationEventHandler);
     releaseMic();
 
     clog('Initialize() resolved. webPhone=' + (webPhone ? typeof webPhone : 'null/void'));
 
-    // If webPhone is null AND regEvent has not yet fired, we wait for the
-    // 30s timeout above. If regEvent fires 'registered', the proxy above handles it.
-    // If webPhone is valid and regEvent hasn't fired yet, also wait.
-    // Either way — do NOT call scheduleRetry() here based on webPhone alone.
+    if (webPhone && !sdkReady && !regFired) {
+      // SDK returned phone object before regEvent — wait for regEvent (already set timeout)
+    }
 
   } catch (err) {
     releaseMic();
@@ -368,7 +297,7 @@ async function init() {
   }
 }
 
-// ── Retry: exponential backoff ────────────────────────────────────────────────
+// ── Retry ─────────────────────────────────────────────────────
 let retryTimer = null;
 function scheduleRetry() {
   if (retryTimer) return;
@@ -376,7 +305,6 @@ function scheduleRetry() {
   if (initRetries > MAX_RETRIES) {
     setReg('failed');
     setStatus('❌ Connection failed. Reload the page.');
-    clog('Max retries reached');
     return;
   }
   const delay = Math.min(5000 * Math.pow(2, initRetries - 1), 30000);
@@ -385,7 +313,7 @@ function scheduleRetry() {
   retryTimer = setTimeout(() => { retryTimer = null; init(); }, delay);
 }
 
-// ── Click-to-call polling ─────────────────────────────────────────────────────
+// ── Pending call poll ─────────────────────────────────────────
 let pollTimer = null;
 let pollCount = 0;
 function startPoll() {
@@ -413,23 +341,23 @@ async function doPoll() {
 }
 
 async function triggerOutboundCall(number) {
-  if (!webPhone)   { clog('MakeCall: webPhone null'); setStatus('SDK not ready'); return; }
-  if (!sdkReady)   { clog('MakeCall: SDK not registered'); setStatus('SDK not registered yet'); return; }
+  if (!webPhone)  { clog('MakeCall: webPhone null'); setStatus('SDK not ready'); return; }
+  if (!sdkReady)  { clog('MakeCall: not registered'); setStatus('Not registered yet'); return; }
   callDirection = 'outbound';
   clog('MakeCall → ' + number);
   try { await webPhone.MakeCall(number, null, null); }
   catch (e) { clog('MakeCall error: ' + e.message); setStatus('Call failed: ' + e.message); }
 }
 
-// ── Call event handler ────────────────────────────────────────────────────────
+// ── Call event handler ────────────────────────────────────────
 function handleCallEvent(event) {
   clog('callEvent: ' + JSON.stringify(event));
   const raw  = JSON.stringify(event || {}).toLowerCase();
   const type = ((event && (event.event || event.EventType || event.type || event.state)) || '').toLowerCase();
 
-  const isIncoming   = type.includes('incoming') || type.includes('ringing') || raw.includes('incoming') || raw.includes('ringing');
-  const isConnected  = type.includes('connect') || type.includes('answer') || type.includes('accept') || type.includes('active') || raw.includes('accepted') || raw.includes('connected');
-  const isEnded      = type.includes('end') || type.includes('terminat') || type.includes('bye') || type.includes('complet') || type.includes('disconnect') || raw.includes('callended') || raw.includes('call_completed');
+  const isIncoming  = type.includes('incoming') || type.includes('ringing') || raw.includes('incoming') || raw.includes('ringing');
+  const isConnected = type.includes('connect')  || type.includes('answer')  || type.includes('accept')  || type.includes('active') || raw.includes('accepted') || raw.includes('connected');
+  const isEnded     = type.includes('end')      || type.includes('terminat')|| type.includes('bye')     || type.includes('complet') || raw.includes('callended') || raw.includes('call_completed');
 
   if (isIncoming) {
     if (callDirection === 'outbound') {
@@ -451,12 +379,12 @@ function handleCallEvent(event) {
   }
 }
 
-// ── Button handlers ───────────────────────────────────────────────────────────
+// ── Button handlers ───────────────────────────────────────────
 async function makeCall() {
   const number = document.getElementById('phone').value.trim();
-  if (!number)     { setStatus('Enter a number'); return; }
-  if (!webPhone)   { setStatus('SDK not ready');  return; }
-  if (!micGranted) { setStatus('⚠️ Allow microphone first!'); return; }
+  if (!number)    { setStatus('Enter a number'); return; }
+  if (!webPhone)  { setStatus('SDK not ready');  return; }
+  if (!micGranted){ setStatus('⚠️ Allow microphone first!'); return; }
   document.getElementById('callBtn').disabled = true;
   await triggerOutboundCall(number);
   document.getElementById('callBtn').disabled = false;
@@ -475,14 +403,12 @@ async function acceptCall() {
 
 async function rejectCall() {
   if (!webPhone) return;
-  clog('RejectCall');
   try { await webPhone.HangupCall(); } catch (e) { clog('Reject err: ' + e.message); }
   showDialer(); setStatus('Call rejected');
 }
 
 async function hangUp() {
   if (!webPhone) return;
-  clog('HangupCall');
   try { await webPhone.HangupCall(); } catch (e) { clog('Hangup err: ' + e.message); }
   showDialer(); setStatus('Call ended');
 }
