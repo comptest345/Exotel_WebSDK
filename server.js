@@ -22,7 +22,8 @@ const BX24_WEBHOOK    = process.env.BX24_WEBHOOK_URL || '';
 const BX24_USER_ID    = process.env.BX24_USER_ID || '1';
 const BX24_DOMAIN     = process.env.BX24_DOMAIN   || '';
 
-const isIndia = (DOMAIN === 'mumbai' || DOMAIN === 'india');
+// FIX: broaden isIndia to catch mum1 / mum / in1 / india / mumbai variants
+const isIndia = /mum|in1|india/i.test(DOMAIN);
 const SIP_FB  = isIndia ? 'voip.in1.exotel.com' : 'voip.sgp1.exotel.com';
 
 // ── In-memory state ───────────────────────────────────────────────────
@@ -239,6 +240,7 @@ app.get('/health', (req, res) => res.json({
   bx24_user_id:        BX24_USER_ID,
   domain:              DOMAIN,
   sip_domain:          SIP_FB,
+  is_india:            isIndia,
   virtual_number_set:  !!VIRTUAL_NUMBER
 }));
 
@@ -342,7 +344,6 @@ app.get('/token', async (req, res) => {
     const { user_id, bx24_user_id } = req.query;
     let lookupKey = user_id;
 
-    // If only bx24_user_id provided, resolve to email from cache
     if (!lookupKey && bx24_user_id) {
       lookupKey = bx24UserEmailCache[bx24_user_id] || null;
       if (!lookupKey) {
@@ -355,7 +356,6 @@ app.get('/token', async (req, res) => {
 
     const appToken = await getAppToken();
 
-    // Try exact usermapping lookup by email (user_id param is email here)
     const r    = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(lookupKey)}`, {
       headers: { 'Authorization': appToken }
     });
@@ -364,10 +364,6 @@ app.get('/token', async (req, res) => {
 
     if (!r.ok) throw new Error(`Usermapping HTTP ${r.status}: ${JSON.stringify(data)}`);
 
-    // Support both response shapes:
-    // shape A: { Data: { Users: [...] } }
-    // shape B: { Data: [ ... ] }  (array directly)
-    // shape C: { Data: { SipId: ... } }  (single user object)
     let user = null;
     if (data.Data) {
       if (Array.isArray(data.Data)) {
@@ -380,7 +376,6 @@ app.get('/token', async (req, res) => {
     }
 
     if (!user) {
-      // Fallback: list all users and find by email
       console.log(`[Token] Direct lookup found nothing for ${lookupKey} — scanning all mapped users`);
       const allUsers = await fetchAllMappedUsers(appToken);
       user = allUsers.find(u => u.Email && u.Email.toLowerCase() === lookupKey.toLowerCase()) || null;
@@ -394,18 +389,19 @@ app.get('/token', async (req, res) => {
 
     console.log('[Token] Issued:', { lookupKey, AppUserId: user.AppUserId, SipId: user.SipId });
 
-    // Return BOTH field names the SDK needs
+    // sip_secret is returned RAW — no JSON.stringify, no URL encoding.
+    // Special chars like ! and $ in the password must reach the SDK unmodified
+    // so the MD5 Digest hash matches what Kamailio expects.
     res.json({
       success:        true,
-      // Primary SDK fields
-      access_token:   appToken,        // → ExotelCRMWebSDK first arg
-      app_user_id:    user.AppUserId,  // → ExotelCRMWebSDK second arg (string)
-      // Extra info for debugging
+      access_token:   appToken,
+      app_user_id:    user.AppUserId,
       app_token:      appToken,
       user_id:        user.AppUserId,
       email:          user.Email,
       sip_id:         user.SipId,
-      sip_secret:     user.SipSecret,
+      sip_username:   user.SipId ? user.SipId.replace(/^sip:/, '') : '',
+      sip_secret:     user.SipSecret,        // RAW string — do not encode
       virtual_number: user.VirtualNumber,
       name:           user.AppUsername
     });
@@ -422,6 +418,10 @@ app.post('/sync-users', async (req, res) => {
 });
 
 // ── Startup sync: CCM co-workers ↔ usermapping ───────────────────────
+// FIX: We no longer skip CCM users without SipDeviceID.
+// When a user is added to usermapping via POST, Exotel auto-creates their
+// SIP device — so skipping on missing SipDeviceID was wrong and prevented
+// new co-workers from ever being registered.
 async function syncExotelUsers() {
   console.log('[Sync] Starting user sync...');
   try {
@@ -444,11 +444,13 @@ async function syncExotelUsers() {
     const maxId  = allMapped.length > 0 ? Math.max(...allMapped.map(u => parseInt(u.AppUserId) || 0)) : 100;
     let   nextId = maxId + 1;
 
-    // ADD new users with verified SIP device
+    // ADD: all CCM users with an email that are not yet in usermapping.
+    // Do NOT require SipDeviceID — Exotel creates the SIP device automatically
+    // when the usermapping POST succeeds. Requiring SipDeviceID here caused an
+    // infinite loop: can't register → no SipDevice → never added → can't register.
     const toAdd = ccmUsers.filter(u => {
-      if (!u.Email) return false;
+      if (!u.Email) { console.log(`[Sync] Skipping unnamed CCM user (no email)`); return false; }
       if (mappedEmails.has(u.Email.toLowerCase())) return false;
-      if (!u.SipDeviceID) { console.log(`[Sync] Skipping ${u.Email} — no verified SIP device yet`); return false; }
       return true;
     });
 
@@ -470,7 +472,12 @@ async function syncExotelUsers() {
       });
       const addData = safeParseJSON(await addRes.text(), 'sync/add');
       console.log('[Sync] Done:', JSON.stringify(addData));
-      addedUsers = toAdd.map((u, i) => ({ email: u.Email, appUserId: String(maxId + 1 + i), name: u.Name || u.Email }));
+      const addedData = (addData.Data && Array.isArray(addData.Data)) ? addData.Data : [];
+      addedUsers = addedData.map(u => ({ email: u.Email, appUserId: u.AppUserId, name: u.AppUsername, sipId: u.SipId }));
+      if (addedUsers.length === 0) {
+        // Fallback if response shape differs
+        addedUsers = toAdd.map((u, i) => ({ email: u.Email, appUserId: String(maxId + 1 + i), name: u.Name || u.Email }));
+      }
     } else {
       console.log('[Sync] Nothing to add.');
     }
@@ -504,7 +511,7 @@ app.use(express.static(path.join(__dirname, 'public', 'target')));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Exotel WebSDK server on port ${PORT} | SIP: ${SIP_FB}`);
+  console.log(`✅ Exotel WebSDK server on port ${PORT} | SIP: ${SIP_FB} | isIndia: ${isIndia}`);
   console.log('[Startup] Auto-syncing Exotel users...');
   const result = await syncExotelUsers();
   console.log('[Startup] Sync result:', JSON.stringify(result));

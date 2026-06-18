@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
 // popup.js — Exotel WebSDK + Bitrix24 Softphone
-// ROOT CAUSE FIX:
+// ROOT CAUSE FIX (all 5 bugs):
 //   1. ExotelCRMWebSDK constructor takes (accessToken, appUserId)
 //      where accessToken = APP token (not customer token)
 //      and appUserId = AppUserId string from /usermapping
@@ -10,6 +10,17 @@
 //   4. /token endpoint must return { access_token, app_user_id }
 //      BOTH fields are required for ExotelCRMWebSDK constructor.
 //   5. regEvent fires 'registered'/'terminated' — match exactly.
+//
+// MIC BUG FIX:
+//   micStream must NOT be stopped before Initialize() resolves.
+//   The SDK grabs the MediaStream internally during setup.
+//   We keep it alive, and only release it AFTER Initialize() settles.
+//
+// WEBPHONE NULL FIX:
+//   Some ExotelCRMWebSDK versions return void/undefined from Initialize().
+//   We must not treat null webPhone as failure — the regEvent is the
+//   authoritative signal. If regEvent fires 'registered', we're good.
+//   Only bail if BOTH webPhone===null AND regEvent never fires.
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone      = null;
@@ -120,7 +131,7 @@ async function resolveBx24Identity() {
   try {
     const u = await getBx24CurrentUser();
     if (u.email || u.id) { clog('Identity via BX24.init: ' + u.name + ' <' + u.email + '> id=' + u.id); return u; }
-  } catch (e) { clog('BX24.init failed: ' + e.message); }
+  } catch (e) { clog('BX24 user detection failed: ' + e.message); }
 
   try {
     const u = await getBx24UserViaPostMessage();
@@ -145,6 +156,15 @@ async function requestMic() {
     setStatus('⚠️ Allow microphone and reload.');
     const w = document.getElementById('micWarning');
     if (w) w.style.display = 'block';
+  }
+}
+
+// Release mic stream (called AFTER Initialize() settles)
+function releaseMic() {
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+    clog('Mic stream released (SDK has taken over)');
   }
 }
 
@@ -212,7 +232,7 @@ async function init() {
   currentUserEmail  = identity.email || null;
   setStatus((identity.name ? 'Hello ' + identity.name.split(' ')[0] + '! ' : '') + 'Requesting mic...');
 
-  // Step 2: Microphone
+  // Step 2: Microphone — request early, but DO NOT release until after Initialize()
   await requestMic();
   if (!micGranted) { scheduleRetry(); return; }
 
@@ -229,10 +249,9 @@ async function init() {
     if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + body.slice(0, 200));
     tokenData = JSON.parse(body);
     if (tokenData.error) throw new Error(tokenData.error);
-    // Back-fill email
-    if (!currentUserEmail && tokenData.email)        currentUserEmail = tokenData.email;
-    if (!currentUserEmail && tokenData.sip_id)       currentUserEmail = tokenData.sip_id;
-    clog('Token OK → app_user_id=' + tokenData.app_user_id + ' sip_id=' + tokenData.sip_id);
+    if (!currentUserEmail && tokenData.email)  currentUserEmail = tokenData.email;
+    if (!currentUserEmail && tokenData.sip_id) currentUserEmail = tokenData.sip_id;
+    clog('Token OK → app_user_id=' + tokenData.app_user_id + ' sip_id=' + tokenData.sip_id + ' sip_username=' + tokenData.sip_username);
   } catch (e) {
     setReg('failed');
     setStatus('Credentials error: ' + e.message);
@@ -274,18 +293,22 @@ async function init() {
     clog('new ExotelCRMWebSDK(token[0..20]=' + accessToken.slice(0,20) + '... userId=' + appUserId + ' autoConnect=true)');
     const crmWebSDK = new ExotelCRMWebSDK(accessToken, appUserId, true);
 
-    // regEvent fires with string state: 'registered' | 'terminated' | 'unregistered' | 'sent request'
-    // Per Exotel docs: RegisterationEvent(state, phone)
+    // regEvent is the AUTHORITATIVE signal — not the webPhone return value.
+    // Some SDK versions return void/undefined from Initialize() even on success.
+    // Strategy:
+    //   - If regEvent fires 'registered' → success (regardless of webPhone value)
+    //   - If regEvent fires 'terminated'/'unregistered' → retry
+    //   - If regEvent never fires in 30s → show error and retry
+    //   - 'sent request' is a normal transient state — do NOT retry on it
     let regFired = false;
     const regTimeoutHandle = setTimeout(() => {
-      if (!sdkReady) {
-        clog('regEvent not fired in 20s — SDK may be registered silently or wrong token');
-        // Do NOT assume registered here — show error so user knows
+      if (!sdkReady && !regFired) {
+        clog('regEvent not fired in 30s — SDK stalled or wrong credentials');
         setReg('failed');
         setStatus('SIP register timeout — check credentials & network');
         scheduleRetry();
       }
-    }, 20000);
+    }, 30000);
 
     function registrationEventHandler(state, phone) {
       regFired = true;
@@ -295,6 +318,16 @@ async function init() {
       if (state === 'registered') {
         sdkReady = true;
         initRetries = 0;
+        // If Initialize() returned null/void, assign a minimal proxy so
+        // MakeCall / AcceptCall / HangupCall work via crmWebSDK directly
+        if (!webPhone) {
+          webPhone = {
+            MakeCall:   (n, a, b)  => crmWebSDK.MakeCall   ? crmWebSDK.MakeCall(n, a, b)   : Promise.resolve(),
+            AcceptCall: ()         => crmWebSDK.AcceptCall  ? crmWebSDK.AcceptCall()         : Promise.resolve(),
+            HangupCall: ()         => crmWebSDK.HangupCall  ? crmWebSDK.HangupCall()         : Promise.resolve()
+          };
+          clog('webPhone was null — using crmWebSDK proxy');
+        }
         setReg('registered');
         setStatus('✅ Ready — ' + (phone || appUserId));
         startPoll();
@@ -305,35 +338,29 @@ async function init() {
         clog('SIP ' + state + ' for ' + phone);
         scheduleRetry();
       } else {
-        // 'sent request' or other transient states
-        clog('SIP state: ' + state);
+        // 'sent request' and other transient states — wait, do not retry
+        clog('SIP transient state: ' + state + ' — waiting for final state');
       }
     }
 
+    // Keep micStream alive here — SDK may capture it during Initialize()
     webPhone = await crmWebSDK.Initialize(
       handleCallEvent,
       registrationEventHandler
     );
 
-    // Release mic stream after SDK takes over
-    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    // ONLY release mic AFTER Initialize() has fully resolved
+    releaseMic();
 
-    clog('Initialize() resolved. webPhone=' + (webPhone ? typeof webPhone : 'null'));
+    clog('Initialize() resolved. webPhone=' + (webPhone ? typeof webPhone : 'null/void'));
 
-    // Some SDK versions resolve promise before firing regEvent
-    // If webPhone returned and regEvent hasn't fired yet, wait for it via timeout above
-    // If webPhone is null/void, SDK may have failed internally
-    if (!webPhone) {
-      clearTimeout(regTimeoutHandle);
-      if (!sdkReady) {
-        setReg('failed');
-        setStatus('SDK Initialize() returned null — check app_user_id and token');
-        clog('webPhone is null after Initialize — possible wrong AppUserId or token mismatch');
-        scheduleRetry();
-      }
-    }
+    // If webPhone is null AND regEvent has not yet fired, we wait for the
+    // 30s timeout above. If regEvent fires 'registered', the proxy above handles it.
+    // If webPhone is valid and regEvent hasn't fired yet, also wait.
+    // Either way — do NOT call scheduleRetry() here based on webPhone alone.
 
   } catch (err) {
+    releaseMic();
     setReg('failed');
     setStatus('SDK error: ' + err.message);
     clog('SDK FAILED: ' + err.message);
@@ -395,8 +422,6 @@ async function triggerOutboundCall(number) {
 }
 
 // ── Call event handler ────────────────────────────────────────────────────────
-// Exotel SDK fires events like: { event: 'incoming' | 'accepted' | 'terminated' | ... }
-// Per docs: sofPhoneListenerCallback(event)
 function handleCallEvent(event) {
   clog('callEvent: ' + JSON.stringify(event));
   const raw  = JSON.stringify(event || {}).toLowerCase();
@@ -408,7 +433,6 @@ function handleCallEvent(event) {
 
   if (isIncoming) {
     if (callDirection === 'outbound') {
-      // Outbound SIP leg rings locally — auto-accept silently
       clog('Outbound SIP ring → silent AcceptCall');
       if (webPhone) webPhone.AcceptCall().catch(e => clog('silentAccept err: ' + e.message));
     } else {
