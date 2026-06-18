@@ -1,8 +1,8 @@
 // ═══════════════════════════════════════════════════════════════
 // popup.js — Multi-agent version
-// FIX: Uses BX24 auth token passed via iframe URL (?bx24_user_id=)
-//      as fallback when BX24.init() is unavailable (Marketplace page).
-//      Also supports legacy email lookup via /token?user_id=email
+// FIX: Robust BX24 identity resolution (postMessage + BX24.init +
+//      URL param fallbacks). Proper /token lookup by email.
+//      SDK reconnect/retry logic for "Failed, retrying".
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone      = null;
@@ -11,6 +11,8 @@ let timerInterval = null;
 let timerSec      = 0;
 let callDirection = null;
 let micGranted    = false;
+let initRetries   = 0;
+const MAX_RETRIES = 3;
 
 let currentUserEmail  = null;
 let currentBx24UserId = null;
@@ -34,54 +36,113 @@ function setReg(state) {
   const map = {
     connecting: { cls: 'yellow', label: 'Connecting...' },
     registered: { cls: 'green',  label: '\uD83D\uDFE2 Ready' },
-    failed:     { cls: 'red',    label: '\uD83D\uDD34 Registration failed' }
+    failed:     { cls: 'red',    label: '\uD83D\uDD34 Disconnected — retrying...' }
   };
   const s = map[state] || { cls: '', label: state };
   if (dot) dot.className = 'dot ' + s.cls;
   if (txt) txt.textContent = s.label;
 }
 
-// ── Get logged-in Bitrix24 user email ───────────────────────────────────────────
+// ── Method 1: postMessage-based BX24 identity (most reliable in sidebar iframes) ──
+function getBx24UserViaPostMessage() {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('postMessage timeout')), 4000);
+    function handler(e) {
+      try {
+        const d = (typeof e.data === 'string') ? JSON.parse(e.data) : e.data;
+        if (d && d.BX24_AUTH && d.BX24_AUTH.user_id) {
+          clearTimeout(timeout);
+          window.removeEventListener('message', handler);
+          resolve({ id: String(d.BX24_AUTH.user_id), email: null, name: '' });
+        }
+      } catch(err) {}
+    }
+    window.addEventListener('message', handler);
+    // Ask parent for auth
+    try { window.parent.postMessage({ cmd: 'getAuth' }, '*'); } catch(e) {}
+  });
+}
+
+// ── Method 2: BX24.init() API call ────────────────────────────────────────────
 function getBx24CurrentUser() {
   return new Promise((resolve, reject) => {
     let attempts = 0;
-    const MAX    = 5;
+    const MAX    = 8;   // more attempts, longer wait
     function tryInit() {
       attempts++;
       if (!window.BX24) {
-        if (attempts < MAX) { setTimeout(tryInit, 1000); }
-        else { reject(new Error('BX24 not available')); }
+        if (attempts < MAX) { setTimeout(tryInit, 800); }
+        else { reject(new Error('BX24 not available after ' + MAX + ' attempts')); }
         return;
       }
-      BX24.init(function () {
-        BX24.callMethod('user.current', {}, function (result) {
-          if (result.error()) { reject(new Error(String(result.error()))); return; }
-          const data = result.data();
-          resolve({
-            email: data.EMAIL || null,
-            id:    data.ID    || null,
-            name:  (data.NAME + ' ' + (data.LAST_NAME || '')).trim()
+      try {
+        BX24.init(function () {
+          BX24.callMethod('user.current', {}, function (result) {
+            if (result.error()) { reject(new Error(String(result.error()))); return; }
+            const data = result.data();
+            resolve({
+              email: (data.EMAIL || '').trim() || null,
+              id:    String(data.ID || ''),
+              name:  ((data.NAME || '') + ' ' + (data.LAST_NAME || '')).trim()
+            });
           });
         });
-      });
+      } catch(e) {
+        if (attempts < MAX) { setTimeout(tryInit, 800); }
+        else { reject(e); }
+      }
     }
     tryInit();
   });
 }
 
-// ── FIX: Parse bx24_user_id from iframe URL query params ─────────────────────────────
+// ── Method 3: Parse bx24_user_id / USER_ID from iframe URL ───────────────────
 function getBx24UserIdFromUrl() {
   try {
     const params = new URLSearchParams(window.location.search);
+    // PLACEMENT_OPTIONS is set by BX24 when opening a sidebar placement
     const placementOptions = params.get('PLACEMENT_OPTIONS');
     if (placementOptions) {
       const opts = JSON.parse(decodeURIComponent(placementOptions));
       if (opts.USER_ID) return String(opts.USER_ID);
     }
-    const userId = params.get('USER_ID') || params.get('user_id');
-    if (userId) return String(userId);
-  } catch(e) {}
-  return null;
+    // Direct query param fallbacks
+    return params.get('USER_ID') || params.get('user_id') || params.get('bx24_user_id') || null;
+  } catch(e) { return null; }
+}
+
+// ── Resolve BX24 user: tries all three methods ────────────────────────────────
+async function resolveBx24Identity() {
+  // Try BX24.init() first (direct API, most info)
+  try {
+    const u = await getBx24CurrentUser();
+    if (u.email || u.id) {
+      clog('Identity via BX24.init(): ' + u.name + ' <' + u.email + '> id=' + u.id);
+      return u;
+    }
+  } catch(e) {
+    clog('BX24.init() failed: ' + e.message);
+  }
+
+  // Try postMessage
+  try {
+    const u = await getBx24UserViaPostMessage();
+    if (u.id) {
+      clog('Identity via postMessage: id=' + u.id);
+      return u;
+    }
+  } catch(e) {
+    clog('postMessage failed: ' + e.message);
+  }
+
+  // Try URL params
+  const urlId = getBx24UserIdFromUrl();
+  if (urlId) {
+    clog('Identity via URL param: id=' + urlId);
+    return { id: urlId, email: null, name: '' };
+  }
+
+  throw new Error('Cannot identify BX24 user — all three methods failed.');
 }
 
 let micStream = null;
@@ -148,72 +209,102 @@ function stopTimer() {
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
+// ── Build the correct /token URL ──────────────────────────────────────────────
+// Priority: email > bx24_user_id
+function buildTokenUrl(email, bx24UserId) {
+  if (email) return '/token?user_id=' + encodeURIComponent(email);
+  if (bx24UserId) return '/token?bx24_user_id=' + encodeURIComponent(bx24UserId);
+  throw new Error('No email or bx24_user_id to build token URL');
+}
+
+// ── Main init ─────────────────────────────────────────────────────────────────
 async function init() {
+  sdkReady  = false;
+  webPhone  = null;
   setReg('connecting');
   setStatus('Identifying user...');
 
-  let tokenLookupId = null;
-
+  // ── Step 1: Identify user ──────────────────────────────────────────────────
+  let identity;
   try {
-    const bxUser = await getBx24CurrentUser();
-    currentUserEmail  = bxUser.email;
-    currentBx24UserId = bxUser.id;
-    clog('BX24 user: ' + bxUser.name + ' <' + currentUserEmail + '> id=' + currentBx24UserId);
-    if (!currentUserEmail) throw new Error('BX24 returned no email for this user');
-    tokenLookupId = currentUserEmail;
-    setStatus('Hello ' + bxUser.name.split(' ')[0] + '! Requesting microphone...');
-  } catch (e) {
-    clog('BX24 user detection failed: ' + e.message);
-    const urlBx24Id = getBx24UserIdFromUrl();
-    if (urlBx24Id) {
-      clog('Using bx24_user_id from URL params: ' + urlBx24Id);
-      currentBx24UserId = urlBx24Id;
-      tokenLookupId = null;
-      setStatus('User ' + urlBx24Id + ': Requesting microphone...');
-    } else {
-      setReg('failed');
-      setStatus('\u26A0\uFE0F Please open the dialer from a CRM contact, not the Marketplace page.');
-      console.error('[Dialer] BX24 user detection failed:', e.message);
-      return;
-    }
+    identity = await resolveBx24Identity();
+  } catch(e) {
+    setReg('failed');
+    setStatus('\u26A0\uFE0F Could not identify user. Open from a CRM contact.');
+    clog('Identity resolution failed: ' + e.message);
+    scheduleRetry();
+    return;
   }
 
-  await requestMic();
-  if (!micGranted) return;
+  currentBx24UserId = identity.id   || null;
+  currentUserEmail  = identity.email || null;
 
+  const greet = identity.name ? ('Hello ' + identity.name.split(' ')[0] + '! ') : '';
+  setStatus(greet + 'Requesting microphone...');
+
+  // ── Step 2: Microphone ────────────────────────────────────────────────────
+  await requestMic();
+  if (!micGranted) { scheduleRetry(); return; }
+
+  // ── Step 3: Fetch token / credentials ────────────────────────────────────
   setStatus('Fetching credentials...');
+  let tokenData;
   try {
-    let tokenUrl;
-    if (tokenLookupId) {
-      tokenUrl = '/token?user_id=' + encodeURIComponent(tokenLookupId);
-    } else if (currentBx24UserId) {
-      tokenUrl = '/token?bx24_user_id=' + encodeURIComponent(currentBx24UserId);
-    } else {
-      throw new Error('Cannot identify user — no email or bx24_user_id');
+    const tokenUrl = buildTokenUrl(currentUserEmail, currentBx24UserId);
+    clog('Fetching token: ' + tokenUrl);
+    const res = await fetch(tokenUrl);
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error('Token HTTP ' + res.status + ': ' + errText.slice(0, 200));
+    }
+    tokenData = await res.json();
+    if (tokenData.error) throw new Error(tokenData.error);
+    // Back-fill email from token response if we only had a BX24 user ID
+    if (!currentUserEmail && tokenData.email) currentUserEmail = tokenData.email;
+    clog('Token OK — app_user_id=' + tokenData.app_user_id + ' sip_id=' + tokenData.sip_id);
+  } catch(e) {
+    setReg('failed');
+    setStatus('Credentials failed: ' + e.message);
+    clog('Token error: ' + e.message);
+    scheduleRetry();
+    return;
+  }
+
+  const accessToken = tokenData.access_token || tokenData.app_token;
+  const appUserId   = tokenData.app_user_id  || tokenData.user_id;
+  if (!accessToken || !appUserId) {
+    setReg('failed');
+    setStatus('Invalid token response — missing access_token or app_user_id');
+    clog('Bad token response: ' + JSON.stringify(tokenData));
+    scheduleRetry();
+    return;
+  }
+
+  // ── Step 4: Initialize ExotelCRMWebSDK ────────────────────────────────────
+  setStatus('Connecting softphone...');
+  try {
+    if (typeof ExotelCRMWebSDK === 'undefined') {
+      throw new Error('ExotelCRMWebSDK not loaded — check /target/crmBundle.js');
     }
 
-    const res  = await fetch(tokenUrl);
-    if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
-    const data = await res.json();
-    if (data.error) throw new Error(data.error);
-
-    if (!currentUserEmail && data.email) currentUserEmail = data.email;
-
-    clog('Token OK, app_user_id=' + data.app_user_id);
-
-    const accessToken = data.access_token || data.app_token;
-    const appUserId   = data.app_user_id  || data.user_id;
-    if (!accessToken) throw new Error('No access_token in response');
-
-    setStatus('Initializing SDK...');
-    if (typeof ExotelCRMWebSDK === 'undefined') throw new Error('ExotelCRMWebSDK not loaded — check /target/crmBundle.js path');
-
     const crmWebSDK = new ExotelCRMWebSDK(accessToken, appUserId, true);
+
+    // Safety timeout: if regEvent never fires in 15s, consider it registered anyway
+    const regTimeout = setTimeout(() => {
+      if (!sdkReady) {
+        clog('regEvent timeout — assuming registered (SDK may be silent)');
+        sdkReady = true;
+        setReg('registered');
+        setStatus('\u2705 Ready');
+        startPoll();
+      }
+    }, 15000);
 
     webPhone = await crmWebSDK.Initialize(
       handleCallEvent,
       function(event) {
         clog('regEvent: ' + JSON.stringify(event));
+        clearTimeout(regTimeout);
         if (!sdkReady) {
           sdkReady = true;
           setReg('registered');
@@ -224,27 +315,51 @@ async function init() {
       }
     );
 
+    // Release the mic stream we used for permission — SDK manages its own
     if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
 
-    clog('Initialize resolved. webPhone=' + (webPhone ? typeof webPhone : 'null/void'));
+    clog('Initialize resolved. webPhone type=' + (webPhone ? typeof webPhone : 'null'));
 
+    // Some SDK versions resolve the promise without firing regEvent
     if (webPhone && !sdkReady) {
+      clearTimeout(regTimeout);
       sdkReady = true;
       setReg('registered');
       setStatus('\u2705 Ready');
       startPoll();
     }
 
+    // Reset retry counter on success
+    initRetries = 0;
+
   } catch (err) {
     setReg('failed');
-    setStatus('Error: ' + err.message);
-    clog('Init FAILED: ' + err.message);
-    console.error('[Dialer] Init error:', err);
+    setStatus('Softphone error: ' + err.message);
+    clog('SDK init FAILED: ' + err.message);
+    scheduleRetry();
   }
 }
 
-let pollCount = 0;
+// ── Retry logic: exponential backoff (5s, 10s, 20s, then 30s cap) ────────────
+let retryTimer = null;
+function scheduleRetry() {
+  if (retryTimer) return;
+  initRetries++;
+  if (initRetries > MAX_RETRIES) {
+    setReg('failed');
+    setStatus('\u274C Connection failed after ' + MAX_RETRIES + ' retries. Reload the page.');
+    clog('Max retries reached (' + MAX_RETRIES + ')');
+    return;
+  }
+  const delay = Math.min(5000 * Math.pow(2, initRetries - 1), 30000);
+  clog('Retrying in ' + (delay/1000) + 's (attempt ' + initRetries + '/' + MAX_RETRIES + ')');
+  setStatus('Reconnecting in ' + Math.round(delay/1000) + 's... (attempt ' + initRetries + '/' + MAX_RETRIES + ')');
+  retryTimer = setTimeout(() => { retryTimer = null; init(); }, delay);
+}
+
+// ── Polling for BX24 click-to-call ───────────────────────────────────────────
 let pollTimer = null;
+let pollCount = 0;
 function startPoll() {
   if (pollTimer) return;
   pollTimer = setInterval(doPoll, 2000);
@@ -284,17 +399,27 @@ async function triggerOutboundCall(number) {
 function handleCallEvent(event) {
   clog('callEvent: ' + JSON.stringify(event));
   const evtType = ((event && event.event) || (event && event.type) || (event && event.EventType) || '').toLowerCase();
-  const evtStr = JSON.stringify(event).toLowerCase();
+  const evtStr  = JSON.stringify(event).toLowerCase();
   clog('evtType=' + evtType + ' direction=' + callDirection);
 
   if (evtType.includes('incoming') || evtType.includes('ringing') || evtStr.includes('incoming') || evtStr.includes('ringing')) {
-    if (callDirection === 'outbound') { clog('Outbound SIP leg incoming \u2192 silent AcceptCall'); silentAcceptOutbound(); }
-    else { const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown'; showIncoming(from); setStatus(''); }
+    if (callDirection === 'outbound') {
+      clog('Outbound SIP leg incoming \u2192 silent AcceptCall');
+      silentAcceptOutbound();
+    } else {
+      const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown';
+      showIncoming(from);
+      setStatus('');
+    }
   } else if (evtType.includes('connect') || evtType.includes('answer') || evtType.includes('accept') || evtType.includes('active') || evtStr.includes('call_answered') || evtStr.includes('connected')) {
-    const num = callDirection === 'inbound' ? (document.getElementById('callerNum')?.textContent || '') : (document.getElementById('phone')?.value || '');
-    showActive(num); setStatus('');
+    const num = callDirection === 'inbound'
+      ? (document.getElementById('callerNum')?.textContent || '')
+      : (document.getElementById('phone')?.value || '');
+    showActive(num);
+    setStatus('');
   } else if (evtType.includes('end') || evtType.includes('complet') || evtType.includes('bye') || evtType.includes('terminal') || evtStr.includes('callended') || evtStr.includes('call_completed') || evtStr.includes('disconnect')) {
-    showDialer(); setStatus('Call ended');
+    showDialer();
+    setStatus('Call ended');
   }
 }
 
@@ -320,22 +445,30 @@ async function acceptCall() {
   if (!webPhone) { setStatus('SDK not ready'); return; }
   if (!micGranted) { await requestMic(); if (!micGranted) { setStatus('\u26A0\uFE0F Mic required'); return; } }
   clog('AcceptCall (inbound)');
-  try { await webPhone.AcceptCall(); showActive(document.getElementById('callerNum')?.textContent || ''); setStatus(''); }
-  catch (err) { clog('AcceptCall error: ' + err.message); setStatus('Accept failed: ' + err.message); }
+  try {
+    await webPhone.AcceptCall();
+    showActive(document.getElementById('callerNum')?.textContent || '');
+    setStatus('');
+  } catch (err) {
+    clog('AcceptCall error: ' + err.message);
+    setStatus('Accept failed: ' + err.message);
+  }
 }
 
 async function rejectCall() {
   if (!webPhone) return;
   clog('RejectCall');
   try { await webPhone.HangupCall(); } catch (e) { clog('Reject err: ' + e.message); }
-  showDialer(); setStatus('Call rejected');
+  showDialer();
+  setStatus('Call rejected');
 }
 
 async function hangUp() {
   if (!webPhone) return;
   clog('HangupCall');
   try { await webPhone.HangupCall(); } catch (e) { clog('Hangup err: ' + e.message); }
-  showDialer(); setStatus('Call ended');
+  showDialer();
+  setStatus('Call ended');
 }
 
 window.onload = init;
