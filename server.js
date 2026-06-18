@@ -7,7 +7,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ── Env vars ─────────────────────────────────────────────────────
-const BASE            = 'https://integrationscore.mum1.exotel.com/v2/integrations';
+const BASE            = 'https://integrationscore.sg1.exotel.com/v2/integrations';
 const CUSTOMER_ID     = process.env.EXOTEL_CUSTOMER_ID;
 const CUSTOMER_SECRET = process.env.EXOTEL_CUSTOMER_SECRET;
 const ACCOUNT_SID     = process.env.EXOTEL_ACCOUNT_SID;
