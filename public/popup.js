@@ -44,18 +44,33 @@ function setReg(state) {
 // ── Get logged-in Bitrix24 user's email ──────────────────────────
 function getBx24CurrentUser() {
   return new Promise((resolve, reject) => {
-    if (!window.BX24) { reject(new Error('BX24 not available')); return; }
-    BX24.init(function () {
-      BX24.callMethod('user.current', {}, function (result) {
-        if (result.error()) { reject(new Error(result.error())); return; }
-        const data = result.data();
-        resolve({
-          email:  data.EMAIL  || null,
-          id:     data.ID     || null,
-          name:   (data.NAME + ' ' + (data.LAST_NAME || '')).trim()
+    let attempts = 0;
+    const MAX    = 5; // retry up to 5 times with 1s gap
+
+    function tryInit() {
+      attempts++;
+      if (!window.BX24) {
+        if (attempts < MAX) {
+          setTimeout(tryInit, 1000);
+        } else {
+          reject(new Error('BX24 not available'));
+        }
+        return;
+      }
+      BX24.init(function () {
+        BX24.callMethod('user.current', {}, function (result) {
+          if (result.error()) { reject(new Error(String(result.error()))); return; }
+          const data = result.data();
+          resolve({
+            email: data.EMAIL  || null,
+            id:    data.ID     || null,
+            name:  (data.NAME + ' ' + (data.LAST_NAME || '')).trim()
+          });
         });
       });
-    });
+    }
+
+    tryInit();
   });
 }
 
@@ -151,7 +166,7 @@ async function init() {
   setStatus('Fetching credentials...');
   try {
     // Use email as user_id so server can match by Email field in Exotel usermapping
-    const lookupId = currentUserEmail || 'default';
+    const lookupId = currentUserEmail || window._EXOTEL_APP_USER_ID || '123';
     const res  = await fetch('/token?user_id=' + encodeURIComponent(lookupId));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
