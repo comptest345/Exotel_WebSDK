@@ -227,44 +227,78 @@ app.post('/create-user', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── /token — called by popup.js, background.js, AND by ExotelCRMWebSDK internally ──
-// The Exotel crmBundle.js SDK makes its own internal fetch to /token
-// and specifically checks for the field "app_user_id" in the response.
-// popup.js also checks for data.sip_id — both are returned here.
+// ── BX24 user email cache (bx24UserId → email) ───────────────────
+const bx24UserEmailCache = {};
+
+// ── /token — Looks up by EMAIL (primary key) or bx24_user_id (cache fallback)
+// popup.js sends ?user_id=email@domain.com after resolving BX24 user.current
+// The /token endpoint then fetches the correct SipSecret from Singapore CCM.
 app.get('/token', async (req, res) => {
   try {
-    const { user_id } = req.query;
-    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+    const { user_id, bx24_user_id } = req.query;
+    let lookupKey = user_id;
 
-    // Step 1: Get app-scoped JWT
+    // If no email provided, try to resolve from bx24_user_id cache
+    if (!lookupKey && bx24_user_id) {
+      lookupKey = bx24UserEmailCache[bx24_user_id] || null;
+      if (!lookupKey) {
+        return res.status(400).json({
+          error: `BX24 user ${bx24_user_id} email not cached yet. Open from a CRM contact first.`
+        });
+      }
+    }
+    if (!lookupKey) return res.status(400).json({ error: 'user_id (email) or bx24_user_id required' });
+
     const appToken = await getAppToken();
 
-    // Step 2: Get SIP credentials for this user from Exotel usermapping
-    const r    = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(user_id)}`, {
+    // Direct lookup by email via usermapping API
+    const r    = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(lookupKey)}`, {
       headers: { 'Authorization': appToken }
     });
-    const data = JSON.parse(await r.text());
-    if (!r.ok) throw new Error(`Usermapping failed [${r.status}]: ${JSON.stringify(data)}`);
+    const raw  = await r.text();
+    const data = JSON.parse(raw);
 
-    const user = (data.Data && data.Data.Users && data.Data.Users.length > 0)
-      ? data.Data.Users[0]
-      : (data.Data && data.Data.SipId ? data.Data : null);
+    let user = null;
+    if (data.Data) {
+      if (Array.isArray(data.Data)) {
+        user = data.Data[0] || null;
+      } else if (data.Data.Users && data.Data.Users.length > 0) {
+        user = data.Data.Users[0];
+      } else if (data.Data.SipId) {
+        user = data.Data;
+      }
+    }
 
-    if (!user) throw new Error(`No user found for user_id=${user_id}. Run /list-users to check.`);
+    // If direct lookup failed, scan all users by email
+    if (!user) {
+      console.log(`[Token] Direct lookup found nothing for ${lookupKey} — scanning all users`);
+      const at2      = await getAppToken();
+      const listRes  = await fetch(`${BASE}/usermapping`, { headers: { 'Authorization': at2 } });
+      const listData = JSON.parse(await listRes.text());
+      const allUsers = (listData.Data && listData.Data.Users) || (Array.isArray(listData.Data) ? listData.Data : []);
+      user = allUsers.find(u => u.Email && u.Email.toLowerCase() === lookupKey.toLowerCase()) || null;
+    }
 
-    console.log('[Token] Issued for user_id:', user_id, 'SipId:', user.SipId);
+    if (!user) {
+      return res.status(404).json({
+        error: `No usermapping found for: ${lookupKey}. Check /list-users to confirm the user exists.`
+      });
+    }
 
-    // IMPORTANT: crmBundle.js SDK internally fetches /token and checks for "app_user_id".
-    // Without this field the SDK throws "No app_user_id in /token response" and init fails.
+    console.log('[Token] Issued:', { lookupKey, AppUserId: user.AppUserId, SipId: user.SipId });
+
     res.json({
       success:        true,
-      access_token:   appToken,          // ← SDK (crmBundle.js) internal fetch expects THIS
-      app_token:      appToken,          // ← kept for backward compat with popup.js
-      app_user_id:    user.AppUserId,    // ← SDK init check requires this field name exactly
+      access_token:   appToken,
+      app_token:      appToken,
+      app_user_id:    user.AppUserId,
+      user_id:        user.AppUserId,
+      email:          user.Email,
       sip_id:         user.SipId,
+      sip_username:   user.SipId ? user.SipId.replace(/^sip:/, '') : '',
       sip_secret:     user.SipSecret,
       virtual_number: user.VirtualNumber,
-      user_id:        user.AppUserId     // ← kept for backward compat
+      name:           user.AppUsername
     });
   } catch(e) {
     console.error('[Token] Error:', e.message);
