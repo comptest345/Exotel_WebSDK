@@ -1,5 +1,7 @@
 // ═══════════════════════════════════════════════════════════════
-// popup.js — Fixed per official Exotel CRM WebSDK docs
+// popup.js — Multi-agent version
+// Identifies logged-in Bitrix24 user by EMAIL, fetches their own
+// SIP credentials from Exotel, and registers with per-user SIP.
 // ═══════════════════════════════════════════════════════════════
 
 let webPhone      = null;
@@ -9,15 +11,16 @@ let timerSec      = 0;
 let callDirection = null; // 'inbound' | 'outbound' | null
 let micGranted    = false;
 
-const EXOTEL_APP_USER_ID = '123';
-const BX24_USER_ID       = '44';
+// These are set dynamically from BX24 — NOT hardcoded anymore
+let currentUserEmail  = null;
+let currentBx24UserId = null;
 
 function log(msg) { console.log('[Dialer]', msg); }
 function clog(msg, extra) {
   fetch('/client-log', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source: 'popup.js', message: msg, extra: extra || null, ts: Date.now() })
+    body: JSON.stringify({ source: 'popup.js', message: msg, extra: extra || null, email: currentUserEmail, ts: Date.now() })
   }).catch(() => {});
 }
 function setStatus(msg) {
@@ -38,23 +41,42 @@ function setReg(state) {
   if (txt) txt.textContent = s.label;
 }
 
-// ── Mic permission ────────────────────────────────────────────
-let micStream = null; // global
+// ── Get logged-in Bitrix24 user's email ──────────────────────────
+function getBx24CurrentUser() {
+  return new Promise((resolve, reject) => {
+    if (!window.BX24) { reject(new Error('BX24 not available')); return; }
+    BX24.init(function () {
+      BX24.callMethod('user.current', {}, function (result) {
+        if (result.error()) { reject(new Error(result.error())); return; }
+        const data = result.data();
+        resolve({
+          email:  data.EMAIL  || null,
+          id:     data.ID     || null,
+          name:   (data.NAME + ' ' + (data.LAST_NAME || '')).trim()
+        });
+      });
+    });
+  });
+}
+
+// ── Mic permission ────────────────────────────────────────────────
+let micStream = null;
 
 async function requestMic() {
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    // DO NOT stop tracks here — let SDK reuse or release it
     micGranted = true;
     clog('Mic permission granted');
   } catch (e) {
     micGranted = false;
     clog('Mic DENIED: ' + e.message);
     setStatus('⚠️ Allow microphone and reload.');
+    const w = document.getElementById('micWarning');
+    if (w) w.style.display = 'block';
   }
 }
 
-// ── UI states ─────────────────────────────────────────────────
+// ── UI states ─────────────────────────────────────────────────────
 function showIncoming(from) {
   callDirection = 'inbound';
   const el = document.getElementById('callerNum');
@@ -103,53 +125,72 @@ function stopTimer() {
   if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
-// ── Init ──────────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────────
 async function init() {
   setReg('connecting');
-  setStatus('Requesting microphone...');
+  setStatus('Identifying user...');
+
+  // Step 1: Get logged-in BX24 user's email
+  try {
+    const bxUser = await getBx24CurrentUser();
+    currentUserEmail  = bxUser.email;
+    currentBx24UserId = bxUser.id;
+    clog('BX24 user: ' + bxUser.name + ' <' + currentUserEmail + '> id=' + currentBx24UserId);
+    setStatus('Hello ' + bxUser.name.split(' ')[0] + '! Requesting microphone...');
+  } catch (e) {
+    // Fallback: if not running inside BX24 (e.g. testing directly in browser)
+    clog('BX24 user detection failed: ' + e.message + ' — using env fallback');
+    setStatus('Requesting microphone...');
+  }
+
+  // Step 2: Mic
   await requestMic();
   if (!micGranted) return;
 
+  // Step 3: Fetch SIP credentials for this user
   setStatus('Fetching credentials...');
   try {
-    const res = await fetch('/token?user_id=' + encodeURIComponent(EXOTEL_APP_USER_ID));
+    // Use email as user_id so server can match by Email field in Exotel usermapping
+    const lookupId = currentUserEmail || 'default';
+    const res  = await fetch('/token?user_id=' + encodeURIComponent(lookupId));
     if (!res.ok) throw new Error('Token fetch failed: ' + res.status);
     const data = await res.json();
-    clog('Token OK, app_user_id=' + (data.app_user_id || data.user_id));
+    if (data.error) throw new Error(data.error);
+
+    clog('Token OK, app_user_id=' + data.app_user_id + ' email=' + data.email);
 
     const accessToken = data.access_token || data.app_token;
-    const appUserId   = data.app_user_id  || data.user_id || EXOTEL_APP_USER_ID;
+    const appUserId   = data.app_user_id  || data.user_id;
     if (!accessToken) throw new Error('No access_token in response');
 
+    // Step 4: Init SDK
     setStatus('Initializing SDK...');
     if (typeof ExotelCRMWebSDK === 'undefined') throw new Error('ExotelCRMWebSDK not loaded — check /target/crmBundle.js path');
 
-    // ✅ FIX 1: autoConnectVOIP = true (was false — caused silent registration failure)
     const crmWebSDK = new ExotelCRMWebSDK(accessToken, appUserId, true);
 
-    // ✅ FIX 2: await Initialize() — it RETURNS ExotelWebPhoneSDK (the actual phone object)
     webPhone = await crmWebSDK.Initialize(
-      handleCallEvent,   // sofPhoneListenerCallback
-      function(event) {  // softPhoneRegisterEventCallBack
+      handleCallEvent,
+      function(event) {
         clog('regEvent: ' + JSON.stringify(event));
         if (!sdkReady) {
           sdkReady = true;
           setReg('registered');
           setStatus('✅ Ready');
-          clog('SIP registered ✅');
+          clog('SIP registered ✅ as ' + appUserId);
           startPoll();
         }
       }
     );
-    // After webPhone = await crmWebSDK.Initialize(...)
-if (micStream) {
-  micStream.getTracks().forEach(t => t.stop());
-  micStream = null;
-}
+
+    // Release pre-acquired mic — SDK now manages it
+    if (micStream) {
+      micStream.getTracks().forEach(t => t.stop());
+      micStream = null;
+    }
 
     clog('Initialize resolved. webPhone=' + (webPhone ? typeof webPhone : 'null/void'));
 
-    // Some SDK versions resolve with webPhone, others fire regCallback first
     if (webPhone && !sdkReady) {
       sdkReady = true;
       setReg('registered');
@@ -165,7 +206,7 @@ if (micStream) {
   }
 }
 
-// ── Poll for BX24 click-to-call outbound ─────────────────────
+// ── Poll for BX24 click-to-call (per agent email) ────────────────
 let pollCount = 0;
 let pollTimer = null;
 function startPoll() {
@@ -173,11 +214,12 @@ function startPoll() {
   pollTimer = setInterval(doPoll, 2000);
 }
 async function doPoll() {
+  if (!currentUserEmail) return;
   try {
-    const res  = await fetch('/pending-call');
+    const res  = await fetch('/pending-call?email=' + encodeURIComponent(currentUserEmail));
     const data = await res.json();
     pollCount++;
-    if (pollCount % 30 === 1) clog('poll #' + pollCount);
+    if (pollCount % 30 === 1) clog('poll #' + pollCount + ' email=' + currentUserEmail);
     if (data.pending && data.number) {
       clog('BX24 click-to-call: ' + data.number);
       callDirection = 'outbound';
@@ -189,7 +231,7 @@ async function doPoll() {
   } catch (e) { /* silent */ }
 }
 
-// ── Outbound call ─────────────────────────────────────────────
+// ── Outbound call ─────────────────────────────────────────────────
 async function triggerOutboundCall(number) {
   if (!webPhone) { setStatus('SDK not ready'); clog('webPhone is null!'); return; }
   callDirection = 'outbound';
@@ -199,16 +241,12 @@ async function triggerOutboundCall(number) {
   } catch (e) {
     clog('MakeCall error: ' + e.message);
   }
-  // Do NOT show active UI here.
-  // SDK will fire callListener with incoming/ringing → we silently AcceptCall()
-  // SDK then fires connected/answered → we show active UI
 }
 
-// ── Call event handler (per official SDK event structure) ─────
+// ── Call event handler ────────────────────────────────────────────
 function handleCallEvent(event) {
   clog('callEvent: ' + JSON.stringify(event));
 
-  // ✅ FIX 3: Read event.event or event.type directly — don't stringify-match
   const evtType = (
     (event && event.event) ||
     (event && event.type)  ||
@@ -216,26 +254,24 @@ function handleCallEvent(event) {
     ''
   ).toLowerCase();
 
-  const evtStr = JSON.stringify(event).toLowerCase(); // fallback for unknown shapes
+  const evtStr = JSON.stringify(event).toLowerCase();
 
   clog('evtType=' + evtType + ' direction=' + callDirection);
 
-  // ── Incoming / Ringing ────────────────────────────────────
+  // Incoming / Ringing
   if (evtType.includes('incoming') || evtType.includes('ringing') ||
       evtStr.includes('incoming')  || evtStr.includes('ringing')) {
 
     if (callDirection === 'outbound') {
-      // Outbound SIP leg rings browser — silently accept to open mic
       clog('Outbound SIP leg incoming → silent AcceptCall');
       silentAcceptOutbound();
     } else {
-      // Genuine inbound call from customer
       const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown';
       showIncoming(from);
       setStatus('');
     }
 
-  // ── Connected / Answered ──────────────────────────────────
+  // Connected / Answered
   } else if (evtType.includes('connect') || evtType.includes('answer') ||
              evtType.includes('accept')  || evtType.includes('active') ||
              evtStr.includes('call_answered') || evtStr.includes('connected')) {
@@ -246,7 +282,7 @@ function handleCallEvent(event) {
     showActive(num);
     setStatus('');
 
-  // ── Ended ─────────────────────────────────────────────────
+  // Ended
   } else if (evtType.includes('end')   || evtType.includes('complet') ||
              evtType.includes('bye')   || evtType.includes('terminal') ||
              evtStr.includes('callended') || evtStr.includes('call_completed') ||
@@ -267,11 +303,11 @@ async function silentAcceptOutbound() {
   } catch (e) {
     clog('silentAccept error: ' + e.message);
     const num = document.getElementById('phone')?.value || '';
-    showActive(num); // show active anyway — call may still connect
+    showActive(num);
   }
 }
 
-// ── Manual call button ────────────────────────────────────────
+// ── Manual call button ────────────────────────────────────────────
 async function makeCall() {
   const number = document.getElementById('phone').value.trim();
   if (!number)    { setStatus('Enter a number'); return; }
@@ -282,7 +318,7 @@ async function makeCall() {
   document.getElementById('callBtn').disabled = false;
 }
 
-// ── Accept inbound ────────────────────────────────────────────
+// ── Accept inbound ────────────────────────────────────────────────
 async function acceptCall() {
   if (!webPhone) { setStatus('SDK not ready'); return; }
   if (!micGranted) {
@@ -300,7 +336,7 @@ async function acceptCall() {
   }
 }
 
-// ── Reject inbound ────────────────────────────────────────────
+// ── Reject inbound ────────────────────────────────────────────────
 async function rejectCall() {
   if (!webPhone) return;
   clog('RejectCall');
@@ -309,7 +345,7 @@ async function rejectCall() {
   setStatus('Call rejected');
 }
 
-// ── Hang up ───────────────────────────────────────────────────
+// ── Hang up ───────────────────────────────────────────────────────
 async function hangUp() {
   if (!webPhone) return;
   clog('HangupCall');
