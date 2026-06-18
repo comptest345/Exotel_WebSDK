@@ -120,7 +120,17 @@ const inboundCallMap       = {}; // callSid → bxCallId
 let pollCount = 0;
 
 // ── Static HTML routes ────────────────────────────────────────────
-app.all('/popup.html',      (req, res) => res.sendFile(path.join(__dirname, 'public', 'popup.html')));
+app.all('/popup.html', (req, res) => {
+  // Inject server-side env vars into the page so popup.js fallback works
+  // even when BX24 JS is not available (e.g. opened directly, not in sidebar).
+  const fs       = require('fs');
+  const htmlPath = path.join(__dirname, 'public', 'popup.html');
+  let   html     = fs.readFileSync(htmlPath, 'utf8');
+  const inject   = `<script>window._EXOTEL_APP_USER_ID="${APP_USER_ID}";<\/script>`;
+  html = html.replace('</head>', inject + '</head>');
+  res.setHeader('Content-Type', 'text/html');
+  res.send(html);
+});
 app.all('/background.html', (req, res) => res.sendFile(path.join(__dirname, 'public', 'background.html')));
 
 app.get('/crmBundle.js', (req, res) => {
