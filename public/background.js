@@ -1,8 +1,9 @@
 // ═══════════════════════════════════════════════════════════════
-// background.js — Registers Bitrix24 telephony + handles BX24 events
+// background.js — Multi-agent version
+// Registers Bitrix24 telephony + handles BX24 events.
+// BX24 user is resolved dynamically — no hardcoded IDs.
 // ═══════════════════════════════════════════════════════════════
 
-const BX24_USER_ID = '44';
 let currentCallId = null;
 let callStartTime = 0;
 
@@ -20,16 +21,17 @@ function initBG() {
       bgLog('onExternalCallStart: ' + JSON.stringify(data));
       const num    = data.PHONE_NUMBER || data.PHONE_NUMBER_INTERNATIONAL || '';
       const callId = data.CALL_ID || '';
+      const userId = data.USER_ID || '';
       currentCallId = callId;
       callStartTime = Date.now();
 
-      // Send number to server so popup.js poll picks it up
-      fetch('/outbound-call', {
+      // Send to server — server resolves BX24 userId → email via BX24 webhook
+      fetch('/bx24-call-start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ number: num, callId: callId, userId: BX24_USER_ID })
+        body: JSON.stringify({ PHONE_NUMBER: num, CALL_ID: callId, USER_ID: userId })
       }).then(r => r.json()).then(d => {
-        bgLog('Queued outbound call: ' + JSON.stringify(d));
+        bgLog('Queued outbound call for: ' + (d.email || 'unknown') + ' → ' + num);
       }).catch(e => bgLog('Queue error: ' + e.message));
     });
 
