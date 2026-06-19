@@ -127,18 +127,7 @@ async function resolveBx24Identity() {
     return { id: authId, email: null, name: '' };
   }
 
-  // Method 4: Ask the server to resolve via BX24 webhook using hardcoded fallback user_id
-  // Only works if BX24_USER_ID env var is set — better than failing completely
-  try {
-    const res  = await fetch('/token?bx24_user_id=44');
-    const data = await res.json();
-    if (data.email) {
-      clog('Identity via server fallback (bx24_user_id=44): ' + data.email);
-      return { id: '44', email: data.email, name: data.name || '' };
-    }
-  } catch (_) {}
-
-  throw new Error('Cannot identify BX24 user — all methods failed.');
+  throw new Error('Cannot identify BX24 user — all methods failed. URL: ' + window.location.href.slice(0, 150));
 }
 
 // ── Microphone ────────────────────────────────────────────────
