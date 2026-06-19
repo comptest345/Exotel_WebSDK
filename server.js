@@ -45,8 +45,14 @@ async function getCustomerToken() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ Id: CUSTOMER_ID, Secret: CUSTOMER_SECRET, Entity: 'customer' })
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`Customer token failed: ${JSON.stringify(data)}`);
+  const raw  = await res.text();
+  let data;
+  try { data = JSON.parse(raw); }
+  catch (_) {
+    console.error('[Token] Customer token raw response (HTTP ' + res.status + '):', raw.slice(0, 300));
+    throw new Error('Customer token: invalid JSON from Exotel — HTTP ' + res.status);
+  }
+  if (!res.ok) throw new Error('Customer token failed: ' + JSON.stringify(data));
   return data.Data;
 }
 
@@ -107,7 +113,15 @@ async function syncUsers() {
     // 1. Get all CCM co-workers
     const ct       = await getCustomerToken();
     const ccmRes   = await fetch(`${BASE}/user?entity=customer`, { headers: { 'Authorization': ct } });
-    const ccmData  = await ccmRes.json();
+    const ccmRaw   = await ccmRes.text();
+    console.log('[Sync] CCM raw (first 300):', ccmRaw.slice(0, 300));
+    let ccmData;
+    try { ccmData = JSON.parse(ccmRaw); }
+    catch (parseErr) {
+      console.error('[Sync] CCM JSON parse failed. HTTP ' + ccmRes.status + ' Body:', ccmRaw.slice(0, 500));
+      // Don't crash sync — skip CCM add/delete but let usermapping still work
+      ccmData = { Data: [] };
+    }
     const ccmUsers = Array.isArray(ccmData.Data) ? ccmData.Data : [];
     console.log(`[Sync] CCM users: ${ccmUsers.length}`);
 
