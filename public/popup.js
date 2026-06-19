@@ -18,11 +18,11 @@ const MAX_RETRIES = 4;
 let currentUserEmail  = null;
 let currentBx24UserId = null;
 let currentInboundCallSid = null;  // set when an inbound call arrives; used for claiming
-// Guard: track the last callSid that was dismissed (claimed by another agent or
-// rejected). Used to prevent a late/duplicate native SIP event from re-showing
-// the incoming panel for a call we already dismissed.
-let dismissedCallSid = null;
-let dismissedAt      = 0;   // timestamp of last dismiss; used for cooldown
+// Guard: track ALL callSids that were dismissed (claimed by another agent, or
+// rejected by this agent). A Set instead of a single var handles cases where
+// duplicate Exotel webhooks fire and multiple calls arrive in quick succession.
+const dismissedCallSids = new Set();
+let dismissedAt      = 0;   // timestamp of last dismiss; used for native-SIP cooldown
 
 function log(msg) { console.log('[Dialer]', msg); }
 function clog(msg, extra) {
@@ -420,10 +420,14 @@ function startSSE() {
   sseSource.addEventListener('inbound_call', async (e) => {
     const d = JSON.parse(e.data);
     clog('SSE inbound_call from: ' + d.from + ' sid: ' + d.callSid);
-    // A genuinely new call arrived — reset dismiss cooldown so it isn't blocked.
-    if (d.callSid && d.callSid !== dismissedCallSid) {
-      dismissedAt      = 0;
-      dismissedCallSid = null;
+    // Already dismissed (claimed by us, claimed by another, or rejected) — skip.
+    if (d.callSid && dismissedCallSids.has(d.callSid)) {
+      clog('SSE inbound_call ignored — already dismissed sid=' + d.callSid);
+      return;
+    }
+    // A genuinely new call — reset the native-SIP cooldown for this callSid.
+    if (d.callSid) {
+      dismissedAt = 0;
     }
     showIncoming(d.from, d.callSid);
   });
@@ -431,16 +435,11 @@ function startSSE() {
   // Another agent claimed the call — dismiss our incoming UI.
   sseSource.addEventListener('call_dismissed', (e) => {
     const d = JSON.parse(e.data);
-    // Dismiss if:
-    // (a) sid matches what we recorded, OR
-    // (b) currentInboundCallSid is null — means the native SDK event fired
-    //     before SSE and we never got a sid, but we're definitely showing
-    //     the incoming panel (callDirection === 'inbound').
     const sidMatch = (currentInboundCallSid === d.callSid) || (currentInboundCallSid === null);
     if (callDirection === 'inbound' && sidMatch) {
       clog('call_dismissed — claimed by ' + d.claimedBy + ' sid=' + d.callSid);
-      dismissedCallSid = d.callSid;   // guard against late native re-trigger
-      dismissedAt      = Date.now();
+      if (d.callSid) dismissedCallSids.add(d.callSid);  // guard against late native re-trigger
+      dismissedAt = Date.now();
       showDialer();
       setStatus('📞 Answered by another agent');
     }
@@ -469,9 +468,23 @@ async function doPoll() {
     pollCount++;
     if (pollCount % 12 === 1) clog('poll#' + pollCount + ' email=' + currentUserEmail);
     if (data.pending && data.type === 'inbound' && callDirection !== 'inbound') {
-      // Poll caught an inbound call we missed via SSE
+      // Poll caught an inbound call we missed via SSE.
+      // But skip it if we already dismissed this callSid.
+      if (data.callSid && dismissedCallSids.has(data.callSid)) {
+        clog('Poll inbound ignored — already dismissed sid=' + data.callSid);
+        return;
+      }
       clog('Poll fallback: inbound from ' + data.from + ' sid=' + data.callSid);
       showIncoming(data.from, data.callSid);
+    } else if (!data.pending && data.type === 'claimed') {
+      // Server says the most recent inbound call is claimed — dismiss our panel if showing.
+      if (callDirection === 'inbound') {
+        clog('Poll: call ' + data.callSid + ' already claimed by ' + data.claimedBy + ' — dismissing');
+        if (data.callSid) dismissedCallSids.add(data.callSid);
+        dismissedAt = Date.now();
+        showDialer();
+        setStatus('📞 Answered by another agent');
+      }
     } else if (data.pending && data.type === 'outbound' && data.number) {
       clog('Poll fallback caught outbound call: ' + data.number);
       callDirection = 'outbound';
@@ -525,10 +538,14 @@ function handleCallEvent(event) {
       showOutboundRinging(document.getElementById('phone')?.value || '');
     } else {
       // Native SIP incoming event — carries no callSid.
-      // If we dismissed this call within the last 8 seconds (another agent
-      // claimed it), ignore this late SIP retransmission; don't re-open panel.
+      // If currentInboundCallSid is set and already dismissed, ignore this.
+      if (currentInboundCallSid && dismissedCallSids.has(currentInboundCallSid)) {
+        clog('Native incoming event ignored — callSid already dismissed: ' + currentInboundCallSid);
+        return;
+      }
+      // Also check the time-based cooldown for cases where callSid isn't set yet.
       if (Date.now() - dismissedAt < 8000) {
-        clog('Native incoming event ignored — within dismiss cooldown (callSid=' + dismissedCallSid + ')');
+        clog('Native incoming event ignored — within dismiss cooldown');
         return;
       }
       const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown';
@@ -578,11 +595,14 @@ async function acceptCall() {
       const claimData = await claimRes.json();
       if (!claimData.claimed) {
         clog('Claim failed — already taken by ' + (claimData.claimedBy || 'another agent'));
+        if (currentInboundCallSid) dismissedCallSids.add(currentInboundCallSid);
         showDialer();
         setStatus('📞 Already answered by another agent');
         return;
       }
       clog('Claimed callSid=' + currentInboundCallSid + ' bx24CallId=' + claimData.bx24CallId);
+      // Mark as handled so poll/SSE don't re-show this call on this agent's panel.
+      if (currentInboundCallSid) dismissedCallSids.add(currentInboundCallSid);
     } catch (e) {
       clog('Claim request failed (proceeding anyway): ' + e.message);
       // Network error on claim — proceed with AcceptCall so the agent isn't stuck.
@@ -598,13 +618,9 @@ async function acceptCall() {
 }
 
 async function rejectCall() {
-  // For inbound multi-agent: just dismiss this agent's UI locally.
-  // Do NOT call HangupCall — that would send a SIP decline for our leg and
-  // could interfere with other agents still ringing.
-  // The customer continues to hear ringback; Exotel's platform handles no-answer timeout.
   clog('rejectCall — dismissing locally, other agents unaffected');
-  dismissedCallSid = currentInboundCallSid;
-  dismissedAt      = Date.now();
+  if (currentInboundCallSid) dismissedCallSids.add(currentInboundCallSid);
+  dismissedAt = Date.now();
   showDialer();
   setStatus('Call declined');
 }
