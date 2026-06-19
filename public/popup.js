@@ -17,6 +17,7 @@ const MAX_RETRIES = 4;
 
 let currentUserEmail  = null;
 let currentBx24UserId = null;
+let currentInboundCallSid = null;  // set when an inbound call arrives; used for claiming
 
 function log(msg) { console.log('[Dialer]', msg); }
 function clog(msg, extra) {
@@ -154,8 +155,9 @@ function releaseMic() {
 }
 
 // ── UI helpers ────────────────────────────────────────────────
-function showIncoming(from) {
+function showIncoming(from, callSid) {
   callDirection = 'inbound';
+  currentInboundCallSid = callSid || null;
   const el = document.getElementById('callerNum');
   if (el) el.textContent = from || 'Unknown';
   document.getElementById('incomingPanel').style.display = 'block';
@@ -192,6 +194,7 @@ function showOutboundRinging(num) {
 
 function showDialer() {
   callDirection = null;
+  currentInboundCallSid = null;
   document.getElementById('incomingPanel').style.display = 'none';
   document.getElementById('activePanel').style.display   = 'none';
   document.getElementById('dialerPanel').style.display   = 'block';
@@ -407,8 +410,18 @@ function startSSE() {
 
   sseSource.addEventListener('inbound_call', async (e) => {
     const d = JSON.parse(e.data);
-    clog('SSE inbound_call from: ' + d.from);
-    showIncoming(d.from);
+    clog('SSE inbound_call from: ' + d.from + ' sid: ' + d.callSid);
+    showIncoming(d.from, d.callSid);
+  });
+
+  // Another agent claimed the call — dismiss our incoming UI.
+  sseSource.addEventListener('call_dismissed', (e) => {
+    const d = JSON.parse(e.data);
+    if (callDirection === 'inbound' && currentInboundCallSid === d.callSid) {
+      clog('call_dismissed — claimed by ' + d.claimedBy);
+      showDialer();
+      setStatus('📞 Answered by another agent');
+    }
   });
 
   sseSource.onopen  = () => clog('SSE connected');
@@ -433,8 +446,19 @@ async function doPoll() {
     const data = await res.json();
     pollCount++;
     if (pollCount % 12 === 1) clog('poll#' + pollCount + ' email=' + currentUserEmail);
-    if (data.pending && data.number) {
-      clog('Poll fallback caught call: ' + data.number);
+    if (data.pending && data.type === 'inbound' && callDirection !== 'inbound') {
+      // Poll caught an inbound call we missed via SSE
+      clog('Poll fallback: inbound from ' + data.from + ' sid=' + data.callSid);
+      showIncoming(data.from, data.callSid);
+    } else if (data.pending && data.type === 'outbound' && data.number) {
+      clog('Poll fallback caught outbound call: ' + data.number);
+      callDirection = 'outbound';
+      const phoneEl = document.getElementById('phone');
+      if (phoneEl) phoneEl.value = data.number;
+      await triggerOutboundCall(data.number);
+    } else if (data.pending && data.number) {
+      // Legacy shape (no type field) — treat as outbound
+      clog('Poll fallback (legacy) caught call: ' + data.number);
       callDirection = 'outbound';
       const phoneEl = document.getElementById('phone');
       if (phoneEl) phoneEl.value = data.number;
@@ -507,6 +531,35 @@ async function makeCall() {
 async function acceptCall() {
   if (!webPhone) { setStatus('SDK not ready'); return; }
   if (!micGranted) { await requestMic(); if (!micGranted) { setStatus('⚠️ Mic required'); return; } }
+
+  // Multi-agent: atomically claim the call on the server before accepting
+  // the SIP leg. If another agent got there first we get { claimed: false }
+  // and just dismiss — no SIP AcceptCall is sent.
+  if (currentInboundCallSid) {
+    try {
+      const claimRes = await fetch('/claim-call', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          callSid:    currentInboundCallSid,
+          email:      currentUserEmail,
+          bx24UserId: currentBx24UserId
+        })
+      });
+      const claimData = await claimRes.json();
+      if (!claimData.claimed) {
+        clog('Claim failed — already taken by ' + (claimData.claimedBy || 'another agent'));
+        showDialer();
+        setStatus('📞 Already answered by another agent');
+        return;
+      }
+      clog('Claimed callSid=' + currentInboundCallSid + ' bx24CallId=' + claimData.bx24CallId);
+    } catch (e) {
+      clog('Claim request failed (proceeding anyway): ' + e.message);
+      // Network error on claim — proceed with AcceptCall so the agent isn't stuck.
+    }
+  }
+
   clog('AcceptCall');
   try {
     await webPhone.AcceptCall();
@@ -516,9 +569,13 @@ async function acceptCall() {
 }
 
 async function rejectCall() {
-  if (!webPhone) return;
-  try { await webPhone.HangupCall(); } catch (e) { clog('Reject err: ' + e.message); }
-  showDialer(); setStatus('Call rejected');
+  // For inbound multi-agent: just dismiss this agent's UI locally.
+  // Do NOT call HangupCall — that would send a SIP decline for our leg and
+  // could interfere with other agents still ringing.
+  // The customer continues to hear ringback; Exotel's platform handles no-answer timeout.
+  clog('rejectCall — dismissing locally, other agents unaffected');
+  showDialer();
+  setStatus('Call declined');
 }
 
 async function hangUp() {
