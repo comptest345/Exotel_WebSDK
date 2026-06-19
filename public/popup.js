@@ -221,9 +221,11 @@ async function init() {
   }
 
   const accessToken = tokenData.access_token || tokenData.app_token;
-  const appUserId   = String(tokenData.app_user_id || tokenData.user_id || '');
+  const credentials = tokenData.multiCredentials || [
+    { app_user_id: String(tokenData.app_user_id || tokenData.user_id || '') }
+  ];
 
-  if (!accessToken || !appUserId) {
+  if (!accessToken || credentials.length === 0) {
     setReg('failed');
     setStatus('Missing token fields — check /list-users');
     clog('Bad token response: ' + JSON.stringify(tokenData));
@@ -231,36 +233,63 @@ async function init() {
     return;
   }
 
-  // Step 3: Init ExotelCRMWebSDK
+  // Step 3: Init ExotelCRMWebSDK — try each credential set until one registers.
+  // For single-entry agents this runs once. For Khushil (two entries) it tries
+  // the highest AppUserId first, then falls back to the second if that times out.
   setStatus('Connecting softphone...');
+  await tryInitWithCredentials(accessToken, credentials, 0);
+}
+
+// ── Multi-credential SDK init ─────────────────────────────────
+// Tries each credential set in `creds` (index i) until one registers.
+// If a set times out (30 s) without a regEvent, moves to the next.
+// Only falls back to scheduleRetry() after all sets are exhausted.
+async function tryInitWithCredentials(accessToken, creds, i) {
+  if (i >= creds.length) {
+    clog('All ' + creds.length + ' credential(s) exhausted — scheduling retry');
+    setReg('failed');
+    setStatus('SIP register failed — retrying');
+    scheduleRetry();
+    return;
+  }
+
+  const cred      = creds[i];
+  const appUserId = String(cred.app_user_id || '');
+  if (!appUserId) {
+    clog('Credential #' + i + ' has no app_user_id — skipping');
+    return tryInitWithCredentials(accessToken, creds, i + 1);
+  }
+
   try {
     if (typeof ExotelCRMWebSDK === 'undefined') {
       throw new Error('ExotelCRMWebSDK not loaded — crmBundle.js missing');
     }
 
-    clog('new ExotelCRMWebSDK(token[0..20]=' + accessToken.slice(0,20) + '... userId=' + appUserId + ')');
+    clog('SDK init attempt ' + (i+1) + '/' + creds.length +
+         ' — token[0..20]=' + accessToken.slice(0,20) +
+         '... userId=' + appUserId);
     const crmWebSDK = new ExotelCRMWebSDK(accessToken, appUserId, true);
 
     let regFired = false;
     const regTimeout = setTimeout(() => {
       if (!sdkReady && !regFired) {
-        clog('regEvent not fired in 30s — wrong credentials or network issue');
-        setReg('failed');
-        setStatus('SIP register timeout — retrying');
-        scheduleRetry();
+        clog('regEvent not fired in 30 s for userId=' + appUserId +
+             ' — trying next credential (' + (i+1) + '/' + creds.length + ')');
+        setStatus('Trying next credential...');
+        tryInitWithCredentials(accessToken, creds, i + 1);
       }
     }, 30000);
 
     function registrationEventHandler(state, phone) {
+      if (regFired) return;   // guard: ignore late events from a previous attempt
       regFired = true;
       clearTimeout(regTimeout);
-      clog('regEvent state=' + state + ' phone=' + phone);
+      clog('regEvent state=' + state + ' phone=' + phone + ' userId=' + appUserId);
 
       if (state === 'registered') {
         sdkReady    = true;
         initRetries = 0;
         if (!webPhone) {
-          // SDK returned void — create proxy
           webPhone = {
             MakeCall:   (n, a, b) => crmWebSDK.MakeCall   ? crmWebSDK.MakeCall(n, a, b)   : Promise.resolve(),
             AcceptCall: ()        => crmWebSDK.AcceptCall  ? crmWebSDK.AcceptCall()         : Promise.resolve(),
@@ -271,29 +300,24 @@ async function init() {
         setStatus('✅ Ready — ' + (phone || appUserId));
         startPoll();
       } else if (state === 'terminated' || state === 'unregistered') {
-        sdkReady = false;
-        setReg('failed');
-        setStatus('SIP ' + state + ' — retrying...');
-        scheduleRetry();
+        // Hard failure on this credential — move on immediately
+        clog('regEvent ' + state + ' for userId=' + appUserId + ' — trying next');
+        tryInitWithCredentials(accessToken, creds, i + 1);
       }
-      // 'sent request' / transient states: wait, don't retry
+      // 'sent request' / other transient states: wait for regTimeout
     }
 
     webPhone = await crmWebSDK.Initialize(handleCallEvent, registrationEventHandler);
     releaseMic();
 
-    clog('Initialize() resolved. webPhone=' + (webPhone ? typeof webPhone : 'null/void'));
-
-    if (webPhone && !sdkReady && !regFired) {
-      // SDK returned phone object before regEvent — wait for regEvent (already set timeout)
-    }
+    clog('Initialize() resolved. webPhone=' + (webPhone ? typeof webPhone : 'null/void') +
+         ' userId=' + appUserId);
 
   } catch (err) {
     releaseMic();
-    setReg('failed');
-    setStatus('SDK error: ' + err.message);
-    clog('SDK FAILED: ' + err.message);
-    scheduleRetry();
+    clog('SDK FAILED userId=' + appUserId + ': ' + err.message);
+    // Hard JS error — try next credential immediately
+    tryInitWithCredentials(accessToken, creds, i + 1);
   }
 }
 
