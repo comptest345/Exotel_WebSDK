@@ -34,6 +34,26 @@ let   pendingInboundCall = null;
 const inboundCallMap   = {};
 let   pollCount = 0;
 
+// ── SSE client registry ───────────────────────────────────────────
+// sseClients: email → Express Response object (one per agent tab)
+// When a call event arrives we push it instantly instead of waiting for a poll.
+const sseClients = {};  // email → res
+
+function ssePush(email, event, data) {
+  const key = (email || '').toLowerCase();
+  const client = sseClients[key];
+  if (!client) return false;
+  try {
+    client.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    console.log(`[SSE] Pushed '${event}' to ${key}`);
+    return true;
+  } catch (e) {
+    console.warn(`[SSE] Push failed for ${key}:`, e.message);
+    delete sseClients[key];
+    return false;
+  }
+}
+
 // ── Token cache ───────────────────────────────────────────────────
 let _appTokenCache = null;
 let _appTokenExp   = 0;
@@ -241,8 +261,13 @@ app.post('/bx24-call-start', async (req, res) => {
       // Store by bx24UserId as fallback so poll can still find it
       pendingCallMap['bx24_' + bx24UserId] = { number, callId, ts: Date.now() };
     } else {
-      pendingCallMap[email.toLowerCase()] = { number, callId, ts: Date.now() };
-      console.log(`[BX24-CallStart] Queued for ${email} → ${number}`);
+      const key = email.toLowerCase();
+      // Try instant SSE push first; fall back to poll queue if popup isn't connected yet
+      const pushed = ssePush(key, 'outbound_call', { number, callId });
+      if (!pushed) {
+        pendingCallMap[key] = { number, callId, ts: Date.now() };
+        console.log(`[BX24-CallStart] Queued (no SSE) for ${email} → ${number}`);
+      }
     }
     res.json({ status: 'ok' });
   } catch (e) { res.json({ status: 'error', message: e.message }); }
@@ -272,6 +297,51 @@ app.get('/pending-call', (req, res) => {
   }
 });
 
+// ── SSE subscription endpoint ────────────────────────────────────
+// popup.js connects here on open. Server pushes call events instantly.
+// One connection per agent email. New tab replaces old (last-write-wins).
+app.get('/events', (req, res) => {
+  const email = (req.query.email || '').toLowerCase();
+  if (!email) return res.status(400).end('email required');
+
+  // SSE headers
+  res.set({
+    'Content-Type':  'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection':    'keep-alive',
+    'X-Accel-Buffering': 'no'   // disable Nginx buffering on Render
+  });
+  res.flushHeaders();
+
+  // Replace any existing connection for this agent
+  if (sseClients[email]) {
+    try { sseClients[email].end(); } catch (_) {}
+  }
+  sseClients[email] = res;
+  console.log(`[SSE] Agent connected: ${email} (active: ${Object.keys(sseClients).length})`);
+
+  // Heartbeat every 20 s to keep the connection alive through Render's idle timeout
+  const hb = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch (_) { clearInterval(hb); }
+  }, 20000);
+
+  // If there's already a pending call queued for this agent, flush it immediately
+  const entry = pendingCallMap[email];
+  if (entry && (Date.now() - entry.ts) < 30000) {
+    delete pendingCallMap[email];
+    console.log(`[SSE] Flushing queued call to ${email}: ${entry.number}`);
+    ssePush(email, 'outbound_call', { number: entry.number, callId: entry.callId });
+  }
+
+  req.on('close', () => {
+    clearInterval(hb);
+    if (sseClients[email] === res) {
+      delete sseClients[email];
+      console.log(`[SSE] Agent disconnected: ${email}`);
+    }
+  });
+});
+
 // ── Incoming call (Exotel webhook) ────────────────────────────────
 app.all('/incoming-call', async (req, res) => {
   const p  = Object.assign({}, req.query, req.body);
@@ -290,8 +360,15 @@ app.all('/incoming-call', async (req, res) => {
       const bxId = (r && r.CALL_ID) || sid;
       inboundCallMap[sid] = bxId;
       pendingInboundCall  = { from, callSid: bxId, ts: Date.now() };
+      // Push to all connected SSE agents (inbound goes to whoever is online)
+      Object.keys(sseClients).forEach(agentEmail =>
+        ssePush(agentEmail, 'inbound_call', { from, callSid: bxId })
+      );
     } else {
       pendingInboundCall = { from, callSid: sid, ts: Date.now() };
+      Object.keys(sseClients).forEach(agentEmail =>
+        ssePush(agentEmail, 'inbound_call', { from, callSid: sid })
+      );
     }
     res.json({ status: 'received' });
   } catch (e) { console.error('[Incoming]', e.message); res.json({ status: 'error', message: e.message }); }
