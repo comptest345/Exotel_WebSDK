@@ -297,7 +297,7 @@ app.get('/pending-call', (req, res) => {
   if (!key) return res.json({ pending: false, reason: 'no_key' });
 
   const entry = pendingCallMap[key];
-  if (entry && (Date.now() - entry.ts) < 30000) {
+  if (entry && (Date.now() - entry.ts) < 60000) {  // 60 s: BX24 bridge init can take up to 30 s
     delete pendingCallMap[key];
     console.log(`[Poll] Delivering call to ${key}: ${entry.number}`);
     res.json({ pending: true, number: entry.number, callId: entry.callId });
@@ -337,7 +337,7 @@ app.get('/events', (req, res) => {
 
   // If there's already a pending call queued for this agent, flush it immediately
   const entry = pendingCallMap[email];
-  if (entry && (Date.now() - entry.ts) < 30000) {
+  if (entry && (Date.now() - entry.ts) < 60000) {  // 60 s: matches poll endpoint TTL
     delete pendingCallMap[email];
     console.log(`[SSE] Flushing queued call to ${email}: ${entry.number}`);
     ssePush(email, 'outbound_call', { number: entry.number, callId: entry.callId });
