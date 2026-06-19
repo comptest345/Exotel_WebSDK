@@ -379,14 +379,23 @@ app.get('/pending-call', (req, res) => {
     res.json({ pending: true, type: 'outbound', number: entry.number, callId: entry.callId });
   } else {
     if (entry) delete pendingCallMap[key];
-    // Also check for any unclaimed inbound call this agent may have missed
-    // (read-only: do NOT delete — other agents may still need to claim it)
+    // Also check for any unclaimed inbound call this agent may have missed via SSE.
+    // IMPORTANT: skip calls that are already claimed — don't re-show to polling agents.
+    // (read-only: do NOT delete — other agents may still need to see the result)
     const inbound = Object.entries(pendingInboundMap).find(
       ([sid, d]) => !inboundClaimMap[sid] && (Date.now() - d.ts) < 60000
     );
     if (inbound) {
       const [sid, d] = inbound;
       return res.json({ pending: true, type: 'inbound', from: d.from, callSid: sid });
+    }
+    // If the most recent inbound call IS claimed, tell the client so it can dismiss cleanly.
+    const claimed = Object.entries(pendingInboundMap).find(
+      ([sid, d]) => !!inboundClaimMap[sid] && (Date.now() - d.ts) < 60000
+    );
+    if (claimed) {
+      const [sid] = claimed;
+      return res.json({ pending: false, type: 'claimed', callSid: sid, claimedBy: inboundClaimMap[sid].email });
     }
     res.json({ pending: false });
   }
@@ -437,6 +446,12 @@ app.get('/events', (req, res) => {
   });
 });
 
+// ── Claimed SIDs registry ─────────────────────────────────────────────────
+// Once an agent claims a call, we record the sid here so that any duplicate
+// Exotel Dial webhooks (Exotel retries the webhook once per SIP leg tried)
+// don't cause a second broadcast to all agents.
+const claimedSids = new Set();
+
 // ── Incoming call (Exotel webhook) ────────────────────────────────
 app.all('/incoming-call', async (req, res) => {
   const p  = Object.assign({}, req.query, req.body);
@@ -447,6 +462,13 @@ app.all('/incoming-call', async (req, res) => {
     const from  = p.From || p.CallFrom || p.caller_id || p.CallerId || p.callerid || 'Unknown';
     const sid   = p.CallSid || p.call_sid || ('in_' + Date.now());
     const toNum = p.To || p.DialWhomNumber || p.CallTo || VIRTUAL_NUMBER || 'Unknown';
+
+    // Block re-broadcast if this call was already claimed (Exotel sends one
+    // Dial webhook per SIP leg it tries — we only want the first broadcast).
+    if (claimedSids.has(sid)) {
+      console.log(`[Incoming] SKIP broadcast — ${sid} already claimed`);
+      return res.json({ status: 'already_claimed' });
+    }
 
     // Store the call so: (a) agents that missed the SSE get it via poll,
     // (b) /claim-call can read 'from' when registering with BX24.
@@ -481,6 +503,7 @@ app.post('/claim-call', async (req, res) => {
   }
 
   inboundClaimMap[callSid] = { email, bx24UserId: bx24UserId || null, bx24CallId: null, ts: Date.now() };
+  claimedSids.add(callSid);  // prevent re-broadcast on duplicate Exotel webhooks
   console.log(`[Claim] ${email} claimed ${callSid}`);
 
   // Register the call in BX24 under the claiming agent's user ID.
@@ -533,6 +556,7 @@ app.all('/call-callback', async (req, res) => {
     const agentId  = claim ? (claim.bx24UserId || BX24_USER_ID) : BX24_USER_ID;
     if (claim)  delete inboundClaimMap[sid];
     if (pendingInboundMap[sid]) delete pendingInboundMap[sid];
+    claimedSids.delete(sid);  // release so memory doesn't grow forever
 
     if (BX24_WEBHOOK && bx24Id)
       await bx24Call('telephony.externalcall.finish', {
