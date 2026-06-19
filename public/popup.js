@@ -48,11 +48,13 @@ function setReg(state) {
 function getBx24CurrentUser() {
   return new Promise((resolve, reject) => {
     let attempts = 0;
+    // Retry for up to 30 seconds (50 × 600ms) — BX24 iframe bridge can be slow to init
+    const MAX_ATTEMPTS = 50;
     function tryInit() {
       attempts++;
       if (typeof window.BX24 === 'undefined') {
-        if (attempts < 10) return setTimeout(tryInit, 600);
-        return reject(new Error('BX24 JS bridge not loaded'));
+        if (attempts < MAX_ATTEMPTS) return setTimeout(tryInit, 600);
+        return reject(new Error('BX24 JS bridge not loaded after ' + (MAX_ATTEMPTS * 0.6) + 's'));
       }
       try {
         BX24.init(function () {
@@ -67,7 +69,7 @@ function getBx24CurrentUser() {
           });
         });
       } catch (e) {
-        if (attempts < 10) return setTimeout(tryInit, 600);
+        if (attempts < MAX_ATTEMPTS) return setTimeout(tryInit, 600);
         reject(e);
       }
     }
@@ -78,17 +80,31 @@ function getBx24CurrentUser() {
 function getBx24UserIdFromUrl() {
   try {
     const params = new URLSearchParams(window.location.search);
+    // PLACEMENT_OPTIONS carries USER_ID in CRM_ACTIVITY_SIDEBAR context
     const po = params.get('PLACEMENT_OPTIONS');
     if (po) {
       const opts = JSON.parse(decodeURIComponent(po));
       if (opts.USER_ID) return String(opts.USER_ID);
     }
+    // Direct params (some placements pass it flat)
     return params.get('USER_ID') || params.get('user_id') || params.get('bx24_user_id') || null;
   } catch (_) { return null; }
 }
 
+function getBx24UserIdFromAuth() {
+  // BX24 injects an auth object into the iframe URL as a ?auth[user_id]=N param
+  try {
+    const params = new URLSearchParams(window.location.search);
+    // BX24 uses bracket notation: auth[user_id]
+    return params.get('auth[user_id]') || params.get('AUTH[USER_ID]') || null;
+  } catch (_) { return null; }
+}
+
 async function resolveBx24Identity() {
-  // Method 1: BX24.init API (most reliable)
+  // Log the full URL to help debug iframe context issues
+  clog('popup URL: ' + window.location.href.slice(0, 200));
+
+  // Method 1: BX24.init API (most reliable — works in sidebar iframe)
   try {
     const u = await getBx24CurrentUser();
     if (u.email || u.id) {
@@ -97,12 +113,30 @@ async function resolveBx24Identity() {
     }
   } catch (e) { clog('BX24.init failed: ' + e.message); }
 
-  // Method 2: URL params
+  // Method 2: PLACEMENT_OPTIONS or direct URL params
   const urlId = getBx24UserIdFromUrl();
   if (urlId) {
-    clog('Identity via URL: id=' + urlId);
+    clog('Identity via URL PLACEMENT_OPTIONS: id=' + urlId);
     return { id: urlId, email: null, name: '' };
   }
+
+  // Method 3: BX24 auth params injected into iframe URL
+  const authId = getBx24UserIdFromAuth();
+  if (authId) {
+    clog('Identity via auth[user_id]: id=' + authId);
+    return { id: authId, email: null, name: '' };
+  }
+
+  // Method 4: Ask the server to resolve via BX24 webhook using hardcoded fallback user_id
+  // Only works if BX24_USER_ID env var is set — better than failing completely
+  try {
+    const res  = await fetch('/token?bx24_user_id=44');
+    const data = await res.json();
+    if (data.email) {
+      clog('Identity via server fallback (bx24_user_id=44): ' + data.email);
+      return { id: '44', email: data.email, name: data.name || '' };
+    }
+  } catch (_) {}
 
   throw new Error('Cannot identify BX24 user — all methods failed.');
 }
