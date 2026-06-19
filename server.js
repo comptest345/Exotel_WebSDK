@@ -269,14 +269,30 @@ async function syncUsers() {
     }
 
     // 4. DELETE users removed from CCM
+    // Exotel's DELETE endpoint accepts ExotelUserId (internal UUID), not AppUserId.
+    // Try ExotelUserId first, then AppUserId, then SIP username as last resort.
     const toRemove = allMapped.filter(u => u.Email && !ccmByEmail[u.Email.toLowerCase()]);
     for (const u of toRemove) {
-      console.log(`[Sync] Removing ${u.Email} (AppUserId=${u.AppUserId})`);
-      const delRes = await fetch(`${BASE}/usermapping/${encodeURIComponent(u.AppUserId)}`, {
-        method: 'DELETE', headers: { 'Authorization': at }
-      });
-      if (delRes.ok) console.log(`[Sync] Removed: ${u.Email}`);
-      else console.warn(`[Sync] Remove failed for ${u.Email}: ${await delRes.text()}`);
+      console.log(`[Sync] Removing ${u.Email} (AppUserId=${u.AppUserId} ExotelUserId=${u.ExotelUserId || 'n/a'})`);
+      const sipUsername = u.SipId ? u.SipId.replace(/^sip:/, '') : null;
+      const candidates = [u.ExotelUserId, u.AppUserId, sipUsername].filter(Boolean);
+      let deleted = false;
+      for (const key of candidates) {
+        const delRes = await fetch(`${BASE}/usermapping/${encodeURIComponent(key)}`, {
+          method: 'DELETE', headers: { 'Authorization': at }
+        });
+        const body = await delRes.text();
+        if (delRes.ok) {
+          console.log(`[Sync] Removed ${u.Email} using key=${key}`);
+          deleted = true;
+          break;
+        }
+        console.log(`[Sync] Delete key=${key} HTTP ${delRes.status}: ${body.slice(0, 120)}`);
+      }
+      if (!deleted) {
+        console.warn(`[Sync] Could not remove ${u.Email} — all keys failed (${candidates.join(', ')}). ` +
+          'Delete manually via Exotel dashboard or DELETE /delete-user/:appUserId.');
+      }
     }
 
     console.log(`[Sync] Done. Added=${toAdd.length} Removed=${toRemove.length} CCM=${ccmUsers.length} Mapped=${allMapped.length}`);
@@ -645,12 +661,26 @@ app.post('/create-user', async (req, res) => {
 
 app.delete('/delete-user/:appUserId', async (req, res) => {
   try {
-    const at  = await getAppToken();
-    const r   = await fetch(`${BASE}/usermapping/${encodeURIComponent(req.params.appUserId)}`, {
-      method: 'DELETE', headers: { 'Authorization': at }
-    });
-    if (!r.ok) throw new Error(`Delete failed [${r.status}]: ${await r.text()}`);
-    res.json({ success: true });
+    const at = await getAppToken();
+    // Try to find the user in usermapping to get ExotelUserId (the correct delete key)
+    const allUsers = await fetchAllMappedUsers(at);
+    const target = allUsers.find(u => u.AppUserId === req.params.appUserId);
+    const sipUsername = target && target.SipId ? target.SipId.replace(/^sip:/, '') : null;
+    const candidates = [
+      target && target.ExotelUserId,
+      req.params.appUserId,
+      sipUsername
+    ].filter(Boolean);
+
+    for (const key of candidates) {
+      const r = await fetch(`${BASE}/usermapping/${encodeURIComponent(key)}`, {
+        method: 'DELETE', headers: { 'Authorization': at }
+      });
+      if (r.ok) return res.json({ success: true, deletedKey: key });
+      const body = await r.text();
+      if (r.status !== 404) throw new Error(`Delete failed [${r.status}] key=${key}: ${body.slice(0,200)}`);
+    }
+    throw new Error(`Not found with any key: ${candidates.join(', ')}`);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
