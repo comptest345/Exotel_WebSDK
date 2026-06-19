@@ -337,13 +337,53 @@ function scheduleRetry() {
   retryTimer = setTimeout(() => { retryTimer = null; init(); }, delay);
 }
 
-// ── Pending call poll ─────────────────────────────────────────
-let pollTimer = null;
-let pollCount = 0;
+// ── SSE subscription + poll fallback ─────────────────────────
+// Primary: subscribe to /events so the server pushes calls instantly.
+// Fallback: 5 s poll on /pending-call covers the window before SSE connects
+//           and the edge case where the SSE connection drops silently.
+let sseSource  = null;
+let pollTimer  = null;
+let pollCount  = 0;
+
 function startPoll() {
-  if (pollTimer) return;
-  pollTimer = setInterval(doPoll, 2000);
+  startSSE();          // SSE is the primary channel
+  startPollFallback(); // poll runs alongside as safety net
 }
+
+function startSSE() {
+  if (sseSource) return; // already connected
+  if (!currentUserEmail) return;
+  const url = '/events?email=' + encodeURIComponent(currentUserEmail);
+  clog('SSE connecting: ' + url);
+  sseSource = new EventSource(url);
+
+  sseSource.addEventListener('outbound_call', async (e) => {
+    const d = JSON.parse(e.data);
+    clog('SSE outbound_call: ' + d.number);
+    const phoneEl = document.getElementById('phone');
+    if (phoneEl) phoneEl.value = d.number;
+    callDirection = 'outbound';
+    await triggerOutboundCall(d.number);
+  });
+
+  sseSource.addEventListener('inbound_call', async (e) => {
+    const d = JSON.parse(e.data);
+    clog('SSE inbound_call from: ' + d.from);
+    showIncoming(d.from);
+  });
+
+  sseSource.onopen  = () => clog('SSE connected');
+  sseSource.onerror = (err) => {
+    clog('SSE error — will rely on poll fallback');
+    // EventSource auto-reconnects; no need to do anything
+  };
+}
+
+function startPollFallback() {
+  if (pollTimer) return;
+  pollTimer = setInterval(doPoll, 5000); // reduced frequency — SSE handles real-time
+}
+
 async function doPoll() {
   if (!currentUserEmail && !currentBx24UserId) return;
   try {
@@ -353,9 +393,9 @@ async function doPoll() {
     const res  = await fetch(url);
     const data = await res.json();
     pollCount++;
-    if (pollCount % 30 === 1) clog('poll#' + pollCount + ' email=' + currentUserEmail);
+    if (pollCount % 12 === 1) clog('poll#' + pollCount + ' email=' + currentUserEmail);
     if (data.pending && data.number) {
-      clog('Click-to-call: ' + data.number);
+      clog('Poll fallback caught call: ' + data.number);
       callDirection = 'outbound';
       const phoneEl = document.getElementById('phone');
       if (phoneEl) phoneEl.value = data.number;
