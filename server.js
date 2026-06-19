@@ -135,14 +135,24 @@ async function syncUsers() {
     const ccmRes   = await fetch(`${BASE}/user?entity=customer`, { headers: { 'Authorization': ct } });
     const ccmRaw   = await ccmRes.text();
     console.log('[Sync] CCM raw (first 300):', ccmRaw.slice(0, 300));
+    // SAFETY: if CCM fetch fails (404, HTML error page, bad JSON) — abort entirely.
+    // Never delete usermapping entries based on a failed CCM response.
+    if (!ccmRes.ok) {
+      console.error(`[Sync] CCM fetch failed HTTP ${ccmRes.status} — aborting sync to protect usermapping`);
+      return { error: `CCM HTTP ${ccmRes.status}: ${ccmRaw.slice(0, 200)}` };
+    }
     let ccmData;
     try { ccmData = JSON.parse(ccmRaw); }
     catch (parseErr) {
-      console.error('[Sync] CCM JSON parse failed. HTTP ' + ccmRes.status + ' Body:', ccmRaw.slice(0, 500));
-      // Don't crash sync — skip CCM add/delete but let usermapping still work
-      ccmData = { Data: [] };
+      console.error('[Sync] CCM JSON parse failed — aborting sync to protect usermapping. Body:', ccmRaw.slice(0, 300));
+      return { error: 'CCM response not JSON — sync aborted' };
     }
     const ccmUsers = Array.isArray(ccmData.Data) ? ccmData.Data : [];
+    // Safety: if API returned 0 users something is wrong — skip deletes
+    if (ccmUsers.length === 0) {
+      console.warn('[Sync] CCM returned 0 users — skipping add/delete to protect usermapping');
+      return { skipped: true, reason: 'ccm_empty' };
+    }
     console.log(`[Sync] CCM users: ${ccmUsers.length}`);
 
     const ccmByEmail = {};
