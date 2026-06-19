@@ -174,6 +174,22 @@ function showActive(num) {
   document.getElementById('callBtn').style.display       = 'none';
   startTimer();
 }
+// Shows a "ringing" state for outbound calls: the SIP leg to Exotel is up,
+// but the customer hasn't answered yet. Active panel is visible (agent can
+// hang up) but the timer does NOT start until customer actually answers.
+function showOutboundRinging(num) {
+  const el = document.getElementById('activeNum');
+  if (el) el.textContent = '🔔 ' + (num || 'Calling...');
+  document.getElementById('incomingPanel').style.display = 'none';
+  document.getElementById('activePanel').style.display   = 'block';
+  document.getElementById('dialerPanel').style.display   = 'none';
+  document.getElementById('hangupBtn').style.display     = 'block';
+  document.getElementById('callBtn').style.display       = 'none';
+  stopTimer();
+  const timerEl = document.getElementById('timerEl');
+  if (timerEl) timerEl.textContent = 'Ringing...';
+}
+
 function showDialer() {
   callDirection = null;
   document.getElementById('incomingPanel').style.display = 'none';
@@ -443,13 +459,24 @@ function handleCallEvent(event) {
   const type = ((event && (event.event || event.EventType || event.type || event.state)) || '').toLowerCase();
 
   const isIncoming  = type.includes('incoming') || type.includes('ringing') || raw.includes('incoming') || raw.includes('ringing');
-  const isConnected = type.includes('connect')  || type.includes('answer')  || type.includes('accept')  || type.includes('active') || raw.includes('accepted') || raw.includes('connected');
   const isEnded     = type.includes('end')      || type.includes('terminat')|| type.includes('bye')     || type.includes('complet') || raw.includes('callended') || raw.includes('call_completed');
+
+  // BUG FIX: For outbound calls, 'accept'/'accepted' fires when AcceptCall()
+  // resolves on the agent's own SIP leg — the customer's phone is still ringing
+  // at this point. Only 'connect', 'answer', or 'active' mean the customer answered.
+  // For inbound calls, 'accept' correctly means the agent accepted and the call is live.
+  const isAcceptEvent = type.includes('accept') || raw.includes('accepted');
+  const isConnected   =
+    type.includes('connect') || type.includes('answer') || type.includes('active') || raw.includes('connected')
+    || (isAcceptEvent && callDirection !== 'outbound');
 
   if (isIncoming) {
     if (callDirection === 'outbound') {
-      clog('Outbound SIP ring → silent AcceptCall');
+      clog('Outbound SIP ring → silent AcceptCall, showing ringing UI');
       if (webPhone) webPhone.AcceptCall().catch(e => clog('silentAccept err: ' + e.message));
+      // BUG FIX: Show "Ringing..." so the agent has feedback and can hang up.
+      // Timer does NOT start here — customer hasn't answered yet.
+      showOutboundRinging(document.getElementById('phone')?.value || '');
     } else {
       const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown';
       showIncoming(from);
@@ -458,7 +485,7 @@ function handleCallEvent(event) {
     const num = callDirection === 'inbound'
       ? (document.getElementById('callerNum')?.textContent || '')
       : (document.getElementById('phone')?.value || '');
-    showActive(num);
+    showActive(num);  // Customer answered — now start the timer
     setStatus('');
   } else if (isEnded) {
     showDialer();
