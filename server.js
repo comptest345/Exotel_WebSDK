@@ -127,45 +127,116 @@ async function fetchAllMappedUsers(at) {
   return allUsers;
 }
 
-// ── AUTO-SYNC: Exotel CCM co-workers ↔ usermapping ───────────────
-// Runs at startup and every 5 minutes.
-// ADD: any CCM user with an email not yet in usermapping → POST to usermapping
-// DELETE: any usermapping entry whose email is no longer in CCM → DELETE from usermapping
-// Email is the unique key — names can be duplicated, IDs are internal.
-async function syncUsers() {
-  console.log('[Sync] Starting...');
+// ── CCM Users API helpers ─────────────────────────────────────────
+// The correct endpoint to list Exotel CCM co-workers is:
+//   GET https://ccm-api.in.exotel.com/v2/accounts/<sid>/users   (India/Mumbai)
+//   GET https://ccm-api.exotel.com/v2/accounts/<sid>/users      (Singapore)
+// Auth: HTTP Basic with API_KEY:API_TOKEN (NOT the integration token).
+// Docs: https://developer.exotel.com/docs/users/api-reference/list-users
+
+function getCcmBaseUrl() {
+  return isIndia
+    ? `https://ccm-api.in.exotel.com/v2/accounts/${ACCOUNT_SID}/users`
+    : `https://ccm-api.exotel.com/v2/accounts/${ACCOUNT_SID}/users`;
+}
+
+function getCcmBasicAuth() {
+  return 'Basic ' + Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
+}
+
+// Fetch all CCM co-workers (paginated) — returns array of {email, first_name, last_name, id}
+async function fetchAllCcmUsers() {
+  const users = [];
+  let offset = 0;
+  const limit = 50;
+  while (true) {
+    const url = `${getCcmBaseUrl()}?fields=devices&limit=${limit}&offset=${offset}`;
+    const res  = await fetch(url, { headers: { 'Authorization': getCcmBasicAuth() } });
+    const raw  = await res.text();
+    if (!res.ok) throw new Error(`CCM Users API HTTP ${res.status}: ${raw.slice(0, 200)}`);
+    const data = JSON.parse(raw);
+    // Response: { response: [ { data: { id, email, first_name, last_name, ... } } ], metadata: { total, count } }
+    const page = (data.response || []).map(r => r.data).filter(Boolean);
+    users.push(...page);
+    const meta = data.metadata || {};
+    if (users.length >= (meta.total || users.length) || page.length < limit) break;
+    offset += limit;
+  }
+  return users;
+}
+
+// ── AUTO-REGISTER: create a usermapping entry on first login ──────
+// Called from /token when an email has no existing usermapping entry.
+async function autoRegisterUser(email, name, appToken) {
   try {
-    // 1. Get all CCM co-workers
-    const ct       = await getCustomerToken();
-    const ccmRes   = await fetch(`${BASE}/user?entity=customer`, { headers: { 'Authorization': ct } });
-    const ccmRaw   = await ccmRes.text();
-    console.log('[Sync] CCM raw (first 300):', ccmRaw.slice(0, 300));
-    // SAFETY: if CCM fetch fails (404, HTML error page, bad JSON) — abort entirely.
-    // Never delete usermapping entries based on a failed CCM response.
-    if (!ccmRes.ok) {
-      console.error(`[Sync] CCM fetch failed HTTP ${ccmRes.status} — aborting sync to protect usermapping`);
-      return { error: `CCM HTTP ${ccmRes.status}: ${ccmRaw.slice(0, 200)}` };
+    const allMapped = await fetchAllMappedUsers(appToken);
+    // Don't double-create
+    const exists = allMapped.find(u => u.Email && u.Email.toLowerCase() === email.toLowerCase());
+    if (exists) return exists;
+
+    const maxId = allMapped.length > 0
+      ? Math.max(...allMapped.map(u => parseInt(u.AppUserId) || 0))
+      : 100;
+    const newId = String(maxId + 1);
+
+    const payload = [{
+      AppUserId:        newId,
+      AppUsername:      name || email,
+      Email:            email,
+      ExotelAccountSid: ACCOUNT_SID,
+      ExotelUserName:   name || email,
+      AgentNumber:      '',
+      VirtualNumber:    VIRTUAL_NUMBER
+    }];
+
+    const addRes  = await fetch(`${BASE}/usermapping`, {
+      method:  'POST',
+      headers: { 'Authorization': appToken, 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload)
+    });
+    const addData = await addRes.json();
+    console.log(`[AutoRegister] Created usermapping for ${email} → AppUserId=${newId}:`, JSON.stringify(addData));
+
+    // Return the newly-created entry so /token can proceed immediately
+    const refreshed = await fetchAllMappedUsers(appToken);
+    return refreshed.find(u => u.Email && u.Email.toLowerCase() === email.toLowerCase()) || null;
+  } catch (e) {
+    console.error(`[AutoRegister] Failed for ${email}:`, e.message);
+    return null;
+  }
+}
+
+// ── AUTO-SYNC: CCM co-workers ↔ /usermapping ─────────────────────
+// Uses the correct CCM Users API (Basic Auth on ccm-api.in.exotel.com).
+// Runs at startup and every 5 minutes.
+// ADD: CCM users whose email isn't in usermapping yet.
+// DELETE: usermapping entries whose email no longer exists in CCM.
+async function syncUsers() {
+  console.log('[Sync] Starting CCM sync...');
+  try {
+    // 1. Fetch all co-workers from CCM Users API
+    let ccmUsers;
+    try {
+      ccmUsers = await fetchAllCcmUsers();
+    } catch (e) {
+      console.error('[Sync] CCM Users API fetch failed — aborting to protect usermapping:', e.message);
+      return { error: e.message };
     }
-    let ccmData;
-    try { ccmData = JSON.parse(ccmRaw); }
-    catch (parseErr) {
-      console.error('[Sync] CCM JSON parse failed — aborting sync to protect usermapping. Body:', ccmRaw.slice(0, 300));
-      return { error: 'CCM response not JSON — sync aborted' };
-    }
-    const ccmUsers = Array.isArray(ccmData.Data) ? ccmData.Data : [];
-    // Safety: if API returned 0 users something is wrong — skip deletes
+
     if (ccmUsers.length === 0) {
-      console.warn('[Sync] CCM returned 0 users — skipping add/delete to protect usermapping');
+      console.warn('[Sync] CCM returned 0 users — skipping to protect usermapping');
       return { skipped: true, reason: 'ccm_empty' };
     }
-    console.log(`[Sync] CCM users: ${ccmUsers.length}`);
+    console.log(`[Sync] CCM co-workers: ${ccmUsers.length}`);
 
     const ccmByEmail = {};
-    ccmUsers.forEach(u => { if (u.Email) ccmByEmail[u.Email.toLowerCase()] = u; });
+    ccmUsers.forEach(u => {
+      if (u.email) ccmByEmail[u.email.toLowerCase()] = u;
+    });
 
     // 2. Get all current usermapping entries
-    const at         = await getAppToken();
-    const allMapped  = await fetchAllMappedUsers(at);
+    const at        = await getAppToken();
+    const allMapped = await fetchAllMappedUsers(at);
     const mapByEmail = {};
     allMapped.forEach(u => { if (u.Email) mapByEmail[u.Email.toLowerCase()] = u; });
     console.log(`[Sync] Mapped users: ${allMapped.length}`);
@@ -176,22 +247,22 @@ async function syncUsers() {
       : 100;
     let nextId = maxId + 1;
 
-    const toAdd = ccmUsers.filter(u => u.Email && !mapByEmail[u.Email.toLowerCase()]);
+    const toAdd = ccmUsers.filter(u => u.email && !mapByEmail[u.email.toLowerCase()]);
     if (toAdd.length > 0) {
-      console.log(`[Sync] Adding ${toAdd.length}: ${toAdd.map(u => u.Email).join(', ')}`);
+      console.log(`[Sync] Adding ${toAdd.length}: ${toAdd.map(u => u.email).join(', ')}`);
       const payload = toAdd.map(u => ({
         AppUserId:        String(nextId++),
-        AppUsername:      u.Name || u.Email,
-        Email:            u.Email,
+        AppUsername:      [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email,
+        Email:            u.email,
         ExotelAccountSid: ACCOUNT_SID,
-        ExotelUserName:   u.Name || u.Email,
-        AgentNumber:      u.AgentNumber || '',
+        ExotelUserName:   [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email,
+        AgentNumber:      '',
         VirtualNumber:    VIRTUAL_NUMBER
       }));
       const addRes  = await fetch(`${BASE}/usermapping`, {
-        method: 'POST',
+        method:  'POST',
         headers: { 'Authorization': at, 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body:    JSON.stringify(payload)
       });
       const addData = await addRes.json();
       console.log('[Sync] Add result:', JSON.stringify(addData));
@@ -208,7 +279,7 @@ async function syncUsers() {
       else console.warn(`[Sync] Remove failed for ${u.Email}: ${await delRes.text()}`);
     }
 
-    console.log(`[Sync] Done. Added=${toAdd.length} Removed=${toRemove.length}`);
+    console.log(`[Sync] Done. Added=${toAdd.length} Removed=${toRemove.length} CCM=${ccmUsers.length} Mapped=${allMapped.length}`);
     return { added: toAdd.length, removed: toRemove.length, total_ccm: ccmUsers.length, total_mapped: allMapped.length };
   } catch (e) {
     console.error('[Sync] Error:', e.message);
@@ -614,9 +685,17 @@ app.get('/token', async (req, res) => {
     if (matchedUsers.length === 0 && user) matchedUsers.push(user);
 
     if (matchedUsers.length === 0) {
-      return res.status(404).json({
-        error: `No usermapping found for ${lookupEmail}. Check /list-users.`
-      });
+      // Auto-register on first login — CCM sync endpoint not available on this plan
+      console.log(`[Token] No usermapping for ${lookupEmail} — attempting auto-register...`);
+      const newEntry = await autoRegisterUser(lookupEmail, lookupEmail, appToken);
+      if (newEntry) {
+        matchedUsers.push(newEntry);
+        console.log(`[Token] Auto-register succeeded for ${lookupEmail} → AppUserId=${newEntry.AppUserId}`);
+      } else {
+        return res.status(404).json({
+          error: `No usermapping for ${lookupEmail} and auto-register failed. Add manually via POST /create-user.`
+        });
+      }
     }
 
     // Primary credential = first match (highest AppUserId wins — most recently created)
