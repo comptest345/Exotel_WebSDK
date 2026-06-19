@@ -30,8 +30,12 @@ const SIP_FB  = isIndia ? 'voip.in1.exotel.com' : 'voip.sgp1.exotel.com';
 // pendingCallMap: email → { number, callId, ts }
 // Keyed by agent email so each agent only gets their own pending call.
 const pendingCallMap   = {};
-let   pendingInboundCall = null;
-const inboundCallMap   = {};
+// pendingInboundMap: callSid → { from, to, ts }
+// Holds every ringing inbound call until an agent claims it or it times out.
+const pendingInboundMap = {};
+// inboundClaimMap: callSid → { email, bx24UserId, bx24CallId, ts }
+// Set atomically when an agent claims a call; used by /call-callback to finish it.
+const inboundClaimMap   = {};
 let   pollCount = 0;
 
 // ── SSE client registry ───────────────────────────────────────────
@@ -299,10 +303,19 @@ app.get('/pending-call', (req, res) => {
   const entry = pendingCallMap[key];
   if (entry && (Date.now() - entry.ts) < 60000) {  // 60 s: BX24 bridge init can take up to 30 s
     delete pendingCallMap[key];
-    console.log(`[Poll] Delivering call to ${key}: ${entry.number}`);
-    res.json({ pending: true, number: entry.number, callId: entry.callId });
+    console.log(`[Poll] Delivering outbound call to ${key}: ${entry.number}`);
+    res.json({ pending: true, type: 'outbound', number: entry.number, callId: entry.callId });
   } else {
     if (entry) delete pendingCallMap[key];
+    // Also check for any unclaimed inbound call this agent may have missed
+    // (read-only: do NOT delete — other agents may still need to claim it)
+    const inbound = Object.entries(pendingInboundMap).find(
+      ([sid, d]) => !inboundClaimMap[sid] && (Date.now() - d.ts) < 60000
+    );
+    if (inbound) {
+      const [sid, d] = inbound;
+      return res.json({ pending: true, type: 'inbound', from: d.from, callSid: sid });
+    }
     res.json({ pending: false });
   }
 });
@@ -362,26 +375,74 @@ app.all('/incoming-call', async (req, res) => {
     const from  = p.From || p.CallFrom || p.caller_id || p.CallerId || p.callerid || 'Unknown';
     const sid   = p.CallSid || p.call_sid || ('in_' + Date.now());
     const toNum = p.To || p.DialWhomNumber || p.CallTo || VIRTUAL_NUMBER || 'Unknown';
-    if (BX24_WEBHOOK) {
-      const r    = await bx24Call('telephony.externalcall.register', {
-        USER_ID: BX24_USER_ID, PHONE_NUMBER: from, TYPE: 2,
-        CALL_START_DATE: new Date().toISOString(), CRM_CREATE: true, LINE_NUMBER: toNum, SHOW: 1
-      });
-      const bxId = (r && r.CALL_ID) || sid;
-      inboundCallMap[sid] = bxId;
-      pendingInboundCall  = { from, callSid: bxId, ts: Date.now() };
-      // Push to all connected SSE agents (inbound goes to whoever is online)
-      Object.keys(sseClients).forEach(agentEmail =>
-        ssePush(agentEmail, 'inbound_call', { from, callSid: bxId })
-      );
-    } else {
-      pendingInboundCall = { from, callSid: sid, ts: Date.now() };
-      Object.keys(sseClients).forEach(agentEmail =>
-        ssePush(agentEmail, 'inbound_call', { from, callSid: sid })
-      );
-    }
+
+    // Store the call so: (a) agents that missed the SSE get it via poll,
+    // (b) /claim-call can read 'from' when registering with BX24.
+    // BX24 registration is intentionally deferred to /claim-call so the CRM
+    // activity is attributed to the agent who actually answers, not a hardcoded user.
+    pendingInboundMap[sid] = { from, to: toNum, ts: Date.now() };
+
+    // Broadcast to every connected agent — all of them show the incoming UI.
+    // callSid is included so popup.js can reference it when claiming.
+    const pushed = Object.keys(sseClients).reduce((n, agentEmail) => {
+      return n + (ssePush(agentEmail, 'inbound_call', { from, callSid: sid }) ? 1 : 0);
+    }, 0);
+    console.log(`[Incoming] sid=${sid} from=${from} → broadcast to ${pushed} SSE agent(s)`);
+
     res.json({ status: 'received' });
   } catch (e) { console.error('[Incoming]', e.message); res.json({ status: 'error', message: e.message }); }
+});
+
+// ── Inbound call claim ────────────────────────────────────────────
+// Called by the first agent to click "Accept". Atomically marks the call as
+// claimed, registers it in BX24 under that agent, and tells every other
+// connected agent to dismiss their incoming UI.
+app.post('/claim-call', async (req, res) => {
+  const { callSid, email, bx24UserId } = req.body;
+  if (!callSid || !email) return res.status(400).json({ error: 'callSid and email required' });
+
+  // JS is single-threaded — this check+set is atomic; no race condition.
+  if (inboundClaimMap[callSid]) {
+    const c = inboundClaimMap[callSid];
+    console.log(`[Claim] REJECTED — ${callSid} already claimed by ${c.email}`);
+    return res.json({ claimed: false, reason: 'already_claimed', claimedBy: c.email });
+  }
+
+  inboundClaimMap[callSid] = { email, bx24UserId: bx24UserId || null, bx24CallId: null, ts: Date.now() };
+  console.log(`[Claim] ${email} claimed ${callSid}`);
+
+  // Register the call in BX24 under the claiming agent's user ID.
+  let bx24CallId = callSid;
+  const callData = pendingInboundMap[callSid];
+  if (BX24_WEBHOOK && callData) {
+    try {
+      const agentBx24Id = bx24UserId || BX24_USER_ID;
+      const r = await bx24Call('telephony.externalcall.register', {
+        USER_ID:         agentBx24Id,
+        PHONE_NUMBER:    callData.from,
+        TYPE:            2,  // inbound
+        CALL_START_DATE: new Date().toISOString(),
+        CRM_CREATE:      true,
+        LINE_NUMBER:     callData.to || VIRTUAL_NUMBER || '',
+        SHOW:            0   // popup already showed it via SSE; suppress duplicate BX24 widget
+      });
+      bx24CallId = (r && r.CALL_ID) || callSid;
+      inboundClaimMap[callSid].bx24CallId = bx24CallId;
+      console.log(`[Claim] BX24 registered: CALL_ID=${bx24CallId} USER_ID=${agentBx24Id}`);
+    } catch (e) {
+      console.warn('[Claim] BX24 register failed (non-fatal):', e.message);
+    }
+  }
+
+  // Tell every OTHER agent to dismiss the incoming UI.
+  const claimerKey = email.toLowerCase();
+  Object.keys(sseClients).forEach(agentEmail => {
+    if (agentEmail !== claimerKey) {
+      ssePush(agentEmail, 'call_dismissed', { callSid, reason: 'claimed_by_other', claimedBy: email });
+    }
+  });
+
+  res.json({ claimed: true, bx24CallId });
 });
 
 // ── Call ended (Exotel webhook) ───────────────────────────────────
@@ -392,11 +453,18 @@ app.all('/call-callback', async (req, res) => {
     const sid      = p.CallSid || p.call_sid || '';
     const duration = parseInt(p.Duration || p.duration || '0');
     const status   = p.Status  || p.status  || 'completed';
-    const bxId     = inboundCallMap[sid] || sid;
-    if (inboundCallMap[sid]) delete inboundCallMap[sid];
-    if (BX24_WEBHOOK && bxId)
+
+    // Use the claiming agent's BX24 data; fall back to env BX24_USER_ID for
+    // calls that were never claimed (e.g. abandoned before any agent answered).
+    const claim    = inboundClaimMap[sid];
+    const bx24Id   = claim ? claim.bx24CallId : sid;
+    const agentId  = claim ? (claim.bx24UserId || BX24_USER_ID) : BX24_USER_ID;
+    if (claim)  delete inboundClaimMap[sid];
+    if (pendingInboundMap[sid]) delete pendingInboundMap[sid];
+
+    if (BX24_WEBHOOK && bx24Id)
       await bx24Call('telephony.externalcall.finish', {
-        CALL_ID: bxId, USER_ID: BX24_USER_ID, DURATION: duration,
+        CALL_ID: bx24Id, USER_ID: agentId, DURATION: duration,
         STATUS_CODE: status === 'completed' ? 200 : 304
       });
     res.json({ status: 'received' });
