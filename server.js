@@ -1,6 +1,7 @@
-const express = require('express');
-const fetch   = require('node-fetch');
-const path    = require('path');
+const express    = require('express');
+const fetch      = require('node-fetch');
+const path       = require('path');
+const recordings = require('./exotel-recordings');
 
 const app = express();
 app.use(express.json());
@@ -467,6 +468,17 @@ app.all('/call-callback', async (req, res) => {
         CALL_ID: bx24Id, USER_ID: agentId, DURATION: duration,
         STATUS_CODE: status === 'completed' ? 200 : 304
       });
+
+    // Auto-sync recording for this call into BX24 Activity timeline.
+    // Run async — don't block the webhook response.
+    const callFrom   = (p.From || p.CallFrom || p.caller_id || '').trim();
+    const agentEmail = claim ? claim.email : null;
+    if (callFrom) {
+      recordings.syncRecordings({ phoneNumber: callFrom, agentEmail }).catch(e =>
+        console.warn('[Callback] Recording sync failed (non-fatal):', e.message)
+      );
+    }
+
     res.json({ status: 'received' });
   } catch (e) { console.error('[Callback]', e.message); res.json({ status: 'error', message: e.message }); }
 });
@@ -654,6 +666,9 @@ app.get('/token', async (req, res) => {
 // ── Static files ──────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.static(path.join(__dirname, 'public', 'target')));
+
+// ── Recording sync routes (Exotel → BX24 Activity timeline) ──────
+recordings.init(app);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
