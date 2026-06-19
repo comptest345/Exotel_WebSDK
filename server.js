@@ -415,36 +415,66 @@ app.get('/token', async (req, res) => {
       else if (data.Data.SipId) user = data.Data;
     }
 
-    // Fallback: scan all users by email if direct lookup missed
-    if (!user) {
-      console.log(`[Token] Direct lookup missed for ${lookupEmail} — scanning all`);
-      const allUsers = await fetchAllMappedUsers(appToken);
-      user = allUsers.find(u => u.Email && u.Email.toLowerCase() === lookupEmail.toLowerCase()) || null;
+    // Always scan ALL usermapping entries for this email.
+    // Some agents (e.g. Khushil) have two entries — one per email alias —
+    // and we need to return all of them so popup.js can try each SIP credential
+    // in turn until one registers successfully.
+    const allUsers    = await fetchAllMappedUsers(appToken);
+    const matchedUsers = allUsers.filter(
+      u => u.Email && u.Email.toLowerCase() === lookupEmail.toLowerCase()
+    );
+
+    // Also include the user found by direct lookup (may have a different Email field)
+    if (user && !matchedUsers.find(u => u.AppUserId === user.AppUserId)) {
+      matchedUsers.unshift(user);
     }
 
-    if (!user) {
+    // Fallback: use whatever the direct lookup found
+    if (matchedUsers.length === 0 && user) matchedUsers.push(user);
+
+    if (matchedUsers.length === 0) {
       return res.status(404).json({
         error: `No usermapping found for ${lookupEmail}. Check /list-users.`
       });
     }
 
-    console.log('[Token] Issued:', { email: lookupEmail, AppUserId: user.AppUserId, SipId: user.SipId });
+    // Primary credential = first match (highest AppUserId wins — most recently created)
+    matchedUsers.sort((a, b) => parseInt(b.AppUserId) - parseInt(a.AppUserId));
+    const primary = matchedUsers[0];
+
+    console.log('[Token] Issued:', {
+      email:       lookupEmail,
+      credentials: matchedUsers.map(u => ({ AppUserId: u.AppUserId, SipId: u.SipId }))
+    });
 
     // SipSecret must reach the SDK RAW — no encoding.
     // Special chars like ! $ & in the password must be preserved exactly
     // so the MD5 Digest hash matches what Kamailio expects.
+    //
+    // multiCredentials: array of all credential sets for this email.
+    // popup.js will try them in order and use the first that registers.
+    // For agents with a single usermapping entry this array has length 1
+    // and behaviour is identical to before.
     res.json({
-      success:        true,
-      access_token:   appToken,   // SDK ExotelCRMWebSDK constructor arg 1
-      app_token:      appToken,
-      app_user_id:    user.AppUserId,  // SDK ExotelCRMWebSDK constructor arg 2
-      user_id:        user.AppUserId,
-      email:          user.Email,
-      sip_id:         user.SipId,
-      sip_username:   user.SipId ? user.SipId.replace(/^sip:/, '') : '',
-      sip_secret:     user.SipSecret,
-      virtual_number: user.VirtualNumber,
-      name:           user.AppUsername
+      success:           true,
+      access_token:      appToken,          // SDK constructor arg 1
+      app_token:         appToken,
+      app_user_id:       primary.AppUserId, // SDK constructor arg 2
+      user_id:           primary.AppUserId,
+      email:             primary.Email,
+      sip_id:            primary.SipId,
+      sip_username:      primary.SipId ? primary.SipId.replace(/^sip:/, '') : '',
+      sip_secret:        primary.SipSecret,
+      virtual_number:    primary.VirtualNumber,
+      name:              primary.AppUsername,
+      // All credential sets for this email (≥1 entry; >1 only for multi-mapped agents)
+      multiCredentials:  matchedUsers.map(u => ({
+        app_user_id:  u.AppUserId,
+        sip_id:       u.SipId,
+        sip_secret:   u.SipSecret,
+        virtual_number: u.VirtualNumber,
+        name:         u.AppUsername
+      }))
     });
   } catch (e) {
     console.error('[Token] Error:', e.message);
