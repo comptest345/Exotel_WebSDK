@@ -127,12 +127,14 @@ async function fetchAllMappedUsers(at) {
   return allUsers;
 }
 
-// ── CCM Users API helpers ─────────────────────────────────────────
-// The correct endpoint to list Exotel CCM co-workers is:
-//   GET https://ccm-api.in.exotel.com/v2/accounts/<sid>/users   (India/Mumbai)
-//   GET https://ccm-api.exotel.com/v2/accounts/<sid>/users      (Singapore)
-// Auth: HTTP Basic with API_KEY:API_TOKEN (NOT the integration token).
-// Docs: https://developer.exotel.com/docs/users/api-reference/list-users
+// ── CCM Users API — single source of truth ───────────────────────
+// All SIP credentials come LIVE from the CCM co-workers API.
+// No usermapping cache needed for /token — usermapping is only used for
+// the ExotelCRMWebSDK constructor token (app token), not SIP credentials.
+//
+// CCM API endpoint (Basic Auth with API_KEY:API_TOKEN):
+//   GET /v2/accounts/<sid>/users?fields=devices
+// Returns devices[] per user which contains SipId, SipSecret, VirtualNumber.
 
 function getCcmBaseUrl() {
   return isIndia
@@ -144,7 +146,40 @@ function getCcmBasicAuth() {
   return 'Basic ' + Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
 }
 
-// Fetch all CCM co-workers (paginated) — returns array of {email, first_name, last_name, id}
+// ── In-memory CCM user cache ──────────────────────────────────────
+// Refreshed every 60 seconds so /token never calls CCM on every login.
+// Maps email.toLowerCase() → CCM user object with SIP fields extracted.
+let _ccmCache    = null;   // Map<email, userObj>
+let _ccmCacheExp = 0;
+let _ccmInflight = null;
+
+async function getCcmUserMap() {
+  const now = Date.now();
+  if (_ccmCache && now < _ccmCacheExp) return _ccmCache;
+  if (_ccmInflight) return _ccmInflight;
+
+  _ccmInflight = (async () => {
+    try {
+      const users = await fetchAllCcmUsers();
+      const map   = new Map();
+      users.forEach(u => {
+        if (u.email) map.set(u.email.toLowerCase(), u);
+      });
+      _ccmCache    = map;
+      _ccmCacheExp = Date.now() + 60000; // 60 s TTL
+      console.log(`[CCM] Cache refreshed: ${map.size} users`);
+      return map;
+    } finally {
+      _ccmInflight = null;
+    }
+  })();
+  return _ccmInflight;
+}
+
+// Fetch all CCM co-workers with full device/SIP data.
+// CCM response per user (with ?fields=devices):
+//   { id, email, first_name, last_name, status,
+//     devices: [ { sip_id, sip_secret, virtual_number, device_id, ... } ] }
 async function fetchAllCcmUsers() {
   const users = [];
   let offset = 0;
@@ -155,14 +190,35 @@ async function fetchAllCcmUsers() {
     const raw  = await res.text();
     if (!res.ok) throw new Error(`CCM Users API HTTP ${res.status}: ${raw.slice(0, 200)}`);
     const data = JSON.parse(raw);
-    // Response: { response: [ { data: { id, email, first_name, last_name, ... } } ], metadata: { total, count } }
-    const page = (data.response || []).map(r => r.data).filter(Boolean);
+    console.log('[CCM] Raw sample (first user):', JSON.stringify((data.response||[])[0] || {}).slice(0,400));
+    const page = (data.response || []).map(r => r.data || r).filter(u => u && u.email);
     users.push(...page);
     const meta = data.metadata || {};
     if (users.length >= (meta.total || users.length) || page.length < limit) break;
     offset += limit;
   }
   return users;
+}
+
+// Extract SIP credential(s) for a CCM user.
+// The CCM API returns devices[] on each user when ?fields=devices is passed.
+// Each device has sip_id, sip_secret, virtual_number.
+// We return ALL devices so popup.js can try each in order (same multi-credential flow).
+function extractSipCredentials(ccmUser) {
+  const devices = ccmUser.devices || [];
+  if (devices.length === 0) {
+    // Fallback: some CCM responses put sip fields directly on the user object
+    const sipId = ccmUser.sip_id || ccmUser.sipId || ccmUser.SipId || '';
+    const sipSecret = ccmUser.sip_secret || ccmUser.sipSecret || ccmUser.SipSecret || '';
+    const vn = ccmUser.virtual_number || ccmUser.VirtualNumber || VIRTUAL_NUMBER || '';
+    if (sipId) return [{ sip_id: sipId, sip_secret: sipSecret, virtual_number: vn }];
+    return [];
+  }
+  return devices.map(d => ({
+    sip_id:         d.sip_id        || d.SipId        || '',
+    sip_secret:     d.sip_secret    || d.SipSecret    || '',
+    virtual_number: d.virtual_number|| d.VirtualNumber|| VIRTUAL_NUMBER || ''
+  })).filter(d => d.sip_id);
 }
 
 // ── AUTO-REGISTER: create a usermapping entry on first login ──────
@@ -295,6 +351,8 @@ async function syncUsers() {
       }
     }
 
+    // Invalidate CCM cache so next /token call gets fresh SIP credentials
+    _ccmCache = null;
     console.log(`[Sync] Done. Added=${toAdd.length} Removed=${toRemove.length} CCM=${ccmUsers.length} Mapped=${allMapped.length}`);
     return { added: toAdd.length, removed: toRemove.length, total_ccm: ccmUsers.length, total_mapped: allMapped.length };
   } catch (e) {
@@ -627,12 +685,26 @@ app.get('/setup', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── /list-users — returns all usermapping entries (your source of truth) ──
+// ── /list-users — returns LIVE CCM co-worker data (always up to date) ──
+// Shows every agent with their current SIP device status, exactly as
+// the Exotel dashboard shows. No stale usermapping cache.
 app.get('/list-users', async (req, res) => {
   try {
-    const at    = await getAppToken();
-    const users = await fetchAllMappedUsers(at);
-    res.json({ total: users.length, users });
+    _ccmCache = null; // force a fresh fetch so this is always live
+    const ccmMap = await getCcmUserMap();
+    const users  = Array.from(ccmMap.values()).map(u => {
+      const creds = extractSipCredentials(u);
+      return {
+        email:         u.email,
+        name:          [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email,
+        ccm_id:        u.id,
+        status:        u.status || 'unknown',
+        sip_devices:   creds.map(c => ({ sip_id: c.sip_id, virtual_number: c.virtual_number })),
+        has_sip:       creds.length > 0,
+        raw:           u   // full CCM object for debugging
+      };
+    });
+    res.json({ total: users.length, source: 'ccm_live', users });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -685,116 +757,89 @@ app.delete('/delete-user/:appUserId', async (req, res) => {
 });
 
 // ── /token — THE critical endpoint ───────────────────────────────
-// popup.js sends ?user_id=agent@email.com (resolved from BX24.user.current)
-// We look up by email in usermapping → return the correct SipSecret for that agent.
-// Email is unique per agent — this is the correct bridge between BX24 and Exotel.
+// Looks up the agent by email in the LIVE CCM co-workers list.
+// This guarantees SIP credentials are always fresh — no stale usermapping cache.
+// The app token (for the SDK constructor) still comes from the Exotel integration API.
 app.get('/token', async (req, res) => {
   try {
     const { user_id, bx24_user_id } = req.query;
     let lookupEmail = user_id;
 
-    // If popup sends bx24_user_id instead of email, try to resolve from cache
     if (!lookupEmail && bx24_user_id) {
-      lookupEmail = bx24EmailCache[bx24_user_id] || null;
-      if (!lookupEmail) {
-        // Try fetching from BX24 now
-        lookupEmail = await getBx24UserEmail(bx24_user_id);
-      }
-      if (!lookupEmail) {
+      lookupEmail = bx24EmailCache[bx24_user_id] || await getBx24UserEmail(bx24_user_id);
+      if (!lookupEmail)
         return res.status(400).json({ error: `Cannot resolve email for BX24 user ${bx24_user_id}` });
-      }
     }
     if (!lookupEmail) return res.status(400).json({ error: 'user_id (email) required' });
 
-    const appToken  = await getAppToken();
+    // Fetch app token (for SDK constructor) and live CCM data in parallel
+    const [appToken, ccmMap] = await Promise.all([getAppToken(), getCcmUserMap()]);
 
-    // Direct lookup by email
-    const r    = await fetch(`${BASE}/usermapping?user_id=${encodeURIComponent(lookupEmail)}`, {
-      headers: { 'Authorization': appToken }
-    });
-    const data = await r.json();
-
-    let user = null;
-    if (data.Data) {
-      if (Array.isArray(data.Data)) user = data.Data[0] || null;
-      else if (data.Data.Users && data.Data.Users.length > 0) user = data.Data.Users[0];
-      else if (data.Data.SipId) user = data.Data;
-    }
-
-    // Always scan ALL usermapping entries for this email.
-    // Some agents (e.g. Khushil) have two entries — one per email alias —
-    // and we need to return all of them so popup.js can try each SIP credential
-    // in turn until one registers successfully.
-    const allUsers    = await fetchAllMappedUsers(appToken);
-    const matchedUsers = allUsers.filter(
-      u => u.Email && u.Email.toLowerCase() === lookupEmail.toLowerCase()
-    );
-
-    // Also include the user found by direct lookup (may have a different Email field)
-    if (user && !matchedUsers.find(u => u.AppUserId === user.AppUserId)) {
-      matchedUsers.unshift(user);
-    }
-
-    // Fallback: use whatever the direct lookup found
-    if (matchedUsers.length === 0 && user) matchedUsers.push(user);
-
-    if (matchedUsers.length === 0) {
-      // Auto-register on first login — CCM sync endpoint not available on this plan
-      console.log(`[Token] No usermapping for ${lookupEmail} — attempting auto-register...`);
-      const newEntry = await autoRegisterUser(lookupEmail, lookupEmail, appToken);
-      if (newEntry) {
-        matchedUsers.push(newEntry);
-        console.log(`[Token] Auto-register succeeded for ${lookupEmail} → AppUserId=${newEntry.AppUserId}`);
-      } else {
+    const ccmUser = ccmMap.get(lookupEmail.toLowerCase());
+    if (!ccmUser) {
+      // Force a cache refresh in case user was just added
+      _ccmCache = null;
+      const freshMap = await getCcmUserMap();
+      const freshUser = freshMap.get(lookupEmail.toLowerCase());
+      if (!freshUser) {
         return res.status(404).json({
-          error: `No usermapping for ${lookupEmail} and auto-register failed. Add manually via POST /create-user.`
+          error: `${lookupEmail} not found in Exotel co-workers. Add them in the Exotel dashboard first.`
         });
       }
+      Object.assign(ccmUser || {}, freshUser);
+      // Re-assign for below
+      const creds = extractSipCredentials(freshUser);
+      return sendTokenResponse(res, appToken, freshUser, creds, lookupEmail);
     }
 
-    // Primary credential = first match (highest AppUserId wins — most recently created)
-    matchedUsers.sort((a, b) => parseInt(b.AppUserId) - parseInt(a.AppUserId));
-    const primary = matchedUsers[0];
+    const creds = extractSipCredentials(ccmUser);
+    if (creds.length === 0) {
+      return res.status(500).json({
+        error: `${lookupEmail} found in CCM but has no SIP device assigned. ` +
+          'Check the Exotel dashboard — their softphone may be UNVERIFIED or not set up.'
+      });
+    }
 
-    console.log('[Token] Issued:', {
-      email:       lookupEmail,
-      credentials: matchedUsers.map(u => ({ AppUserId: u.AppUserId, SipId: u.SipId }))
-    });
-
-    // SipSecret must reach the SDK RAW — no encoding.
-    // Special chars like ! $ & in the password must be preserved exactly
-    // so the MD5 Digest hash matches what Kamailio expects.
-    //
-    // multiCredentials: array of all credential sets for this email.
-    // popup.js will try them in order and use the first that registers.
-    // For agents with a single usermapping entry this array has length 1
-    // and behaviour is identical to before.
-    res.json({
-      success:           true,
-      access_token:      appToken,          // SDK constructor arg 1
-      app_token:         appToken,
-      app_user_id:       primary.AppUserId, // SDK constructor arg 2
-      user_id:           primary.AppUserId,
-      email:             primary.Email,
-      sip_id:            primary.SipId,
-      sip_username:      primary.SipId ? primary.SipId.replace(/^sip:/, '') : '',
-      sip_secret:        primary.SipSecret,
-      virtual_number:    primary.VirtualNumber,
-      name:              primary.AppUsername,
-      // All credential sets for this email (≥1 entry; >1 only for multi-mapped agents)
-      multiCredentials:  matchedUsers.map(u => ({
-        app_user_id:  u.AppUserId,
-        sip_id:       u.SipId,
-        sip_secret:   u.SipSecret,
-        virtual_number: u.VirtualNumber,
-        name:         u.AppUsername
-      }))
-    });
+    return sendTokenResponse(res, appToken, ccmUser, creds, lookupEmail);
   } catch (e) {
     console.error('[Token] Error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
+
+function sendTokenResponse(res, appToken, ccmUser, creds, email) {
+  // Use the CCM user id as the AppUserId (stable, unique per Exotel account)
+  const appUserId = String(ccmUser.id || ccmUser.ExotelUserId || creds[0].sip_id.replace(/[^a-z0-9]/gi,'') || email);
+  const primary   = creds[0];
+  const name      = [ccmUser.first_name, ccmUser.last_name].filter(Boolean).join(' ') || ccmUser.email || email;
+
+  console.log('[Token] Issued from CCM:', {
+    email,
+    appUserId,
+    devices: creds.map(c => c.sip_id)
+  });
+
+  // multiCredentials lets popup.js try all SIP devices in order (same as before)
+  res.json({
+    success:          true,
+    access_token:     appToken,
+    app_token:        appToken,
+    app_user_id:      appUserId,
+    user_id:          appUserId,
+    email:            email,
+    sip_id:           primary.sip_id,
+    sip_username:     primary.sip_id.replace(/^sip:/, ''),
+    sip_secret:       primary.sip_secret,
+    virtual_number:   primary.virtual_number || VIRTUAL_NUMBER || '',
+    name,
+    multiCredentials: creds.map((c, i) => ({
+      app_user_id:    i === 0 ? appUserId : appUserId + '_' + i,
+      sip_id:         c.sip_id,
+      sip_secret:     c.sip_secret,
+      virtual_number: c.virtual_number || VIRTUAL_NUMBER || ''
+    }))
+  });
+}
 
 // ── Static files ──────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
