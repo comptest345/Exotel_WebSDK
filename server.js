@@ -213,10 +213,14 @@ async function fetchAllCcmUsers() {
       const raw  = await res.text();
       const body = JSON.parse(raw);
       // Individual user response: { code, status, data: { ...user, devices: [...] } }
-      const userData = body.data || body;
-      const devices  = userData.devices || u.devices || [];
-      // Enrich devices with sip_secret from individual response
-      u.devices = devices;
+      const userData   = body.data || body;
+      const liveDevs   = userData.devices;
+      // CRITICAL: only overwrite if individual response has MORE data (non-empty).
+      // If individual endpoint returns [] it means it didn't include devices — keep
+      // the richer list from the bulk endpoint.
+      if (Array.isArray(liveDevs) && liveDevs.length > 0) {
+        u.devices = liveDevs;
+      }
       // Also try top-level sip_secret fields
       if (!u.sip_secret && userData.sip_secret) u.sip_secret = userData.sip_secret;
     } catch (e) {
@@ -246,7 +250,8 @@ async function fetchCcmUserById(ccmId) {
 // contact_uri is the SIP username field (not sip_id).
 // sip_secret may be on the device object or on the user object directly.
 function extractSipCredentials(ccmUser) {
-  const devices = (ccmUser.devices || []).filter(d => d.type === 'sip');
+  // Only include verified SIP devices — unverified ones can't register
+  const devices = (ccmUser.devices || []).filter(d => d.type === 'sip' && d.verified !== false);
 
   if (devices.length === 0) {
     // Fallback: some responses put sip fields directly on the user object
@@ -278,10 +283,13 @@ async function autoRegisterUser(email, name, appToken) {
     const exists = allMapped.find(u => u.Email && u.Email.toLowerCase() === email.toLowerCase());
     if (exists) return exists;
 
-    const maxId = allMapped.length > 0
-      ? Math.max(...allMapped.map(u => parseInt(u.AppUserId) || 0))
-      : 100;
-    const newId = String(maxId + 1);
+    // Look up the CCM user so we can use their SIP username as AppUserId
+    const ccmMap  = await getCcmUserMap();
+    const ccmUser = ccmMap.get(email.toLowerCase());
+    const creds   = ccmUser ? extractSipCredentials(ccmUser) : [];
+    const newId   = creds.length > 0
+      ? creds[0].sip_id.replace(/^sip:/i, '')
+      : (ccmUser ? ccmUser.id : ('auto_' + Date.now()));
 
     const payload = [{
       AppUserId:        newId,
@@ -345,17 +353,64 @@ async function syncUsers() {
     allMapped.forEach(u => { if (u.Email) mapByEmail[u.Email.toLowerCase()] = u; });
     console.log(`[Sync] Mapped users: ${allMapped.length}`);
 
-    // 3. ADD missing users
-    const maxId = allMapped.length > 0
-      ? Math.max(...allMapped.map(u => parseInt(u.AppUserId) || 0))
-      : 100;
-    let nextId = maxId + 1;
+    // Helper: compute the correct AppUserId for a CCM user (= SIP username)
+    // The SDK calls integrationscore with user_id={AppUserId}, so AppUserId
+    // MUST equal the SIP username (e.g. "arjunb23aca3e4"), not a sequential number.
+    function correctAppUserId(ccmUser) {
+      const creds = extractSipCredentials(ccmUser);
+      if (creds.length > 0) return creds[0].sip_id.replace(/^sip:/i, '');
+      return ccmUser.id; // fallback: CCM UUID (stable, unique)
+    }
 
+    // 3a. DELETE → ADD migration for users already mapped but with wrong AppUserId
+    //     (old code used sequential numbers; we now use SIP username)
+    const toMigrate = ccmUsers.filter(u => {
+      if (!u.email) return false;
+      const existing = mapByEmail[u.email.toLowerCase()];
+      if (!existing) return false;
+      return existing.AppUserId !== correctAppUserId(u);
+    });
+
+    for (const u of toMigrate) {
+      const existing   = mapByEmail[u.email.toLowerCase()];
+      const newId      = correctAppUserId(u);
+      const name       = [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email;
+      console.log(`[Sync] Migrating ${u.email}: AppUserId ${existing.AppUserId} → ${newId}`);
+
+      // Delete old entry (try ExotelUserId first, then old AppUserId)
+      for (const key of [existing.ExotelUserId, existing.AppUserId].filter(Boolean)) {
+        const r = await fetch(`${BASE}/usermapping/${encodeURIComponent(key)}`, {
+          method: 'DELETE', headers: { 'Authorization': at }
+        });
+        const rb = await r.text();
+        if (r.ok) { console.log(`[Sync] Deleted old mapping key=${key}`); break; }
+        console.log(`[Sync] Delete key=${key} HTTP ${r.status}: ${rb.slice(0, 80)}`);
+      }
+
+      // Re-add with correct AppUserId
+      const addRes  = await fetch(`${BASE}/usermapping`, {
+        method:  'POST',
+        headers: { 'Authorization': at, 'Content-Type': 'application/json' },
+        body:    JSON.stringify([{
+          AppUserId:        newId,
+          AppUsername:      name,
+          Email:            u.email,
+          ExotelAccountSid: ACCOUNT_SID,
+          ExotelUserName:   name,
+          AgentNumber:      '',
+          VirtualNumber:    VIRTUAL_NUMBER
+        }])
+      });
+      const addData = await addRes.json();
+      console.log(`[Sync] Migration result for ${u.email}:`, JSON.stringify(addData).slice(0, 200));
+    }
+
+    // 3b. ADD users not yet in usermapping at all
     const toAdd = ccmUsers.filter(u => u.email && !mapByEmail[u.email.toLowerCase()]);
     if (toAdd.length > 0) {
       console.log(`[Sync] Adding ${toAdd.length}: ${toAdd.map(u => u.email).join(', ')}`);
       const payload = toAdd.map(u => ({
-        AppUserId:        String(nextId++),
+        AppUserId:        correctAppUserId(u),  // SIP username (e.g. "arjunb23aca3e4")
         AppUsername:      [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email,
         Email:            u.email,
         ExotelAccountSid: ACCOUNT_SID,
@@ -760,6 +815,14 @@ app.get('/list-users', async (req, res) => {
 app.post('/sync-users', async (req, res) => {
   try { res.json(await syncUsers()); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Alias — same thing, useful to trigger from browser
+app.get('/force-resync', async (req, res) => {
+  try {
+    _ccmCache = null;  // force fresh CCM data
+    res.json(await syncUsers());
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/create-user', async (req, res) => {
