@@ -874,18 +874,26 @@ app.get('/token', async (req, res) => {
 });
 
 function sendTokenResponse(res, appToken, ccmUser, creds, email) {
-  // Use the CCM user id as the AppUserId (stable, unique per Exotel account)
-  const appUserId = String(ccmUser.id || ccmUser.ExotelUserId || creds[0].sip_id.replace(/[^a-z0-9]/gi,'') || email);
-  const primary   = creds[0];
-  const name      = [ccmUser.first_name, ccmUser.last_name].filter(Boolean).join(' ') || ccmUser.email || email;
+  const primary = creds[0];
+
+  // The SDK's appUserId must match what Exotel has in usermapping.
+  // Priority:
+  //  1. SIP username from contact_uri (e.g. "arjunb23aca3e4") — what Exotel uses internally
+  //  2. ccmUser.id (CCM UUID) — stable fallback
+  //  3. email — last resort
+  const sipUsername = primary.sip_id.replace(/^sip:/i, ''); // strips "sip:" prefix
+  const appUserId   = sipUsername || String(ccmUser.id || email);
+
+  const name = [ccmUser.first_name, ccmUser.last_name].filter(Boolean).join(' ') || ccmUser.email || email;
 
   console.log('[Token] Issued from CCM:', {
     email,
     appUserId,
+    sip_username: sipUsername,
+    has_secret:   !!primary.sip_secret,
     devices: creds.map(c => c.sip_id)
   });
 
-  // multiCredentials lets popup.js try all SIP devices in order (same as before)
   res.json({
     success:          true,
     access_token:     appToken,
@@ -894,12 +902,12 @@ function sendTokenResponse(res, appToken, ccmUser, creds, email) {
     user_id:          appUserId,
     email:            email,
     sip_id:           primary.sip_id,
-    sip_username:     primary.sip_id.replace(/^sip:/i, ''),
+    sip_username:     sipUsername,
     sip_secret:       primary.sip_secret,
     virtual_number:   primary.virtual_number || VIRTUAL_NUMBER || '',
     name,
-    multiCredentials: creds.map((c, i) => ({
-      app_user_id:    i === 0 ? appUserId : appUserId + '_' + i,
+    multiCredentials: creds.map((c) => ({
+      app_user_id:    c.sip_id.replace(/^sip:/i, ''),   // SIP username IS the appUserId for SDK
       sip_id:         c.sip_id,
       sip_secret:     c.sip_secret,
       virtual_number: c.virtual_number || VIRTUAL_NUMBER || ''
