@@ -32,6 +32,19 @@ function clog(msg, extra) {
     body: JSON.stringify({ source: 'popup.js', message: msg, extra: extra || null, email: currentUserEmail, ts: Date.now() })
   }).catch(() => {});
 }
+
+// ── Round robin: report busy/free status to server ────────────
+// Called whenever this agent's call state changes so the server
+// knows whether to ring them for new incoming calls.
+function reportStatus(status) {
+  if (!currentUserEmail) return;
+  fetch('/agent-status', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ email: currentUserEmail, status })
+  }).catch(() => {}); // best-effort — never block call flow on this
+}
+
 function setStatus(msg) {
   const el = document.getElementById('status');
   if (el) el.textContent = msg;
@@ -54,7 +67,6 @@ function setReg(state) {
 function getBx24CurrentUser() {
   return new Promise((resolve, reject) => {
     let attempts = 0;
-    // Retry for up to 30 seconds (50 × 600ms) — BX24 iframe bridge can be slow to init
     const MAX_ATTEMPTS = 50;
     function tryInit() {
       attempts++;
@@ -86,31 +98,25 @@ function getBx24CurrentUser() {
 function getBx24UserIdFromUrl() {
   try {
     const params = new URLSearchParams(window.location.search);
-    // PLACEMENT_OPTIONS carries USER_ID in CRM_ACTIVITY_SIDEBAR context
     const po = params.get('PLACEMENT_OPTIONS');
     if (po) {
       const opts = JSON.parse(decodeURIComponent(po));
       if (opts.USER_ID) return String(opts.USER_ID);
     }
-    // Direct params (some placements pass it flat)
     return params.get('USER_ID') || params.get('user_id') || params.get('bx24_user_id') || null;
   } catch (_) { return null; }
 }
 
 function getBx24UserIdFromAuth() {
-  // BX24 injects an auth object into the iframe URL as a ?auth[user_id]=N param
   try {
     const params = new URLSearchParams(window.location.search);
-    // BX24 uses bracket notation: auth[user_id]
     return params.get('auth[user_id]') || params.get('AUTH[USER_ID]') || null;
   } catch (_) { return null; }
 }
 
 async function resolveBx24Identity() {
-  // Log the full URL to help debug iframe context issues
   clog('popup URL: ' + window.location.href.slice(0, 200));
 
-  // Method 1: BX24.init API (most reliable — works in sidebar iframe)
   try {
     const u = await getBx24CurrentUser();
     if (u.email || u.id) {
@@ -119,14 +125,12 @@ async function resolveBx24Identity() {
     }
   } catch (e) { clog('BX24.init failed: ' + e.message); }
 
-  // Method 2: PLACEMENT_OPTIONS or direct URL params
   const urlId = getBx24UserIdFromUrl();
   if (urlId) {
     clog('Identity via URL PLACEMENT_OPTIONS: id=' + urlId);
     return { id: urlId, email: null, name: '' };
   }
 
-  // Method 3: BX24 auth params injected into iframe URL
   const authId = getBx24UserIdFromAuth();
   if (authId) {
     clog('Identity via auth[user_id]: id=' + authId);
@@ -175,6 +179,7 @@ function showIncoming(from, callSid) {
   document.getElementById('hangupBtn').style.display     = 'none';
   document.getElementById('callBtn').style.display       = 'none';
 }
+
 function showActive(num) {
   const el = document.getElementById('activeNum');
   if (el) el.textContent = num || '';
@@ -184,7 +189,11 @@ function showActive(num) {
   document.getElementById('hangupBtn').style.display     = 'block';
   document.getElementById('callBtn').style.display       = 'none';
   startTimer();
+  // Round robin: tell server this agent is now busy on a call (inbound or outbound).
+  // New incoming calls will skip this agent and ring others who are free.
+  reportStatus('busy');
 }
+
 // Shows a "ringing" state for outbound calls: the SIP leg to Exotel is up,
 // but the customer hasn't answered yet. Active panel is visible (agent can
 // hang up) but the timer does NOT start until customer actually answers.
@@ -199,6 +208,8 @@ function showOutboundRinging(num) {
   stopTimer();
   const timerEl = document.getElementById('timerEl');
   if (timerEl) timerEl.textContent = 'Ringing...';
+  // Round robin: mark busy while ringing outbound — don't also ring inbound.
+  reportStatus('busy');
 }
 
 function showDialer() {
@@ -210,7 +221,10 @@ function showDialer() {
   document.getElementById('hangupBtn').style.display     = 'none';
   document.getElementById('callBtn').style.display       = 'block';
   stopTimer();
+  // Round robin: agent is back to idle — allow new incoming calls to ring them.
+  reportStatus('free');
 }
+
 function startTimer() {
   timerSec = 0; stopTimer();
   timerInterval = setInterval(() => {
@@ -230,7 +244,6 @@ async function init() {
   setReg('connecting');
   setStatus('Identifying user...');
 
-  // Step 1: Identify BX24 user
   let identity;
   try {
     identity = await resolveBx24Identity();
@@ -247,9 +260,6 @@ async function init() {
   await requestMic();
   if (!micGranted) { scheduleRetry(); return; }
 
-  // Step 2: Fetch credentials from /token
-  // Pass email if we have it (most reliable lookup key)
-  // Fall back to bx24_user_id so server can cache-resolve
   setStatus('Fetching credentials...');
   let tokenData;
   try {
@@ -273,13 +283,8 @@ async function init() {
 
   const accessToken = tokenData.access_token || tokenData.app_token;
 
-  // Build credentials list from multiCredentials, falling back to single entry.
-  // app_user_id must be the SIP username (e.g. "arjunb23aca3e4") — NOT the BX24 user ID.
-  // The SDK uses this to look up the SIP registration on Exotel's side.
   const credentials = tokenData.multiCredentials || [
     {
-      // app_user_id must be the usermapping "AppUserId" field, not the SIP
-      // username — the SDK verifies identity against AppUserId internally.
       app_user_id:  String(tokenData.app_user_id || tokenData.user_id || tokenData.sip_username || ''),
       sip_id:       tokenData.sip_id       || '',
       sip_secret:   tokenData.sip_secret   || '',
@@ -299,15 +304,11 @@ async function init() {
     'user=' + c.app_user_id + ' sip=' + c.sip_id + ' secret=' + (c.sip_secret ? '✓' : '✗')
   ).join(' | '));
 
-  // Step 3: Init ExotelCRMWebSDK — try each credential set until one registers.
   setStatus('Connecting softphone...');
   await tryInitWithCredentials(accessToken, credentials, 0);
 }
 
 // ── Multi-credential SDK init ─────────────────────────────────
-// Tries each credential set in `creds` (index i) until one registers.
-// If a set times out (30 s) without a regEvent, moves to the next.
-// Only falls back to scheduleRetry() after all sets are exhausted.
 async function tryInitWithCredentials(accessToken, creds, i) {
   if (i >= creds.length) {
     clog('All ' + creds.length + ' credential(s) exhausted — scheduling retry');
@@ -336,9 +337,6 @@ async function tryInitWithCredentials(accessToken, creds, i) {
          ' sipId=' + sipId +
          ' secret=' + (sipSecret ? '✓' : '✗ MISSING'));
 
-    // ExotelCRMWebSDK(token, appUserId, debug, options?)
-    // Pass sip_username + sip_secret in options so the SDK can register directly
-    // without needing to fetch credentials from Exotel's side separately.
     const sdkOptions = sipSecret
       ? { sip_username: appUserId, sip_password: sipSecret }
       : undefined;
@@ -358,7 +356,7 @@ async function tryInitWithCredentials(accessToken, creds, i) {
     }, 30000);
 
     function registrationEventHandler(state, phone) {
-      if (regFired) return;   // guard: ignore late events from a previous attempt
+      if (regFired) return;
       regFired = true;
       clearTimeout(regTimeout);
       clog('regEvent state=' + state + ' phone=' + phone + ' userId=' + appUserId);
@@ -375,13 +373,13 @@ async function tryInitWithCredentials(accessToken, creds, i) {
         }
         setReg('registered');
         setStatus('✅ Ready — ' + (phone || appUserId));
+        // Report free so server knows this agent is available for incoming calls
+        reportStatus('free');
         startPoll();
       } else if (state === 'terminated' || state === 'unregistered') {
-        // Hard failure on this credential — move on immediately
         clog('regEvent ' + state + ' for userId=' + appUserId + ' — trying next');
         tryInitWithCredentials(accessToken, creds, i + 1);
       }
-      // 'sent request' / other transient states: wait for regTimeout
     }
 
     webPhone = await crmWebSDK.Initialize(handleCallEvent, registrationEventHandler);
@@ -393,7 +391,6 @@ async function tryInitWithCredentials(accessToken, creds, i) {
   } catch (err) {
     releaseMic();
     clog('SDK FAILED userId=' + appUserId + ': ' + err.message);
-    // Hard JS error — try next credential immediately
     tryInitWithCredentials(accessToken, creds, i + 1);
   }
 }
@@ -415,20 +412,17 @@ function scheduleRetry() {
 }
 
 // ── SSE subscription + poll fallback ─────────────────────────
-// Primary: subscribe to /events so the server pushes calls instantly.
-// Fallback: 5 s poll on /pending-call covers the window before SSE connects
-//           and the edge case where the SSE connection drops silently.
 let sseSource  = null;
 let pollTimer  = null;
 let pollCount  = 0;
 
 function startPoll() {
-  startSSE();          // SSE is the primary channel
-  startPollFallback(); // poll runs alongside as safety net
+  startSSE();
+  startPollFallback();
 }
 
 function startSSE() {
-  if (sseSource) return; // already connected
+  if (sseSource) return;
   if (!currentUserEmail) return;
   const url = '/events?email=' + encodeURIComponent(currentUserEmail);
   clog('SSE connecting: ' + url);
@@ -464,7 +458,7 @@ function startSSE() {
     const sidMatch = (currentInboundCallSid === d.callSid) || (currentInboundCallSid === null);
     if (callDirection === 'inbound' && sidMatch) {
       clog('call_dismissed — claimed by ' + d.claimedBy + ' sid=' + d.callSid);
-      if (d.callSid) dismissedCallSids.add(d.callSid);  // guard against late native re-trigger
+      if (d.callSid) dismissedCallSids.add(d.callSid);
       dismissedAt = Date.now();
       showDialer();
       setStatus('📞 Answered by another agent');
@@ -472,15 +466,12 @@ function startSSE() {
   });
 
   sseSource.onopen  = () => clog('SSE connected');
-  sseSource.onerror = (err) => {
-    clog('SSE error — will rely on poll fallback');
-    // EventSource auto-reconnects; no need to do anything
-  };
+  sseSource.onerror = () => clog('SSE error — will rely on poll fallback');
 }
 
 function startPollFallback() {
   if (pollTimer) return;
-  pollTimer = setInterval(doPoll, 5000); // reduced frequency — SSE handles real-time
+  pollTimer = setInterval(doPoll, 5000);
 }
 
 async function doPoll() {
@@ -494,8 +485,6 @@ async function doPoll() {
     pollCount++;
     if (pollCount % 12 === 1) clog('poll#' + pollCount + ' email=' + currentUserEmail);
     if (data.pending && data.type === 'inbound' && callDirection !== 'inbound') {
-      // Poll caught an inbound call we missed via SSE.
-      // But skip it if we already dismissed this callSid.
       if (data.callSid && dismissedCallSids.has(data.callSid)) {
         clog('Poll inbound ignored — already dismissed sid=' + data.callSid);
         return;
@@ -503,7 +492,6 @@ async function doPoll() {
       clog('Poll fallback: inbound from ' + data.from + ' sid=' + data.callSid);
       showIncoming(data.from, data.callSid);
     } else if (!data.pending && data.type === 'claimed') {
-      // Server says the most recent inbound call is claimed — dismiss our panel if showing.
       if (callDirection === 'inbound') {
         clog('Poll: call ' + data.callSid + ' already claimed by ' + data.claimedBy + ' — dismissing');
         if (data.callSid) dismissedCallSids.add(data.callSid);
@@ -518,7 +506,6 @@ async function doPoll() {
       if (phoneEl) phoneEl.value = data.number;
       await triggerOutboundCall(data.number);
     } else if (data.pending && data.number) {
-      // Legacy shape (no type field) — treat as outbound
       clog('Poll fallback (legacy) caught call: ' + data.number);
       callDirection = 'outbound';
       const phoneEl = document.getElementById('phone');
@@ -532,9 +519,20 @@ async function triggerOutboundCall(number) {
   if (!webPhone)  { clog('MakeCall: webPhone null'); setStatus('SDK not ready'); return; }
   if (!sdkReady)  { clog('MakeCall: not registered'); setStatus('Not registered yet'); return; }
   callDirection = 'outbound';
+  // Mark busy immediately on dial attempt — closes the ~1-2s window between
+  // MakeCall() being called and the SDK firing the 'ringing' event (which is
+  // when showOutboundRinging() would otherwise call reportStatus('busy')).
+  // This ensures no incoming call is pushed to this agent the moment they dial.
+  reportStatus('busy');
   clog('MakeCall → ' + number);
   try { await webPhone.MakeCall(number, null, null); }
-  catch (e) { clog('MakeCall error: ' + e.message); setStatus('Call failed: ' + e.message); }
+  catch (e) {
+    // MakeCall itself threw — revert to free so round robin doesn't permanently
+    // exclude this agent from future incoming calls.
+    reportStatus('free');
+    clog('MakeCall error: ' + e.message);
+    setStatus('Call failed: ' + e.message);
+  }
 }
 
 // ── Call event handler ────────────────────────────────────────
@@ -546,10 +544,6 @@ function handleCallEvent(event) {
   const isIncoming  = type.includes('incoming') || type.includes('ringing') || raw.includes('incoming') || raw.includes('ringing');
   const isEnded     = type.includes('end')      || type.includes('terminat')|| type.includes('bye')     || type.includes('complet') || raw.includes('callended') || raw.includes('call_completed');
 
-  // BUG FIX: For outbound calls, 'accept'/'accepted' fires when AcceptCall()
-  // resolves on the agent's own SIP leg — the customer's phone is still ringing
-  // at this point. Only 'connect', 'answer', or 'active' mean the customer answered.
-  // For inbound calls, 'accept' correctly means the agent accepted and the call is live.
   const isAcceptEvent = type.includes('accept') || raw.includes('accepted');
   const isConnected   =
     type.includes('connect') || type.includes('answer') || type.includes('active') || raw.includes('connected')
@@ -559,17 +553,13 @@ function handleCallEvent(event) {
     if (callDirection === 'outbound') {
       clog('Outbound SIP ring → silent AcceptCall, showing ringing UI');
       if (webPhone) webPhone.AcceptCall().catch(e => clog('silentAccept err: ' + e.message));
-      // BUG FIX: Show "Ringing..." so the agent has feedback and can hang up.
-      // Timer does NOT start here — customer hasn't answered yet.
       showOutboundRinging(document.getElementById('phone')?.value || '');
     } else {
       // Native SIP incoming event — carries no callSid.
-      // If currentInboundCallSid is set and already dismissed, ignore this.
       if (currentInboundCallSid && dismissedCallSids.has(currentInboundCallSid)) {
         clog('Native incoming event ignored — callSid already dismissed: ' + currentInboundCallSid);
         return;
       }
-      // Also check the time-based cooldown for cases where callSid isn't set yet.
       if (Date.now() - dismissedAt < 8000) {
         clog('Native incoming event ignored — within dismiss cooldown');
         return;
@@ -581,7 +571,7 @@ function handleCallEvent(event) {
     const num = callDirection === 'inbound'
       ? (document.getElementById('callerNum')?.textContent || '')
       : (document.getElementById('phone')?.value || '');
-    showActive(num);  // Customer answered — now start the timer
+    showActive(num);
     setStatus('');
   } else if (isEnded) {
     showDialer();
@@ -631,7 +621,6 @@ async function acceptCall() {
       if (currentInboundCallSid) dismissedCallSids.add(currentInboundCallSid);
     } catch (e) {
       clog('Claim request failed (proceeding anyway): ' + e.message);
-      // Network error on claim — proceed with AcceptCall so the agent isn't stuck.
     }
   }
 
@@ -644,10 +633,25 @@ async function acceptCall() {
 }
 
 async function rejectCall() {
-  clog('rejectCall — dismissing locally, other agents unaffected');
-  if (currentInboundCallSid) dismissedCallSids.add(currentInboundCallSid);
+  clog('rejectCall — informing server, other free agents continue to ring');
+
+  // Tell the server this agent rejected — the call stays alive for others.
+  // The server will NOT re-push this call to this agent on subsequent Exotel pings.
+  if (currentInboundCallSid) {
+    try {
+      await fetch('/reject-call', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ callSid: currentInboundCallSid, email: currentUserEmail })
+      });
+    } catch (e) {
+      clog('reject-call request failed (non-fatal): ' + e.message);
+    }
+    dismissedCallSids.add(currentInboundCallSid);
+  }
+
   dismissedAt = Date.now();
-  showDialer();
+  showDialer(); // showDialer() calls reportStatus('free') — agent is available again
   setStatus('Call declined');
 }
 
