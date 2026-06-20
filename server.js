@@ -31,7 +31,7 @@ const SIP_FB  = isIndia ? 'voip.in1.exotel.com' : 'voip.sgp1.exotel.com';
 // pendingCallMap: email → { number, callId, ts }
 // Keyed by agent email so each agent only gets their own pending call.
 const pendingCallMap   = {};
-// pendingInboundMap: callSid → { from, to, ts }
+// pendingInboundMap: callSid → { from, to, ts, phoneKey }
 // Holds every ringing inbound call until an agent claims it or it times out.
 const pendingInboundMap = {};
 // inboundClaimMap: callSid → { email, bx24UserId, bx24CallId, ts }
@@ -128,9 +128,6 @@ async function fetchAllMappedUsers(at) {
 }
 
 // ── usermapping live user map — PRIMARY credential source ────────
-// Exotel auto-creates a /usermapping entry (with SipId/SipSecret/VirtualNumber
-// filled in) for every Co-worker the moment they're invited AND verify their
-// SIP device. We never POST to create it — we only READ + cache this list.
 let _mapCache    = null;   // Map<emailLower, usermapping row>
 let _mapCacheExp = 0;
 let _mapInflight = null;
@@ -142,12 +139,12 @@ async function getMappedUserMap(force) {
 
   _mapInflight = (async () => {
     try {
-      const at    = await getAppToken();              // JWT — required on EVERY call
+      const at    = await getAppToken();
       const users = await fetchAllMappedUsers(at);
       const map   = new Map();
       users.forEach(u => { if (u.Email) map.set(u.Email.toLowerCase(), u); });
       _mapCache    = map;
-      _mapCacheExp = Date.now() + 60000; // 60 s TTL
+      _mapCacheExp = Date.now() + 60000;
       console.log(`[Mapping] Cache refreshed: ${map.size} user(s)`);
       return map;
     } finally {
@@ -157,7 +154,6 @@ async function getMappedUserMap(force) {
   return _mapInflight;
 }
 
-// Extract SIP credentials straight from a usermapping row (capitalized fields).
 function extractMappingCredentials(u) {
   if (!u || !u.SipId) return [];
   return [{
@@ -168,14 +164,6 @@ function extractMappingCredentials(u) {
 }
 
 // ── CCM Users API — kept only as an emergency fallback ────────────
-// /token now reads from usermapping (above) as the PRIMARY source. This CCM
-// path is only used as a fallback if a mapping row is missing or unverified
-// (set ENABLE_CCM_FALLBACK=1 to re-enable the lookups that use it below).
-//
-// CCM API endpoint (Basic Auth with API_KEY:API_TOKEN):
-//   GET /v2/accounts/<sid>/users?fields=devices
-// Returns devices[] per user which contains SipId, SipSecret, VirtualNumber.
-
 function getCcmBaseUrl() {
   return isIndia
     ? `https://ccm-api.in.exotel.com/v2/accounts/${ACCOUNT_SID}/users`
@@ -186,10 +174,7 @@ function getCcmBasicAuth() {
   return 'Basic ' + Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
 }
 
-// ── In-memory CCM user cache ──────────────────────────────────────
-// Refreshed every 60 seconds so /token never calls CCM on every login.
-// Maps email.toLowerCase() → CCM user object with SIP fields extracted.
-let _ccmCache    = null;   // Map<email, userObj>
+let _ccmCache    = null;
 let _ccmCacheExp = 0;
 let _ccmInflight = null;
 
@@ -206,7 +191,7 @@ async function getCcmUserMap() {
         if (u.email) map.set(u.email.toLowerCase(), u);
       });
       _ccmCache    = map;
-      _ccmCacheExp = Date.now() + 60000; // 60 s TTL
+      _ccmCacheExp = Date.now() + 60000;
       console.log(`[CCM] Cache refreshed: ${map.size} users`);
       return map;
     } finally {
@@ -216,10 +201,6 @@ async function getCcmUserMap() {
   return _ccmInflight;
 }
 
-// Fetch all CCM co-workers with full device/SIP data.
-// The CCM list endpoint wraps each user as: { code, status, data: { ...user, devices: [...] } }
-// Each device has: { id, name, contact_uri: "sip:username", type, available, verified, status }
-// The SIP secret is NOT in the list response — we fetch it per-user via GET /users/:id?fields=devices
 async function fetchAllCcmUsers() {
   const users = [];
   let offset = 0;
@@ -230,21 +211,14 @@ async function fetchAllCcmUsers() {
     const raw  = await res.text();
     if (!res.ok) throw new Error(`CCM Users API HTTP ${res.status}: ${raw.slice(0, 200)}`);
     const data = JSON.parse(raw);
-
-    // Response is an array of { code, status, data: { ...user } } objects
     const rawList = Array.isArray(data) ? data : (data.response || data.data || []);
     console.log('[CCM] Raw sample (first user):', JSON.stringify(rawList[0] || {}).slice(0, 400));
-
-    // Unwrap each item: item.data contains the actual user object
     const page = rawList.map(r => r.data || r).filter(u => u && u.email);
     users.push(...page);
-
     const meta = data.metadata || {};
     if (users.length >= (meta.total || users.length) || page.length < limit) break;
     offset += limit;
   }
-
-  // Fetch SIP secret for each user individually (not returned in list endpoint)
   await Promise.all(users.map(async u => {
     try {
       const url = `${getCcmBaseUrl()}/${u.id}?fields=devices`;
@@ -252,26 +226,19 @@ async function fetchAllCcmUsers() {
       if (!res.ok) return;
       const raw  = await res.text();
       const body = JSON.parse(raw);
-      // Individual user response: { code, status, data: { ...user, devices: [...] } }
       const userData   = body.data || body;
       const liveDevs   = userData.devices;
-      // CRITICAL: only overwrite if individual response has MORE data (non-empty).
-      // If individual endpoint returns [] it means it didn't include devices — keep
-      // the richer list from the bulk endpoint.
       if (Array.isArray(liveDevs) && liveDevs.length > 0) {
         u.devices = liveDevs;
       }
-      // Also try top-level sip_secret fields
       if (!u.sip_secret && userData.sip_secret) u.sip_secret = userData.sip_secret;
     } catch (e) {
       console.warn(`[CCM] Could not fetch individual user ${u.id} (${u.email}):`, e.message);
     }
   }));
-
   return users;
 }
 
-// Fetch a single CCM user by their CCM user ID (used as fast cache refresh for /token)
 async function fetchCcmUserById(ccmId) {
   try {
     const url = `${getCcmBaseUrl()}/${ccmId}?fields=devices`;
@@ -284,29 +251,17 @@ async function fetchCcmUserById(ccmId) {
   }
 }
 
-// Extract SIP credential(s) for a CCM user.
-// The Exotel CCM API returns devices like:
-//   { id, name, contact_uri: "sip:arjunb23aca3e4", type: "sip", available, verified, status, sip_secret? }
-// contact_uri is the SIP username field (not sip_id).
-// sip_secret may be on the device object or on the user object directly.
 function extractSipCredentials(ccmUser) {
-  // Only include verified SIP devices — unverified ones can't register
   const devices = (ccmUser.devices || []).filter(d => d.type === 'sip' && d.verified !== false);
-
   if (devices.length === 0) {
-    // Fallback: some responses put sip fields directly on the user object
     const sipId     = ccmUser.contact_uri || ccmUser.sip_id || ccmUser.sipId || ccmUser.SipId || '';
     const sipSecret = ccmUser.sip_secret  || ccmUser.sipSecret || ccmUser.SipSecret || '';
     const vn        = ccmUser.virtual_number || ccmUser.VirtualNumber || VIRTUAL_NUMBER || '';
     if (sipId) return [{ sip_id: sipId, sip_secret: sipSecret, virtual_number: vn }];
     return [];
   }
-
-  // User-level secret fallback (some accounts return it here instead of per-device)
   const userSecret = ccmUser.sip_secret || ccmUser.sipSecret || ccmUser.SipSecret || '';
-
   return devices.map(d => {
-    // contact_uri is "sip:arjunb23aca3e4" — that IS the SIP ID
     const sipId     = d.contact_uri || d.sip_id || d.SipId || '';
     const sipSecret = d.sip_secret  || d.SipSecret || userSecret || '';
     const vn        = d.virtual_number || d.VirtualNumber || ccmUser.virtual_number || VIRTUAL_NUMBER || '';
@@ -314,23 +269,17 @@ function extractSipCredentials(ccmUser) {
   }).filter(d => d.sip_id);
 }
 
-// ── AUTO-REGISTER: create a usermapping entry on first login ──────
-// Called from /token when an email has no existing usermapping entry.
 async function autoRegisterUser(email, name, appToken) {
   try {
     const allMapped = await fetchAllMappedUsers(appToken);
-    // Don't double-create
     const exists = allMapped.find(u => u.Email && u.Email.toLowerCase() === email.toLowerCase());
     if (exists) return exists;
-
-    // Look up the CCM user so we can use their SIP username as AppUserId
     const ccmMap  = await getCcmUserMap();
     const ccmUser = ccmMap.get(email.toLowerCase());
     const creds   = ccmUser ? extractSipCredentials(ccmUser) : [];
     const newId   = creds.length > 0
       ? creds[0].sip_id.replace(/^sip:/i, '')
       : (ccmUser ? ccmUser.id : ('auto_' + Date.now()));
-
     const payload = [{
       AppUserId:        newId,
       AppUsername:      name || email,
@@ -340,7 +289,6 @@ async function autoRegisterUser(email, name, appToken) {
       AgentNumber:      '',
       VirtualNumber:    VIRTUAL_NUMBER
     }];
-
     const addRes  = await fetch(`${BASE}/usermapping`, {
       method:  'POST',
       headers: { 'Authorization': appToken, 'Content-Type': 'application/json' },
@@ -348,8 +296,6 @@ async function autoRegisterUser(email, name, appToken) {
     });
     const addData = await addRes.json();
     console.log(`[AutoRegister] Created usermapping for ${email} → AppUserId=${newId}:`, JSON.stringify(addData));
-
-    // Return the newly-created entry so /token can proceed immediately
     const refreshed = await fetchAllMappedUsers(appToken);
     return refreshed.find(u => u.Email && u.Email.toLowerCase() === email.toLowerCase()) || null;
   } catch (e) {
@@ -358,14 +304,6 @@ async function autoRegisterUser(email, name, appToken) {
   }
 }
 
-// ── REFRESH (read-only): keep the usermapping cache warm ──────────
-// Exotel owns usermapping end-to-end: it ADDS a row automatically when you
-// invite a Co-worker, FILLS IN SipId/SipSecret automatically once they verify
-// their SIP device, and REMOVES the row automatically if you remove the
-// Co-worker. We must NOT call POST/DELETE on usermapping ourselves — that's
-// exactly what was causing duplicate AppUserIds / clashing SIP secrets before.
-// This function just forces a fresh GET so /token never serves stale data.
-// Runs at startup and every 5 minutes (see app.listen below).
 async function syncUsers() {
   console.log('[Sync] Refreshing usermapping cache (read-only)...');
   try {
@@ -378,14 +316,9 @@ async function syncUsers() {
   }
 }
 
-// ── LEGACY: old CCM-based create/migrate/delete sync ──────────────
-// No longer called (renamed below). Kept only for reference / emergency
-// rollback — do not wire this back up unless Exotel tells you usermapping
-// rows are NOT being auto-created for your account.
 async function legacySyncUsersFromCcm() {
   console.log('[Sync] Starting CCM sync...');
   try {
-    // 1. Fetch all co-workers from CCM Users API
     let ccmUsers;
     try {
       ccmUsers = await fetchAllCcmUsers();
@@ -393,50 +326,34 @@ async function legacySyncUsersFromCcm() {
       console.error('[Sync] CCM Users API fetch failed — aborting to protect usermapping:', e.message);
       return { error: e.message };
     }
-
     if (ccmUsers.length === 0) {
       console.warn('[Sync] CCM returned 0 users — skipping to protect usermapping');
       return { skipped: true, reason: 'ccm_empty' };
     }
     console.log(`[Sync] CCM co-workers: ${ccmUsers.length}`);
-
     const ccmByEmail = {};
-    ccmUsers.forEach(u => {
-      if (u.email) ccmByEmail[u.email.toLowerCase()] = u;
-    });
-
-    // 2. Get all current usermapping entries
+    ccmUsers.forEach(u => { if (u.email) ccmByEmail[u.email.toLowerCase()] = u; });
     const at        = await getAppToken();
     const allMapped = await fetchAllMappedUsers(at);
     const mapByEmail = {};
     allMapped.forEach(u => { if (u.Email) mapByEmail[u.Email.toLowerCase()] = u; });
     console.log(`[Sync] Mapped users: ${allMapped.length}`);
-
-    // Helper: compute the correct AppUserId for a CCM user (= SIP username)
-    // The SDK calls integrationscore with user_id={AppUserId}, so AppUserId
-    // MUST equal the SIP username (e.g. "arjunb23aca3e4"), not a sequential number.
     function correctAppUserId(ccmUser) {
       const creds = extractSipCredentials(ccmUser);
       if (creds.length > 0) return creds[0].sip_id.replace(/^sip:/i, '');
-      return ccmUser.id; // fallback: CCM UUID (stable, unique)
+      return ccmUser.id;
     }
-
-    // 3a. DELETE → ADD migration for users already mapped but with wrong AppUserId
-    //     (old code used sequential numbers; we now use SIP username)
     const toMigrate = ccmUsers.filter(u => {
       if (!u.email) return false;
       const existing = mapByEmail[u.email.toLowerCase()];
       if (!existing) return false;
       return existing.AppUserId !== correctAppUserId(u);
     });
-
     for (const u of toMigrate) {
       const existing   = mapByEmail[u.email.toLowerCase()];
       const newId      = correctAppUserId(u);
       const name       = [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email;
       console.log(`[Sync] Migrating ${u.email}: AppUserId ${existing.AppUserId} → ${newId}`);
-
-      // Delete old entry (try ExotelUserId first, then old AppUserId)
       for (const key of [existing.ExotelUserId, existing.AppUserId].filter(Boolean)) {
         const r = await fetch(`${BASE}/usermapping/${encodeURIComponent(key)}`, {
           method: 'DELETE', headers: { 'Authorization': at }
@@ -445,8 +362,6 @@ async function legacySyncUsersFromCcm() {
         if (r.ok) { console.log(`[Sync] Deleted old mapping key=${key}`); break; }
         console.log(`[Sync] Delete key=${key} HTTP ${r.status}: ${rb.slice(0, 80)}`);
       }
-
-      // Re-add with correct AppUserId
       const addRes  = await fetch(`${BASE}/usermapping`, {
         method:  'POST',
         headers: { 'Authorization': at, 'Content-Type': 'application/json' },
@@ -463,13 +378,11 @@ async function legacySyncUsersFromCcm() {
       const addData = await addRes.json();
       console.log(`[Sync] Migration result for ${u.email}:`, JSON.stringify(addData).slice(0, 200));
     }
-
-    // 3b. ADD users not yet in usermapping at all
     const toAdd = ccmUsers.filter(u => u.email && !mapByEmail[u.email.toLowerCase()]);
     if (toAdd.length > 0) {
       console.log(`[Sync] Adding ${toAdd.length}: ${toAdd.map(u => u.email).join(', ')}`);
       const payload = toAdd.map(u => ({
-        AppUserId:        correctAppUserId(u),  // SIP username (e.g. "arjunb23aca3e4")
+        AppUserId:        correctAppUserId(u),
         AppUsername:      [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email,
         Email:            u.email,
         ExotelAccountSid: ACCOUNT_SID,
@@ -485,10 +398,6 @@ async function legacySyncUsersFromCcm() {
       const addData = await addRes.json();
       console.log('[Sync] Add result:', JSON.stringify(addData));
     }
-
-    // 4. DELETE users removed from CCM
-    // Exotel's DELETE endpoint accepts ExotelUserId (internal UUID), not AppUserId.
-    // Try ExotelUserId first, then AppUserId, then SIP username as last resort.
     const toRemove = allMapped.filter(u => u.Email && !ccmByEmail[u.Email.toLowerCase()]);
     for (const u of toRemove) {
       console.log(`[Sync] Removing ${u.Email} (AppUserId=${u.AppUserId} ExotelUserId=${u.ExotelUserId || 'n/a'})`);
@@ -512,8 +421,6 @@ async function legacySyncUsersFromCcm() {
           'Delete manually via Exotel dashboard or DELETE /delete-user/:appUserId.');
       }
     }
-
-    // Invalidate CCM cache so next /token call gets fresh SIP credentials
     _ccmCache = null;
     console.log(`[Sync] Done. Added=${toAdd.length} Removed=${toRemove.length} CCM=${ccmUsers.length} Mapped=${allMapped.length}`);
     return { added: toAdd.length, removed: toRemove.length, total_ccm: ccmUsers.length, total_mapped: allMapped.length };
@@ -542,8 +449,6 @@ app.all('/install', (req, res) => {
 });
 
 // ── BX24 outbound call trigger ────────────────────────────────────
-// BX24 sends USER_ID (BX24 user id). We need the agent's email to route
-// the call to the right popup.js poll. We look up email from BX24 webhook.
 const bx24EmailCache = {}; // bx24UserId → email
 
 async function getBx24UserEmail(bx24UserId) {
@@ -575,16 +480,12 @@ app.post('/bx24-call-start', async (req, res) => {
     const bx24UserId = String(d.USER_ID || BX24_USER_ID);
     const number     = d.PHONE_NUMBER || '';
     const callId     = d.CALL_ID     || ('ext_' + Date.now());
-
-    // Resolve agent email to use as routing key
     const email = await getBx24UserEmail(bx24UserId);
     if (!email) {
       console.warn(`[BX24-CallStart] Could not resolve email for BX24 user ${bx24UserId}`);
-      // Store by bx24UserId as fallback so poll can still find it
       pendingCallMap['bx24_' + bx24UserId] = { number, callId, ts: Date.now() };
     } else {
       const key = email.toLowerCase();
-      // Try instant SSE push first; fall back to poll queue if popup isn't connected yet
       const pushed = ssePush(key, 'outbound_call', { number, callId });
       if (!pushed) {
         pendingCallMap[key] = { number, callId, ts: Date.now() };
@@ -596,7 +497,6 @@ app.post('/bx24-call-start', async (req, res) => {
 });
 
 // ── Pending call poll ─────────────────────────────────────────────
-// popup.js polls with ?email=agent@email.com
 app.get('/pending-call', (req, res) => {
   pollCount++;
   if (pollCount % 30 === 1) console.log('[Poll] /pending-call hit #' + pollCount);
@@ -604,28 +504,29 @@ app.get('/pending-call', (req, res) => {
   const email      = (req.query.email      || '').toLowerCase();
   const bx24UserId = req.query.bx24_user_id || '';
 
-  // Try email key first, then bx24 fallback key
   const key   = email || (bx24UserId ? 'bx24_' + bx24UserId : null);
   if (!key) return res.json({ pending: false, reason: 'no_key' });
 
   const entry = pendingCallMap[key];
-  if (entry && (Date.now() - entry.ts) < 60000) {  // 60 s: BX24 bridge init can take up to 30 s
+  if (entry && (Date.now() - entry.ts) < 60000) {
     delete pendingCallMap[key];
     console.log(`[Poll] Delivering outbound call to ${key}: ${entry.number}`);
     res.json({ pending: true, type: 'outbound', number: entry.number, callId: entry.callId });
   } else {
     if (entry) delete pendingCallMap[key];
-    // Also check for any unclaimed inbound call this agent may have missed via SSE.
-    // IMPORTANT: skip calls that are already claimed — don't re-show to polling agents.
-    // (read-only: do NOT delete — other agents may still need to see the result)
-    const inbound = Object.entries(pendingInboundMap).find(
-      ([sid, d]) => !inboundClaimMap[sid] && (Date.now() - d.ts) < 60000
-    );
+    // Check for unclaimed inbound that this agent hasn't rejected
+    const inbound = Object.entries(pendingInboundMap).find(([sid, d]) => {
+      if (inboundClaimMap[sid]) return false;
+      if ((Date.now() - d.ts) >= 60000) return false;
+      // Don't show to agents who already rejected this call
+      const lock = d.phoneKey ? callerLocks.get(d.phoneKey) : null;
+      if (lock && lock.rejectedBy.has(email)) return false;
+      return true;
+    });
     if (inbound) {
       const [sid, d] = inbound;
       return res.json({ pending: true, type: 'inbound', from: d.from, callSid: sid });
     }
-    // If the most recent inbound call IS claimed, tell the client so it can dismiss cleanly.
     const claimed = Object.entries(pendingInboundMap).find(
       ([sid, d]) => !!inboundClaimMap[sid] && (Date.now() - d.ts) < 60000
     );
@@ -638,36 +539,33 @@ app.get('/pending-call', (req, res) => {
 });
 
 // ── SSE subscription endpoint ────────────────────────────────────
-// popup.js connects here on open. Server pushes call events instantly.
-// One connection per agent email. New tab replaces old (last-write-wins).
 app.get('/events', (req, res) => {
   const email = (req.query.email || '').toLowerCase();
   if (!email) return res.status(400).end('email required');
 
-  // SSE headers
   res.set({
     'Content-Type':  'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection':    'keep-alive',
-    'X-Accel-Buffering': 'no'   // disable Nginx buffering on Render
+    'X-Accel-Buffering': 'no'
   });
   res.flushHeaders();
 
-  // Replace any existing connection for this agent
   if (sseClients[email]) {
     try { sseClients[email].end(); } catch (_) {}
   }
   sseClients[email] = res;
   console.log(`[SSE] Agent connected: ${email} (active: ${Object.keys(sseClients).length})`);
 
-  // Heartbeat every 20 s to keep the connection alive through Render's idle timeout
+  // Mark agent as free when they connect (they just loaded the dialer)
+  setAgentBusy(email, false);
+
   const hb = setInterval(() => {
     try { res.write(': heartbeat\n\n'); } catch (_) { clearInterval(hb); }
   }, 20000);
 
-  // If there's already a pending call queued for this agent, flush it immediately
   const entry = pendingCallMap[email];
-  if (entry && (Date.now() - entry.ts) < 60000) {  // 60 s: matches poll endpoint TTL
+  if (entry && (Date.now() - entry.ts) < 60000) {
     delete pendingCallMap[email];
     console.log(`[SSE] Flushing queued call to ${email}: ${entry.number}`);
     ssePush(email, 'outbound_call', { number: entry.number, callId: entry.callId });
@@ -684,9 +582,66 @@ app.get('/events', (req, res) => {
 
 // ── Claimed SIDs registry ─────────────────────────────────────────────────
 // Once an agent claims a call, we record the sid here so that any duplicate
-// Exotel Dial webhooks (Exotel retries the webhook once per SIP leg tried)
-// don't cause a second broadcast to all agents.
+// Exotel Dial webhooks don't cause a second broadcast to all agents.
 const claimedSids = new Set();
+
+// ── Caller-based call lock ─────────────────────────────────────────────────
+// THE CORE FIX for "still rings everyone including the agent who accepted":
+//
+// Exotel can hit /incoming-call multiple times for one ringing call (once per
+// SIP leg / retry ping) and the CallSid is NOT always the same across pings.
+// The old code used `claimedSids.has(sid)` as the dedup guard — but if Exotel
+// sends a new/missing CallSid on the next ping, `'in_' + Date.now()` generates
+// a brand-new key the guard has never seen, so it re-broadcasts to everyone,
+// including the agent who already accepted.
+//
+// FIX: key the lock on the CALLER'S phone number instead — that stays identical
+// across every ping for the same call. Once any agent claims, `lock.claimedBy`
+// is set and every subsequent ping for this caller is silently dropped.
+const callerLocks = new Map(); // normalizedFromNumber → { sid, claimedBy, rejectedBy:Set, ts }
+const LOCK_TTL_MS  = 90 * 1000; // ringing call older than this is treated as stale
+
+function normalizePhone(n) {
+  const digits = String(n || '').replace(/\D/g, '');
+  return digits.slice(-10) || String(n || '').trim().toLowerCase();
+}
+
+// ── Agent presence (round robin: only ring agents who are FREE) ───────────
+// When an agent accepts OR makes a call → mark them BUSY.
+// When a call ends (call-callback) OR they reject → mark them FREE.
+// On new incoming call, we only push SSE to FREE agents first.
+// If everyone is busy (or all rejected), fall back to ringing everyone.
+const agentStatus = new Map(); // emailLower → { status: 'free'|'busy', ts }
+
+function setAgentBusy(email, busy) {
+  const key = (email || '').toLowerCase();
+  if (!key) return;
+  agentStatus.set(key, { status: busy ? 'busy' : 'free', ts: Date.now() });
+  console.log(`[Presence] ${key} → ${busy ? 'BUSY' : 'FREE'}`);
+
+  if (!busy) {
+    // Agent just freed up — if a call is still ringing unclaimed and this
+    // agent hasn't already declined it, ring them immediately.
+    for (const [sid, callData] of Object.entries(pendingInboundMap)) {
+      if (claimedSids.has(sid)) continue;
+      const lock = callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
+      if (lock && lock.claimedBy) continue;
+      if (lock && lock.rejectedBy.has(key)) continue;
+      if (ssePush(key, 'inbound_call', { from: callData.from, callSid: sid })) {
+        console.log(`[Presence] Redirected ringing call ${sid} to newly-free agent ${key}`);
+      }
+    }
+  }
+}
+
+// ── /agent-status — popup.js reports busy/free for round robin ───
+app.post('/agent-status', (req, res) => {
+  const { email, status } = req.body || {};
+  if (!email || !['free', 'busy'].includes(status))
+    return res.status(400).json({ error: 'email and status ("free"|"busy") required' });
+  setAgentBusy(email, status === 'busy');
+  res.json({ ok: true });
+});
 
 // ── Incoming call (Exotel webhook) ────────────────────────────────
 app.all('/incoming-call', async (req, res) => {
@@ -695,38 +650,61 @@ app.all('/incoming-call', async (req, res) => {
   const et = (p.EventType || p.Status || '').toLowerCase();
   if (['free','terminal','completed','busy','noanswer'].includes(et)) return res.json({ status: 'ignored' });
   try {
-    const from  = p.From || p.CallFrom || p.caller_id || p.CallerId || p.callerid || 'Unknown';
-    const sid   = p.CallSid || p.call_sid || ('in_' + Date.now());
-    const toNum = p.To || p.DialWhomNumber || p.CallTo || VIRTUAL_NUMBER || 'Unknown';
+    const from   = p.From || p.CallFrom || p.caller_id || p.CallerId || p.callerid || 'Unknown';
+    const toNum  = p.To || p.DialWhomNumber || p.CallTo || VIRTUAL_NUMBER || 'Unknown';
+    const rawSid = p.CallSid || p.call_sid || p.ParentCallSid || p.DialCallSid || null;
+    const phoneKey = normalizePhone(from);
 
-    // Block re-broadcast if this call was already claimed (Exotel sends one
-    // Dial webhook per SIP leg it tries — we only want the first broadcast).
-    if (claimedSids.has(sid)) {
-      console.log(`[Incoming] SKIP broadcast — ${sid} already claimed`);
+    // Collapse every duplicate ping for this caller onto ONE lock/sid.
+    // This is the fix: regardless of what CallSid Exotel sends on each ping,
+    // we use the caller's number as the stable dedup key.
+    let lock  = callerLocks.get(phoneKey);
+    const stale = lock && (Date.now() - lock.ts > LOCK_TTL_MS) && !lock.claimedBy;
+    if (!lock || stale) {
+      lock = {
+        sid:        rawSid || ('in_' + Date.now() + '_' + phoneKey),
+        claimedBy:  null,
+        rejectedBy: new Set(),
+        ts:         Date.now()
+      };
+      callerLocks.set(phoneKey, lock);
+    }
+    const sid = lock.sid;
+
+    // If already claimed, silently ignore all subsequent pings for this caller.
+    if (lock.claimedBy || claimedSids.has(sid)) {
+      console.log(`[Incoming] SKIP broadcast — ${sid} (from ${from}) already claimed by ${lock.claimedBy}`);
       return res.json({ status: 'already_claimed' });
     }
 
-    // Store the call so: (a) agents that missed the SSE get it via poll,
-    // (b) /claim-call can read 'from' when registering with BX24.
-    // BX24 registration is intentionally deferred to /claim-call so the CRM
-    // activity is attributed to the agent who actually answers, not a hardcoded user.
-    pendingInboundMap[sid] = { from, to: toNum, ts: Date.now() };
+    // Store the call data (used by /claim-call for BX24 registration).
+    pendingInboundMap[sid] = { from, to: toNum, ts: Date.now(), phoneKey };
 
-    // Broadcast to every connected agent — all of them show the incoming UI.
-    // callSid is included so popup.js can reference it when claiming.
-    const pushed = Object.keys(sseClients).reduce((n, agentEmail) => {
-      return n + (ssePush(agentEmail, 'inbound_call', { from, callSid: sid }) ? 1 : 0);
-    }, 0);
-    console.log(`[Incoming] sid=${sid} from=${from} → broadcast to ${pushed} SSE agent(s)`);
+    // Round robin: ring only FREE agents first.
+    // Skip agents who are busy AND agents who already rejected this specific call.
+    // If everyone is busy or has rejected, fall back to ringing all non-rejectors.
+    // If literally everyone rejected, ring everyone (so the call isn't silently dropped).
+    const allAgents = Object.keys(sseClients);
+    let targets = allAgents.filter(e =>
+      (agentStatus.get(e)?.status !== 'busy') && !lock.rejectedBy.has(e)
+    );
+    if (targets.length === 0) targets = allAgents.filter(e => !lock.rejectedBy.has(e));
+    if (targets.length === 0) targets = allAgents;
+
+    const pushed = targets.reduce((n, agentEmail) =>
+      n + (ssePush(agentEmail, 'inbound_call', { from, callSid: sid }) ? 1 : 0), 0);
+    console.log(`[Incoming] sid=${sid} from=${from} → broadcast to ${pushed}/${allAgents.length} agent(s) (free targets: ${targets.length})`);
 
     res.json({ status: 'received' });
   } catch (e) { console.error('[Incoming]', e.message); res.json({ status: 'error', message: e.message }); }
 });
 
 // ── Inbound call claim ────────────────────────────────────────────
-// Called by the first agent to click "Accept". Atomically marks the call as
-// claimed, registers it in BX24 under that agent, and tells every other
-// connected agent to dismiss their incoming UI.
+// Called by the FIRST agent to click "Accept".
+// Atomically claims the call, marks that agent busy (round robin),
+// closes the caller-lock so duplicate Exotel webhook pings are dropped,
+// registers the call in BX24 under that agent, and tells every OTHER
+// agent to dismiss their incoming UI.
 app.post('/claim-call', async (req, res) => {
   const { callSid, email, bx24UserId } = req.body;
   if (!callSid || !email) return res.status(400).json({ error: 'callSid and email required' });
@@ -739,12 +717,22 @@ app.post('/claim-call', async (req, res) => {
   }
 
   inboundClaimMap[callSid] = { email, bx24UserId: bx24UserId || null, bx24CallId: null, ts: Date.now() };
-  claimedSids.add(callSid);  // prevent re-broadcast on duplicate Exotel webhooks
+  claimedSids.add(callSid);
   console.log(`[Claim] ${email} claimed ${callSid}`);
+
+  // Close the caller-lock — this stops every subsequent duplicate Exotel webhook
+  // ping (even with a different/missing CallSid) from re-broadcasting to anyone.
+  const callData = pendingInboundMap[callSid];
+  if (callData && callData.phoneKey) {
+    const lock = callerLocks.get(callData.phoneKey);
+    if (lock) lock.claimedBy = email.toLowerCase();
+  }
+
+  // Round robin: mark this agent busy so new calls skip them.
+  setAgentBusy(email, true);
 
   // Register the call in BX24 under the claiming agent's user ID.
   let bx24CallId = callSid;
-  const callData = pendingInboundMap[callSid];
   if (BX24_WEBHOOK && callData) {
     try {
       const agentBx24Id = bx24UserId || BX24_USER_ID;
@@ -755,7 +743,7 @@ app.post('/claim-call', async (req, res) => {
         CALL_START_DATE: new Date().toISOString(),
         CRM_CREATE:      true,
         LINE_NUMBER:     callData.to || VIRTUAL_NUMBER || '',
-        SHOW:            0   // popup already showed it via SSE; suppress duplicate BX24 widget
+        SHOW:            0
       });
       bx24CallId = (r && r.CALL_ID) || callSid;
       inboundClaimMap[callSid].bx24CallId = bx24CallId;
@@ -765,7 +753,7 @@ app.post('/claim-call', async (req, res) => {
     }
   }
 
-  // Tell every OTHER agent to dismiss the incoming UI.
+  // Tell every OTHER agent to dismiss their incoming UI.
   const claimerKey = email.toLowerCase();
   Object.keys(sseClients).forEach(agentEmail => {
     if (agentEmail !== claimerKey) {
@@ -774,6 +762,25 @@ app.post('/claim-call', async (req, res) => {
   });
 
   res.json({ claimed: true, bx24CallId });
+});
+
+// ── Inbound call reject ────────────────────────────────────────────
+// Called when an agent clicks "Reject". This does NOT claim the call —
+// the call keeps ringing for every other free agent who hasn't rejected it.
+// We record the rejection so this agent's screen doesn't keep popping up
+// for the same call on every subsequent Exotel webhook ping.
+// If an agent rejects, they are set back to FREE (round robin: don't penalize
+// them for one rejection — a future different call should still ring them).
+app.post('/reject-call', (req, res) => {
+  const { callSid, email } = req.body || {};
+  if (!callSid || !email) return res.status(400).json({ error: 'callSid and email required' });
+  const callData = pendingInboundMap[callSid];
+  const lock = callData && callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
+  if (lock) lock.rejectedBy.add(email.toLowerCase());
+  // Set agent back to free — rejecting doesn't make them busy
+  setAgentBusy(email, false);
+  console.log(`[Reject] ${email} declined ${callSid} — still ringing for other free agents`);
+  res.json({ ok: true });
 });
 
 // ── Call ended (Exotel webhook) ───────────────────────────────────
@@ -785,14 +792,21 @@ app.all('/call-callback', async (req, res) => {
     const duration = parseInt(p.Duration || p.duration || '0');
     const status   = p.Status  || p.status  || 'completed';
 
-    // Use the claiming agent's BX24 data; fall back to env BX24_USER_ID for
-    // calls that were never claimed (e.g. abandoned before any agent answered).
     const claim    = inboundClaimMap[sid];
     const bx24Id   = claim ? claim.bx24CallId : sid;
     const agentId  = claim ? (claim.bx24UserId || BX24_USER_ID) : BX24_USER_ID;
-    if (claim)  delete inboundClaimMap[sid];
+
+    // Round robin: free up the agent who was on this call
+    if (claim) {
+      setAgentBusy(claim.email, false);
+      delete inboundClaimMap[sid];
+    }
+
+    // Release the caller-lock so a future call from the same number works normally
+    const callData = pendingInboundMap[sid];
+    if (callData && callData.phoneKey) callerLocks.delete(callData.phoneKey);
     if (pendingInboundMap[sid]) delete pendingInboundMap[sid];
-    claimedSids.delete(sid);  // release so memory doesn't grow forever
+    claimedSids.delete(sid);
 
     if (BX24_WEBHOOK && bx24Id)
       await bx24Call('telephony.externalcall.finish', {
@@ -800,8 +814,6 @@ app.all('/call-callback', async (req, res) => {
         STATUS_CODE: status === 'completed' ? 200 : 304
       });
 
-    // Auto-sync recording for this call into BX24 Activity timeline.
-    // Run async — don't block the webhook response.
     const callFrom   = (p.From || p.CallFrom || p.caller_id || '').trim();
     const agentEmail = claim ? claim.email : null;
     if (callFrom) {
@@ -847,12 +859,9 @@ app.get('/setup', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── /list-users — returns LIVE CCM co-worker data (always up to date) ──
-// Shows every agent with their current SIP device status, exactly as
-// the Exotel dashboard shows. No stale usermapping cache.
 app.get('/list-users', async (req, res) => {
   try {
-    const mapped = await getMappedUserMap(true); // always fresh for this manual-check endpoint
+    const mapped = await getMappedUserMap(true);
     const users  = Array.from(mapped.values()).map(u => {
       const creds = extractMappingCredentials(u);
       return {
@@ -863,32 +872,25 @@ app.get('/list-users', async (req, res) => {
         status:         u.IsActive ? 'active' : 'inactive',
         sip_devices:    creds.map(c => ({ sip_id: c.sip_id, virtual_number: c.virtual_number })),
         has_sip:        creds.length > 0 && !!creds[0].sip_secret,
-        raw:            u   // full usermapping row for debugging
+        raw:            u
       };
     });
     res.json({ total: users.length, source: 'usermapping_live', users });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── /sync-users — manually trigger sync (also runs on startup + every 5min) ──
 app.post('/sync-users', async (req, res) => {
   try { res.json(await syncUsers()); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Alias — same thing, useful to trigger from browser
 app.get('/force-resync', async (req, res) => {
   try {
-    _mapCache = null;  // force fresh usermapping data
+    _mapCache = null;
     res.json(await syncUsers());
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── /create-user — MANUAL OVERRIDE ONLY ───────────────────────────
-// You should NOT need this in normal operation: Exotel creates the
-// usermapping row automatically when a Co-worker is invited + verified.
-// Use this only if Exotel support tells you auto-provisioning is off for
-// your account, or you need to map a user with a different AppUserId.
 app.post('/create-user', async (req, res) => {
   try {
     const { appUserId, appUsername, email, agentNumber, virtualNumber } = req.body;
@@ -909,7 +911,6 @@ app.post('/create-user', async (req, res) => {
 app.delete('/delete-user/:appUserId', async (req, res) => {
   try {
     const at = await getAppToken();
-    // Try to find the user in usermapping to get ExotelUserId (the correct delete key)
     const allUsers = await fetchAllMappedUsers(at);
     const target = allUsers.find(u => u.AppUserId === req.params.appUserId);
     const sipUsername = target && target.SipId ? target.SipId.replace(/^sip:/, '') : null;
@@ -918,7 +919,6 @@ app.delete('/delete-user/:appUserId', async (req, res) => {
       req.params.appUserId,
       sipUsername
     ].filter(Boolean);
-
     for (const key of candidates) {
       const r = await fetch(`${BASE}/usermapping/${encodeURIComponent(key)}`, {
         method: 'DELETE', headers: { 'Authorization': at }
@@ -932,9 +932,6 @@ app.delete('/delete-user/:appUserId', async (req, res) => {
 });
 
 // ── /token — THE critical endpoint ───────────────────────────────
-// Looks up the agent by email in the LIVE CCM co-workers list.
-// This guarantees SIP credentials are always fresh — no stale usermapping cache.
-// The app token (for the SDK constructor) still comes from the Exotel integration API.
 app.get('/token', async (req, res) => {
   try {
     const { user_id, bx24_user_id } = req.query;
@@ -948,16 +945,12 @@ app.get('/token', async (req, res) => {
     if (!lookupEmail) return res.status(400).json({ error: 'user_id (email) required' });
     const emailKey = lookupEmail.toLowerCase();
 
-    // App token (JWT) is REQUIRED on every single call to integrationscore —
-    // including GETs. getAppToken() caches it (~58 min) and auto-refreshes;
-    // you never generate it manually.
     const [appToken, mapped] = await Promise.all([getAppToken(), getMappedUserMap()]);
 
     let mappedUser = mapped.get(emailKey);
     let creds      = extractMappingCredentials(mappedUser);
 
     if (!mappedUser || creds.length === 0 || !creds[0].sip_secret) {
-      // Likely just invited/verified — force one fresh GET before giving up.
       console.log(`[Token] No usable usermapping row for ${lookupEmail} — forcing refresh`);
       const fresh = await getMappedUserMap(true);
       mappedUser  = fresh.get(emailKey);
@@ -990,16 +983,8 @@ app.get('/token', async (req, res) => {
 
 function sendTokenResponse(res, appToken, userObj, creds, email) {
   const primary = creds[0];
-
-  // CRITICAL: crmBundle.js (the SDK) makes its OWN call to
-  // GET /usermapping?user_id=<appUserId> to verify identity, independent of
-  // our server. That value MUST exactly equal the literal "AppUserId" field
-  // stored on the usermapping row (e.g. "124") — NOT the SIP username
-  // ("arjunb23aca3e4"). Using the SIP username here is exactly what produces
-  // "User mapping not found for user_id: ..." / 404 in the SDK console.
   const sipUsername = primary.sip_id.replace(/^sip:/i, '');
   const appUserId    = String(userObj.AppUserId || sipUsername || userObj.id || email);
-
   const name = userObj.AppUsername || userObj.ExotelUserName ||
     [userObj.first_name, userObj.last_name].filter(Boolean).join(' ') ||
     userObj.Email || userObj.email || email;
@@ -1025,8 +1010,6 @@ function sendTokenResponse(res, appToken, userObj, creds, email) {
     virtual_number:   primary.virtual_number || VIRTUAL_NUMBER || '',
     name,
     multiCredentials: creds.map((c) => ({
-      // Same appUserId for every device of this user — it identifies the
-      // usermapping ROW, not the individual SIP device.
       app_user_id:    appUserId,
       sip_id:         c.sip_id,
       sip_secret:     c.sip_secret,
@@ -1034,7 +1017,6 @@ function sendTokenResponse(res, appToken, userObj, creds, email) {
     }))
   });
 }
-
 
 // ── Static files ──────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
@@ -1046,9 +1028,7 @@ recordings.init(app);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Exotel WebSDK server on port ${PORT} | SIP: ${SIP_FB} | India: ${isIndia}`);
-  // Run sync at startup
   const result = await syncUsers();
   console.log('[Startup] Sync:', JSON.stringify(result));
-  // Re-sync every 5 minutes to catch co-worker additions/deletions
   setInterval(syncUsers, 5 * 60 * 1000);
 });
