@@ -127,10 +127,50 @@ async function fetchAllMappedUsers(at) {
   return allUsers;
 }
 
-// ── CCM Users API — single source of truth ───────────────────────
-// All SIP credentials come LIVE from the CCM co-workers API.
-// No usermapping cache needed for /token — usermapping is only used for
-// the ExotelCRMWebSDK constructor token (app token), not SIP credentials.
+// ── usermapping live user map — PRIMARY credential source ────────
+// Exotel auto-creates a /usermapping entry (with SipId/SipSecret/VirtualNumber
+// filled in) for every Co-worker the moment they're invited AND verify their
+// SIP device. We never POST to create it — we only READ + cache this list.
+let _mapCache    = null;   // Map<emailLower, usermapping row>
+let _mapCacheExp = 0;
+let _mapInflight = null;
+
+async function getMappedUserMap(force) {
+  const now = Date.now();
+  if (!force && _mapCache && now < _mapCacheExp) return _mapCache;
+  if (_mapInflight) return _mapInflight;
+
+  _mapInflight = (async () => {
+    try {
+      const at    = await getAppToken();              // JWT — required on EVERY call
+      const users = await fetchAllMappedUsers(at);
+      const map   = new Map();
+      users.forEach(u => { if (u.Email) map.set(u.Email.toLowerCase(), u); });
+      _mapCache    = map;
+      _mapCacheExp = Date.now() + 60000; // 60 s TTL
+      console.log(`[Mapping] Cache refreshed: ${map.size} user(s)`);
+      return map;
+    } finally {
+      _mapInflight = null;
+    }
+  })();
+  return _mapInflight;
+}
+
+// Extract SIP credentials straight from a usermapping row (capitalized fields).
+function extractMappingCredentials(u) {
+  if (!u || !u.SipId) return [];
+  return [{
+    sip_id:         u.SipId,
+    sip_secret:     u.SipSecret || '',
+    virtual_number: u.VirtualNumber || VIRTUAL_NUMBER || ''
+  }];
+}
+
+// ── CCM Users API — kept only as an emergency fallback ────────────
+// /token now reads from usermapping (above) as the PRIMARY source. This CCM
+// path is only used as a fallback if a mapping row is missing or unverified
+// (set ENABLE_CCM_FALLBACK=1 to re-enable the lookups that use it below).
 //
 // CCM API endpoint (Basic Auth with API_KEY:API_TOKEN):
 //   GET /v2/accounts/<sid>/users?fields=devices
@@ -318,12 +358,31 @@ async function autoRegisterUser(email, name, appToken) {
   }
 }
 
-// ── AUTO-SYNC: CCM co-workers ↔ /usermapping ─────────────────────
-// Uses the correct CCM Users API (Basic Auth on ccm-api.in.exotel.com).
-// Runs at startup and every 5 minutes.
-// ADD: CCM users whose email isn't in usermapping yet.
-// DELETE: usermapping entries whose email no longer exists in CCM.
+// ── REFRESH (read-only): keep the usermapping cache warm ──────────
+// Exotel owns usermapping end-to-end: it ADDS a row automatically when you
+// invite a Co-worker, FILLS IN SipId/SipSecret automatically once they verify
+// their SIP device, and REMOVES the row automatically if you remove the
+// Co-worker. We must NOT call POST/DELETE on usermapping ourselves — that's
+// exactly what was causing duplicate AppUserIds / clashing SIP secrets before.
+// This function just forces a fresh GET so /token never serves stale data.
+// Runs at startup and every 5 minutes (see app.listen below).
 async function syncUsers() {
+  console.log('[Sync] Refreshing usermapping cache (read-only)...');
+  try {
+    const map = await getMappedUserMap(true);
+    console.log(`[Sync] Cache refreshed: ${map.size} user(s) in usermapping`);
+    return { refreshed: true, total_mapped: map.size };
+  } catch (e) {
+    console.error('[Sync] Error:', e.message);
+    return { error: e.message };
+  }
+}
+
+// ── LEGACY: old CCM-based create/migrate/delete sync ──────────────
+// No longer called (renamed below). Kept only for reference / emergency
+// rollback — do not wire this back up unless Exotel tells you usermapping
+// rows are NOT being auto-created for your account.
+async function legacySyncUsersFromCcm() {
   console.log('[Sync] Starting CCM sync...');
   try {
     // 1. Fetch all co-workers from CCM Users API
@@ -793,21 +852,21 @@ app.get('/setup', async (req, res) => {
 // the Exotel dashboard shows. No stale usermapping cache.
 app.get('/list-users', async (req, res) => {
   try {
-    _ccmCache = null; // force a fresh fetch so this is always live
-    const ccmMap = await getCcmUserMap();
-    const users  = Array.from(ccmMap.values()).map(u => {
-      const creds = extractSipCredentials(u);
+    const mapped = await getMappedUserMap(true); // always fresh for this manual-check endpoint
+    const users  = Array.from(mapped.values()).map(u => {
+      const creds = extractMappingCredentials(u);
       return {
-        email:         u.email,
-        name:          [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email,
-        ccm_id:        u.id,
-        status:        u.status || 'unknown',
-        sip_devices:   creds.map(c => ({ sip_id: c.sip_id, virtual_number: c.virtual_number })),
-        has_sip:       creds.length > 0,
-        raw:           u   // full CCM object for debugging
+        email:          u.Email,
+        name:           u.AppUsername || u.ExotelUserName || u.Email,
+        app_user_id:    u.AppUserId,
+        exotel_user_id: u.ExotelUserId,
+        status:         u.IsActive ? 'active' : 'inactive',
+        sip_devices:    creds.map(c => ({ sip_id: c.sip_id, virtual_number: c.virtual_number })),
+        has_sip:        creds.length > 0 && !!creds[0].sip_secret,
+        raw:            u   // full usermapping row for debugging
       };
     });
-    res.json({ total: users.length, source: 'ccm_live', users });
+    res.json({ total: users.length, source: 'usermapping_live', users });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -820,11 +879,16 @@ app.post('/sync-users', async (req, res) => {
 // Alias — same thing, useful to trigger from browser
 app.get('/force-resync', async (req, res) => {
   try {
-    _ccmCache = null;  // force fresh CCM data
+    _mapCache = null;  // force fresh usermapping data
     res.json(await syncUsers());
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── /create-user — MANUAL OVERRIDE ONLY ───────────────────────────
+// You should NOT need this in normal operation: Exotel creates the
+// usermapping row automatically when a Co-worker is invited + verified.
+// Use this only if Exotel support tells you auto-provisioning is off for
+// your account, or you need to map a user with a different AppUserId.
 app.post('/create-user', async (req, res) => {
   try {
     const { appUserId, appUsername, email, agentNumber, virtualNumber } = req.body;
@@ -882,74 +946,60 @@ app.get('/token', async (req, res) => {
         return res.status(400).json({ error: `Cannot resolve email for BX24 user ${bx24_user_id}` });
     }
     if (!lookupEmail) return res.status(400).json({ error: 'user_id (email) required' });
+    const emailKey = lookupEmail.toLowerCase();
 
-    // Fetch app token (for SDK constructor) and live CCM data in parallel
-    const [appToken, ccmMap] = await Promise.all([getAppToken(), getCcmUserMap()]);
+    // App token (JWT) is REQUIRED on every single call to integrationscore —
+    // including GETs. getAppToken() caches it (~58 min) and auto-refreshes;
+    // you never generate it manually.
+    const [appToken, mapped] = await Promise.all([getAppToken(), getMappedUserMap()]);
 
-    const ccmUser = ccmMap.get(lookupEmail.toLowerCase());
-    if (!ccmUser) {
-      // Force a cache refresh in case user was just added
-      _ccmCache = null;
-      const freshMap = await getCcmUserMap();
-      const freshUser = freshMap.get(lookupEmail.toLowerCase());
-      if (!freshUser) {
-        return res.status(404).json({
-          error: `${lookupEmail} not found in Exotel co-workers. Add them in the Exotel dashboard first.`
-        });
-      }
-      Object.assign(ccmUser || {}, freshUser);
-      // Re-assign for below
-      const creds = extractSipCredentials(freshUser);
-      return sendTokenResponse(res, appToken, freshUser, creds, lookupEmail);
+    let mappedUser = mapped.get(emailKey);
+    let creds      = extractMappingCredentials(mappedUser);
+
+    if (!mappedUser || creds.length === 0 || !creds[0].sip_secret) {
+      // Likely just invited/verified — force one fresh GET before giving up.
+      console.log(`[Token] No usable usermapping row for ${lookupEmail} — forcing refresh`);
+      const fresh = await getMappedUserMap(true);
+      mappedUser  = fresh.get(emailKey);
+      creds       = extractMappingCredentials(mappedUser);
     }
 
-    let creds = extractSipCredentials(ccmUser);
-
-    // If no creds found OR sip_secret is missing, do a live per-user fetch as fallback
-    if (creds.length === 0 || creds.every(c => !c.sip_secret)) {
-      console.log(`[Token] No SIP creds in cache for ${lookupEmail}, fetching live per-user data...`);
-      const liveUser = await fetchCcmUserById(ccmUser.id);
-      if (liveUser) {
-        // Merge live device data back
-        if (liveUser.devices && liveUser.devices.length > 0) ccmUser.devices = liveUser.devices;
-        if (liveUser.sip_secret) ccmUser.sip_secret = liveUser.sip_secret;
-        creds = extractSipCredentials(ccmUser);
-      }
-    }
-
-    if (creds.length === 0) {
-      return res.status(500).json({
-        error: `${lookupEmail} found in CCM but has no SIP device assigned. ` +
-          'Check the Exotel dashboard — their softphone may be UNVERIFIED or not set up.'
+    if (!mappedUser) {
+      return res.status(404).json({
+        error: `${lookupEmail} not found in Exotel usermapping yet. Invite them as a Co-worker in ` +
+          'Exotel and have them verify their SIP softphone — Exotel adds the row automatically ' +
+          '(usually within a minute, definitely within 5).'
       });
     }
-
-    if (creds.every(c => !c.sip_secret)) {
-      console.warn(`[Token] WARNING: SIP secret missing for ${lookupEmail} — SDK may fail to register. ` +
-        'Check if the Exotel CCM API exposes sip_secret for this account tier.');
+    if (creds.length === 0) {
+      return res.status(500).json({
+        error: `${lookupEmail} exists in usermapping but has no SipId yet — their device is ` +
+          'probably UNVERIFIED. Ask them to complete verification in the Exotel app/SMS link.'
+      });
+    }
+    if (!creds[0].sip_secret) {
+      console.warn(`[Token] WARNING: SipSecret missing for ${lookupEmail} — SDK may fail to register.`);
     }
 
-    return sendTokenResponse(res, appToken, ccmUser, creds, lookupEmail);
+    return sendTokenResponse(res, appToken, mappedUser, creds, lookupEmail);
   } catch (e) {
     console.error('[Token] Error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-function sendTokenResponse(res, appToken, ccmUser, creds, email) {
+function sendTokenResponse(res, appToken, userObj, creds, email) {
   const primary = creds[0];
 
   // The SDK's appUserId must match what Exotel has in usermapping.
-  // Priority:
-  //  1. SIP username from contact_uri (e.g. "arjunb23aca3e4") — what Exotel uses internally
-  //  2. ccmUser.id (CCM UUID) — stable fallback
-  //  3. email — last resort
   const sipUsername = primary.sip_id.replace(/^sip:/i, ''); // strips "sip:" prefix
-  const appUserId   = sipUsername || String(ccmUser.id || email);
+  const appUserId    = sipUsername || String(userObj.AppUserId || userObj.id || email);
 
-  const name = [ccmUser.first_name, ccmUser.last_name].filter(Boolean).join(' ') || ccmUser.email || email;
+  const name = userObj.AppUsername || userObj.ExotelUserName ||
+    [userObj.first_name, userObj.last_name].filter(Boolean).join(' ') ||
+    userObj.Email || userObj.email || email;
 
-  console.log('[Token] Issued from CCM:', {
+  console.log('[Token] Issued from usermapping:', {
     email,
     appUserId,
     sip_username: sipUsername,
@@ -977,6 +1027,7 @@ function sendTokenResponse(res, appToken, ccmUser, creds, email) {
     }))
   });
 }
+
 
 // ── Static files ──────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
