@@ -991,9 +991,14 @@ app.get('/token', async (req, res) => {
 function sendTokenResponse(res, appToken, userObj, creds, email) {
   const primary = creds[0];
 
-  // The SDK's appUserId must match what Exotel has in usermapping.
-  const sipUsername = primary.sip_id.replace(/^sip:/i, ''); // strips "sip:" prefix
-  const appUserId    = sipUsername || String(userObj.AppUserId || userObj.id || email);
+  // CRITICAL: crmBundle.js (the SDK) makes its OWN call to
+  // GET /usermapping?user_id=<appUserId> to verify identity, independent of
+  // our server. That value MUST exactly equal the literal "AppUserId" field
+  // stored on the usermapping row (e.g. "124") — NOT the SIP username
+  // ("arjunb23aca3e4"). Using the SIP username here is exactly what produces
+  // "User mapping not found for user_id: ..." / 404 in the SDK console.
+  const sipUsername = primary.sip_id.replace(/^sip:/i, '');
+  const appUserId    = String(userObj.AppUserId || sipUsername || userObj.id || email);
 
   const name = userObj.AppUsername || userObj.ExotelUserName ||
     [userObj.first_name, userObj.last_name].filter(Boolean).join(' ') ||
@@ -1020,7 +1025,9 @@ function sendTokenResponse(res, appToken, userObj, creds, email) {
     virtual_number:   primary.virtual_number || VIRTUAL_NUMBER || '',
     name,
     multiCredentials: creds.map((c) => ({
-      app_user_id:    c.sip_id.replace(/^sip:/i, ''),   // SIP username IS the appUserId for SDK
+      // Same appUserId for every device of this user — it identifies the
+      // usermapping ROW, not the individual SIP device.
+      app_user_id:    appUserId,
       sip_id:         c.sip_id,
       sip_secret:     c.sip_secret,
       virtual_number: c.virtual_number || VIRTUAL_NUMBER || ''
