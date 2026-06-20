@@ -177,9 +177,9 @@ async function getCcmUserMap() {
 }
 
 // Fetch all CCM co-workers with full device/SIP data.
-// CCM response per user (with ?fields=devices):
-//   { id, email, first_name, last_name, status,
-//     devices: [ { sip_id, sip_secret, virtual_number, device_id, ... } ] }
+// The CCM list endpoint wraps each user as: { code, status, data: { ...user, devices: [...] } }
+// Each device has: { id, name, contact_uri: "sip:username", type, available, verified, status }
+// The SIP secret is NOT in the list response — we fetch it per-user via GET /users/:id?fields=devices
 async function fetchAllCcmUsers() {
   const users = [];
   let offset = 0;
@@ -190,35 +190,83 @@ async function fetchAllCcmUsers() {
     const raw  = await res.text();
     if (!res.ok) throw new Error(`CCM Users API HTTP ${res.status}: ${raw.slice(0, 200)}`);
     const data = JSON.parse(raw);
-    console.log('[CCM] Raw sample (first user):', JSON.stringify((data.response||[])[0] || {}).slice(0,400));
-    const page = (data.response || []).map(r => r.data || r).filter(u => u && u.email);
+
+    // Response is an array of { code, status, data: { ...user } } objects
+    const rawList = Array.isArray(data) ? data : (data.response || data.data || []);
+    console.log('[CCM] Raw sample (first user):', JSON.stringify(rawList[0] || {}).slice(0, 400));
+
+    // Unwrap each item: item.data contains the actual user object
+    const page = rawList.map(r => r.data || r).filter(u => u && u.email);
     users.push(...page);
+
     const meta = data.metadata || {};
     if (users.length >= (meta.total || users.length) || page.length < limit) break;
     offset += limit;
   }
+
+  // Fetch SIP secret for each user individually (not returned in list endpoint)
+  await Promise.all(users.map(async u => {
+    try {
+      const url = `${getCcmBaseUrl()}/${u.id}?fields=devices`;
+      const res  = await fetch(url, { headers: { 'Authorization': getCcmBasicAuth() } });
+      if (!res.ok) return;
+      const raw  = await res.text();
+      const body = JSON.parse(raw);
+      // Individual user response: { code, status, data: { ...user, devices: [...] } }
+      const userData = body.data || body;
+      const devices  = userData.devices || u.devices || [];
+      // Enrich devices with sip_secret from individual response
+      u.devices = devices;
+      // Also try top-level sip_secret fields
+      if (!u.sip_secret && userData.sip_secret) u.sip_secret = userData.sip_secret;
+    } catch (e) {
+      console.warn(`[CCM] Could not fetch individual user ${u.id} (${u.email}):`, e.message);
+    }
+  }));
+
   return users;
 }
 
+// Fetch a single CCM user by their CCM user ID (used as fast cache refresh for /token)
+async function fetchCcmUserById(ccmId) {
+  try {
+    const url = `${getCcmBaseUrl()}/${ccmId}?fields=devices`;
+    const res  = await fetch(url, { headers: { 'Authorization': getCcmBasicAuth() } });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body.data || body;
+  } catch (e) {
+    return null;
+  }
+}
+
 // Extract SIP credential(s) for a CCM user.
-// The CCM API returns devices[] on each user when ?fields=devices is passed.
-// Each device has sip_id, sip_secret, virtual_number.
-// We return ALL devices so popup.js can try each in order (same multi-credential flow).
+// The Exotel CCM API returns devices like:
+//   { id, name, contact_uri: "sip:arjunb23aca3e4", type: "sip", available, verified, status, sip_secret? }
+// contact_uri is the SIP username field (not sip_id).
+// sip_secret may be on the device object or on the user object directly.
 function extractSipCredentials(ccmUser) {
-  const devices = ccmUser.devices || [];
+  const devices = (ccmUser.devices || []).filter(d => d.type === 'sip');
+
   if (devices.length === 0) {
-    // Fallback: some CCM responses put sip fields directly on the user object
-    const sipId = ccmUser.sip_id || ccmUser.sipId || ccmUser.SipId || '';
-    const sipSecret = ccmUser.sip_secret || ccmUser.sipSecret || ccmUser.SipSecret || '';
-    const vn = ccmUser.virtual_number || ccmUser.VirtualNumber || VIRTUAL_NUMBER || '';
+    // Fallback: some responses put sip fields directly on the user object
+    const sipId     = ccmUser.contact_uri || ccmUser.sip_id || ccmUser.sipId || ccmUser.SipId || '';
+    const sipSecret = ccmUser.sip_secret  || ccmUser.sipSecret || ccmUser.SipSecret || '';
+    const vn        = ccmUser.virtual_number || ccmUser.VirtualNumber || VIRTUAL_NUMBER || '';
     if (sipId) return [{ sip_id: sipId, sip_secret: sipSecret, virtual_number: vn }];
     return [];
   }
-  return devices.map(d => ({
-    sip_id:         d.sip_id        || d.SipId        || '',
-    sip_secret:     d.sip_secret    || d.SipSecret    || '',
-    virtual_number: d.virtual_number|| d.VirtualNumber|| VIRTUAL_NUMBER || ''
-  })).filter(d => d.sip_id);
+
+  // User-level secret fallback (some accounts return it here instead of per-device)
+  const userSecret = ccmUser.sip_secret || ccmUser.sipSecret || ccmUser.SipSecret || '';
+
+  return devices.map(d => {
+    // contact_uri is "sip:arjunb23aca3e4" — that IS the SIP ID
+    const sipId     = d.contact_uri || d.sip_id || d.SipId || '';
+    const sipSecret = d.sip_secret  || d.SipSecret || userSecret || '';
+    const vn        = d.virtual_number || d.VirtualNumber || ccmUser.virtual_number || VIRTUAL_NUMBER || '';
+    return { sip_id: sipId, sip_secret: sipSecret, virtual_number: vn };
+  }).filter(d => d.sip_id);
 }
 
 // ── AUTO-REGISTER: create a usermapping entry on first login ──────
@@ -792,12 +840,30 @@ app.get('/token', async (req, res) => {
       return sendTokenResponse(res, appToken, freshUser, creds, lookupEmail);
     }
 
-    const creds = extractSipCredentials(ccmUser);
+    let creds = extractSipCredentials(ccmUser);
+
+    // If no creds found OR sip_secret is missing, do a live per-user fetch as fallback
+    if (creds.length === 0 || creds.every(c => !c.sip_secret)) {
+      console.log(`[Token] No SIP creds in cache for ${lookupEmail}, fetching live per-user data...`);
+      const liveUser = await fetchCcmUserById(ccmUser.id);
+      if (liveUser) {
+        // Merge live device data back
+        if (liveUser.devices && liveUser.devices.length > 0) ccmUser.devices = liveUser.devices;
+        if (liveUser.sip_secret) ccmUser.sip_secret = liveUser.sip_secret;
+        creds = extractSipCredentials(ccmUser);
+      }
+    }
+
     if (creds.length === 0) {
       return res.status(500).json({
         error: `${lookupEmail} found in CCM but has no SIP device assigned. ` +
           'Check the Exotel dashboard — their softphone may be UNVERIFIED or not set up.'
       });
+    }
+
+    if (creds.every(c => !c.sip_secret)) {
+      console.warn(`[Token] WARNING: SIP secret missing for ${lookupEmail} — SDK may fail to register. ` +
+        'Check if the Exotel CCM API exposes sip_secret for this account tier.');
     }
 
     return sendTokenResponse(res, appToken, ccmUser, creds, lookupEmail);
@@ -828,7 +894,7 @@ function sendTokenResponse(res, appToken, ccmUser, creds, email) {
     user_id:          appUserId,
     email:            email,
     sip_id:           primary.sip_id,
-    sip_username:     primary.sip_id.replace(/^sip:/, ''),
+    sip_username:     primary.sip_id.replace(/^sip:/i, ''),
     sip_secret:       primary.sip_secret,
     virtual_number:   primary.virtual_number || VIRTUAL_NUMBER || '',
     name,
