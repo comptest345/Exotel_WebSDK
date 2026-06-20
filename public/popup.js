@@ -278,7 +278,9 @@ async function init() {
   // The SDK uses this to look up the SIP registration on Exotel's side.
   const credentials = tokenData.multiCredentials || [
     {
-      app_user_id:  String(tokenData.sip_username || tokenData.app_user_id || tokenData.user_id || ''),
+      // app_user_id must be the usermapping "AppUserId" field, not the SIP
+      // username — the SDK verifies identity against AppUserId internally.
+      app_user_id:  String(tokenData.app_user_id || tokenData.user_id || tokenData.sip_username || ''),
       sip_id:       tokenData.sip_id       || '',
       sip_secret:   tokenData.sip_secret   || '',
       virtual_number: tokenData.virtual_number || ''
