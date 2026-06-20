@@ -272,11 +272,20 @@ async function init() {
   }
 
   const accessToken = tokenData.access_token || tokenData.app_token;
+
+  // Build credentials list from multiCredentials, falling back to single entry.
+  // app_user_id must be the SIP username (e.g. "arjunb23aca3e4") — NOT the BX24 user ID.
+  // The SDK uses this to look up the SIP registration on Exotel's side.
   const credentials = tokenData.multiCredentials || [
-    { app_user_id: String(tokenData.app_user_id || tokenData.user_id || '') }
+    {
+      app_user_id:  String(tokenData.sip_username || tokenData.app_user_id || tokenData.user_id || ''),
+      sip_id:       tokenData.sip_id       || '',
+      sip_secret:   tokenData.sip_secret   || '',
+      virtual_number: tokenData.virtual_number || ''
+    }
   ];
 
-  if (!accessToken || credentials.length === 0) {
+  if (!accessToken || credentials.length === 0 || !credentials[0].app_user_id) {
     setReg('failed');
     setStatus('Missing token fields — check /list-users');
     clog('Bad token response: ' + JSON.stringify(tokenData));
@@ -284,9 +293,11 @@ async function init() {
     return;
   }
 
+  clog('Credentials ready: ' + credentials.map(c =>
+    'user=' + c.app_user_id + ' sip=' + c.sip_id + ' secret=' + (c.sip_secret ? '✓' : '✗')
+  ).join(' | '));
+
   // Step 3: Init ExotelCRMWebSDK — try each credential set until one registers.
-  // For single-entry agents this runs once. For Khushil (two entries) it tries
-  // the highest AppUserId first, then falls back to the second if that times out.
   setStatus('Connecting softphone...');
   await tryInitWithCredentials(accessToken, credentials, 0);
 }
@@ -304,8 +315,10 @@ async function tryInitWithCredentials(accessToken, creds, i) {
     return;
   }
 
-  const cred      = creds[i];
-  const appUserId = String(cred.app_user_id || '');
+  const cred        = creds[i];
+  const appUserId   = String(cred.app_user_id || '');
+  const sipSecret   = cred.sip_secret   || '';
+  const sipId       = cred.sip_id       || '';
   if (!appUserId) {
     clog('Credential #' + i + ' has no app_user_id — skipping');
     return tryInitWithCredentials(accessToken, creds, i + 1);
@@ -317,9 +330,20 @@ async function tryInitWithCredentials(accessToken, creds, i) {
     }
 
     clog('SDK init attempt ' + (i+1) + '/' + creds.length +
-         ' — token[0..20]=' + accessToken.slice(0,20) +
-         '... userId=' + appUserId);
-    const crmWebSDK = new ExotelCRMWebSDK(accessToken, appUserId, true);
+         ' — userId=' + appUserId +
+         ' sipId=' + sipId +
+         ' secret=' + (sipSecret ? '✓' : '✗ MISSING'));
+
+    // ExotelCRMWebSDK(token, appUserId, debug, options?)
+    // Pass sip_username + sip_secret in options so the SDK can register directly
+    // without needing to fetch credentials from Exotel's side separately.
+    const sdkOptions = sipSecret
+      ? { sip_username: appUserId, sip_password: sipSecret }
+      : undefined;
+
+    const crmWebSDK = sdkOptions
+      ? new ExotelCRMWebSDK(accessToken, appUserId, true, sdkOptions)
+      : new ExotelCRMWebSDK(accessToken, appUserId, true);
 
     let regFired = false;
     const regTimeout = setTimeout(() => {
