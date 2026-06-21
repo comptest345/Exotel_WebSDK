@@ -472,7 +472,18 @@ function startSSE() {
   });
 
   sseSource.onopen  = () => clog('SSE connected');
-  sseSource.onerror = () => clog('SSE error — will rely on poll fallback');
+  sseSource.onerror = () => {
+    clog('SSE error — reconnecting in 3s');
+    // Close and null out so startSSE() can create a fresh connection.
+    // Without this, the guard `if (sseSource) return` permanently blocks
+    // reconnection after the first drop, leaving agents with no SSE channel
+    // and inbound calls being broadcast to zero clients.
+    try { sseSource.close(); } catch (_) {}
+    sseSource = null;
+    setTimeout(() => {
+      if (!sseSource) startSSE();
+    }, 3000);
+  };
 }
 
 function startPollFallback() {
