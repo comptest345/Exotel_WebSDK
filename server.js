@@ -860,12 +860,36 @@ app.all('/call-callback', async (req, res) => {
         STATUS_CODE: status === 'completed' ? 200 : 304
       });
 
-    const callFrom   = (p.From || p.CallFrom || p.caller_id || '').trim();
+    const callFrom   = (p.From || p.CallFrom || p.caller_id || p.FromNumber || '').trim();
     const agentEmail = claim ? claim.email : null;
-    if (callFrom) {
-      recordings.syncRecordings({ phoneNumber: callFrom, agentEmail }).catch(e =>
-        console.warn('[Callback] Recording sync failed (non-fatal):', e.message)
-      );
+    // Outbound: FromNumber is the SIP URI (sip:arjunb23aca3e4), ToNumber is the client.
+    // Inbound:  From is the client number.
+    const clientNum  = (p.Direction || '').toLowerCase().includes('outbound')
+      ? (p.ToNumber || p.To || callFrom).trim()
+      : callFrom;
+
+    if (clientNum) {
+      // Exotel takes 2-5 minutes to process and generate a recording after a call ends.
+      // Syncing immediately always returns null (no recording yet) and permanently marks
+      // the callSid as skipped. Instead we retry at 2 min, 4 min, and 8 min after call end.
+      const syncWithRetry = (delayMs, attempt) => {
+        setTimeout(async () => {
+          try {
+            console.log(`[Callback] Recording sync attempt ${attempt} for ${clientNum} (delay ${delayMs/1000}s)`);
+            const result = await recordings.syncRecordings({ phoneNumber: clientNum, agentEmail, callSid: sid });
+            if (result && result.posted > 0) {
+              console.log(`[Callback] Recording synced on attempt ${attempt}: ${JSON.stringify(result)}`);
+            } else if (attempt < 3) {
+              syncWithRetry(delayMs * 2, attempt + 1); // exponential: 2min → 4min → 8min
+            } else {
+              console.log(`[Callback] Recording not found after ${attempt} attempts for ${clientNum}`);
+            }
+          } catch (e) {
+            console.warn(`[Callback] Recording sync attempt ${attempt} failed:`, e.message);
+          }
+        }, delayMs);
+      };
+      syncWithRetry(2 * 60 * 1000, 1); // first attempt 2 minutes after call ends
     }
 
     res.json({ status: 'received' });
