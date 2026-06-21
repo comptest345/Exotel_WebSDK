@@ -23,6 +23,9 @@ let currentInboundCallSid = null;  // set when an inbound call arrives; used for
 // duplicate Exotel webhooks fire and multiple calls arrive in quick succession.
 const dismissedCallSids = new Set();
 let dismissedAt      = 0;   // timestamp of last dismiss; used for native-SIP cooldown
+// Tracks the callSid WE just claimed+accepted. Prevents the poll fallback from
+// seeing "claimed" and calling showDialer() on our own screen while we're live.
+let acceptingCallSid = null;
 
 function log(msg) { console.log('[Dialer]', msg); }
 function clog(msg, extra) {
@@ -215,6 +218,7 @@ function showOutboundRinging(num) {
 function showDialer() {
   callDirection = null;
   currentInboundCallSid = null;
+  acceptingCallSid = null; // clear guard — we're back to idle
   document.getElementById('incomingPanel').style.display = 'none';
   document.getElementById('activePanel').style.display   = 'none';
   document.getElementById('dialerPanel').style.display   = 'block';
@@ -366,9 +370,11 @@ async function tryInitWithCredentials(accessToken, creds, i) {
         initRetries = 0;
         if (!webPhone) {
           webPhone = {
-            MakeCall:   (n, a, b) => crmWebSDK.MakeCall   ? crmWebSDK.MakeCall(n, a, b)   : Promise.resolve(),
-            AcceptCall: ()        => crmWebSDK.AcceptCall  ? crmWebSDK.AcceptCall()         : Promise.resolve(),
-            HangupCall: ()        => crmWebSDK.HangupCall  ? crmWebSDK.HangupCall()         : Promise.resolve()
+            // SDK signature: MakeCall(toNumber, callback(status, data))
+            // Passing null as callback causes "t is not a function" — use no-op instead.
+            MakeCall:   (n) => crmWebSDK.MakeCall   ? crmWebSDK.MakeCall(n, () => {}) : Promise.resolve(),
+            AcceptCall: ()  => crmWebSDK.AcceptCall  ? crmWebSDK.AcceptCall()           : Promise.resolve(),
+            HangupCall: ()  => crmWebSDK.HangupCall  ? crmWebSDK.HangupCall()           : Promise.resolve()
           };
         }
         setReg('registered');
@@ -492,7 +498,11 @@ async function doPoll() {
       clog('Poll fallback: inbound from ' + data.from + ' sid=' + data.callSid);
       showIncoming(data.from, data.callSid);
     } else if (!data.pending && data.type === 'claimed') {
-      if (callDirection === 'inbound') {
+      // Another agent claimed this call — dismiss OUR incoming panel.
+      // CRITICAL: skip if WE are the one who claimed it (acceptingCallSid guard).
+      // Without this check, the poll sees "claimed" and calls showDialer() on
+      // the accepting agent's screen, wiping out their active call UI.
+      if (callDirection === 'inbound' && data.callSid !== acceptingCallSid) {
         clog('Poll: call ' + data.callSid + ' already claimed by ' + data.claimedBy + ' — dismissing');
         if (data.callSid) dismissedCallSids.add(data.callSid);
         dismissedAt = Date.now();
@@ -525,7 +535,7 @@ async function triggerOutboundCall(number) {
   // This ensures no incoming call is pushed to this agent the moment they dial.
   reportStatus('busy');
   clog('MakeCall → ' + number);
-  try { await webPhone.MakeCall(number, null, null); }
+  try { await webPhone.MakeCall(number); }
   catch (e) {
     // MakeCall itself threw — revert to free so round robin doesn't permanently
     // exclude this agent from future incoming calls.
@@ -555,7 +565,15 @@ function handleCallEvent(event) {
       if (webPhone) webPhone.AcceptCall().catch(e => clog('silentAccept err: ' + e.message));
       showOutboundRinging(document.getElementById('phone')?.value || '');
     } else {
-      // Native SIP incoming event — carries no callSid.
+      // Native SIP incoming/ringing event — carries no callSid.
+      // CRITICAL: if we already accepted this call (acceptingCallSid is set),
+      // Exotel fires a NEW Dial-leg webhook which causes another incoming/ringing
+      // event. We must NOT let it re-show the incoming panel and wipe the
+      // "Connecting..." status we set right after AcceptCall().
+      if (acceptingCallSid) {
+        clog('Native incoming event ignored — already accepted sid=' + acceptingCallSid);
+        return;
+      }
       if (currentInboundCallSid && dismissedCallSids.has(currentInboundCallSid)) {
         clog('Native incoming event ignored — callSid already dismissed: ' + currentInboundCallSid);
         return;
@@ -571,6 +589,7 @@ function handleCallEvent(event) {
     const num = callDirection === 'inbound'
       ? (document.getElementById('callerNum')?.textContent || '')
       : (document.getElementById('phone')?.value || '');
+    acceptingCallSid = null; // clear guard — we're now fully live
     showActive(num);
     setStatus('');
   } else if (isEnded) {
@@ -624,12 +643,23 @@ async function acceptCall() {
     }
   }
 
+  // Set the guard BEFORE AcceptCall so the poll fallback can't dismiss us
+  // the moment the server responds with "claimed" during the AcceptCall await.
+  acceptingCallSid = currentInboundCallSid;
+
   clog('AcceptCall');
   try {
     await webPhone.AcceptCall();
-    showActive(document.getElementById('callerNum')?.textContent || '');
-    setStatus('');
-  } catch (e) { clog('AcceptCall error: ' + e.message); setStatus('Accept failed: ' + e.message); }
+    // DO NOT call showActive() here. AcceptCall() resolving only means our SIP
+    // leg accepted — the customer is not yet connected. We wait for the SDK to
+    // fire the "connected" event in handleCallEvent, which is when audio is live.
+    // Calling showActive() here was Bug 2: timer started before customer answered.
+    setStatus('Connecting...');
+  } catch (e) {
+    acceptingCallSid = null; // revert guard on error
+    clog('AcceptCall error: ' + e.message);
+    setStatus('Accept failed: ' + e.message);
+  }
 }
 
 async function rejectCall() {
