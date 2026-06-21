@@ -526,21 +526,32 @@ async function doPoll() {
 }
 
 async function triggerOutboundCall(number) {
-  if (!webPhone)  { clog('MakeCall: webPhone null'); setStatus('SDK not ready'); return; }
-  if (!sdkReady)  { clog('MakeCall: not registered'); setStatus('Not registered yet'); return; }
+  if (!sdkReady)  { clog('OutboundCall: not registered'); setStatus('Not registered yet'); return; }
   callDirection = 'outbound';
-  // Mark busy immediately on dial attempt — closes the ~1-2s window between
-  // MakeCall() being called and the SDK firing the 'ringing' event (which is
-  // when showOutboundRinging() would otherwise call reportStatus('busy')).
-  // This ensures no incoming call is pushed to this agent the moment they dial.
+  // Mark busy immediately — no incoming calls should ring this agent while dialling.
   reportStatus('busy');
-  clog('MakeCall → ' + number);
-  try { await webPhone.MakeCall(number); }
-  catch (e) {
-    // MakeCall itself threw — revert to free so round robin doesn't permanently
+  clog('OutboundCall → ' + number);
+  try {
+    // POST to our server which calls the Exotel API with record:true.
+    // This is the fix for outbound calls not being recorded — the SDK's own
+    // MakeCall hardcodes record:false, so we bypass it entirely and call
+    // the Exotel V3 API directly from the server side with recording enabled.
+    // The agent's SIP device will still ring via the normal incoming event
+    // and AcceptCall() will connect the audio as usual.
+    const res  = await fetch('/make-outbound-call', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ toNumber: number, agentEmail: currentUserEmail })
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Server error');
+    clog('OutboundCall placed via server: ' + JSON.stringify(data));
+  } catch (e) {
+    // Failed to place — revert to free so round robin doesn't permanently
     // exclude this agent from future incoming calls.
     reportStatus('free');
-    clog('MakeCall error: ' + e.message);
+    callDirection = null;
+    clog('OutboundCall error: ' + e.message);
     setStatus('Call failed: ' + e.message);
   }
 }
