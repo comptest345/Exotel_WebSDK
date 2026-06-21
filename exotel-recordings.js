@@ -247,7 +247,7 @@ async function postRecordingToBx24(call, recordingUrl, entity, agentBx24UserId) 
   }
 }
 
-async function syncRecordings({ phoneNumber, agentEmail } = {}) {
+async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid } = {}) {
   const results = { processed: 0, recorded: 0, posted: 0, skipped: 0, errors: [] };
   const agentBx24UserId = agentEmail ? await getBx24UserId(agentEmail) : null;
 
@@ -270,7 +270,14 @@ async function syncRecordings({ phoneNumber, agentEmail } = {}) {
     const clientNum = phoneNumber ? phoneNumber : (isOutbound ? toNum : fromNum);
 
     const recordingUrl = await fetchRecordingUrl(callSid);
-    if (!recordingUrl) { syncedCallSids.add(callSid); results.skipped++; continue; }
+    if (!recordingUrl) {
+      // Only permanently skip if this is NOT the call we're actively retrying for.
+      // If it IS the hint call and recording isn't ready yet, leave it out of
+      // syncedCallSids so the next retry attempt can find it.
+      if (callSid !== hintSid) { syncedCallSids.add(callSid); }
+      results.skipped++;
+      continue;
+    }
     results.recorded++;
 
     const entity = await findBx24EntityByPhone(clientNum);
