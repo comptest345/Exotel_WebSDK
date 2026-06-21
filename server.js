@@ -473,6 +473,52 @@ async function getBx24UserEmail(bx24UserId) {
   }
 }
 
+// ── Outbound call with recording ──────────────────────────────────
+// popup.js calls this instead of using the SDK's MakeCall (which hardcodes
+// record:false). This endpoint hits the Exotel V3 integrations API directly
+// with record:true so every outbound call is recorded automatically.
+// The agent's SIP device still rings as normal — Exotel dials the agent's
+// SIP URI first, and once they answer it bridges to the customer.
+app.post('/make-outbound-call', async (req, res) => {
+  const { toNumber, agentEmail } = req.body || {};
+  if (!toNumber || !agentEmail)
+    return res.status(400).json({ error: 'toNumber and agentEmail required' });
+
+  try {
+    const appToken  = await getAppToken();
+    const mapped    = await getMappedUserMap();
+    const user      = mapped.get(agentEmail.toLowerCase());
+    if (!user) return res.status(404).json({ error: `No usermapping for ${agentEmail}` });
+
+    const appUserId = String(user.AppUserId || '');
+    const sipId     = user.SipId || '';
+
+    // POST to Exotel integrations outbound_call endpoint with record:true
+    const payload = {
+      customer_id: CUSTOMER_ID,
+      app_id:      APP_ID,
+      to:          toNumber,
+      user_id:     appUserId,
+      record:      true       // ← THE FIX: force recording on every outbound call
+    };
+
+    console.log(`[OutboundCall] ${agentEmail} → ${toNumber} record:true`);
+    const callRes = await fetch(`${BASE}/call/outbound_call`, {
+      method:  'POST',
+      headers: { 'Authorization': appToken, 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload)
+    });
+    const callData = await callRes.json();
+    if (!callRes.ok) throw new Error(JSON.stringify(callData));
+
+    console.log(`[OutboundCall] Placed: ${JSON.stringify(callData)}`);
+    res.json({ ok: true, data: callData });
+  } catch (e) {
+    console.error('[OutboundCall] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/bx24-call-start', async (req, res) => {
   console.log('[BX24-CallStart]', JSON.stringify(req.body));
   try {
