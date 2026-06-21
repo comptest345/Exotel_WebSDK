@@ -613,8 +613,22 @@ app.get('/events', (req, res) => {
   const entry = pendingCallMap[email];
   if (entry && (Date.now() - entry.ts) < 60000) {
     delete pendingCallMap[email];
-    console.log(`[SSE] Flushing queued call to ${email}: ${entry.number}`);
+    console.log(`[SSE] Flushing queued outbound call to ${email}: ${entry.number}`);
     ssePush(email, 'outbound_call', { number: entry.number, callId: entry.callId });
+  }
+
+  // Also flush any unclaimed inbound call this agent hasn't rejected.
+  // This covers the case where the inbound webhook fired while this agent's
+  // SSE was dropped (Render 30s timeout) — on reconnect they get the ring.
+  for (const [sid, callData] of Object.entries(pendingInboundMap)) {
+    if (claimedSids.has(sid)) continue;
+    const lock = callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
+    if (lock && lock.claimedBy) continue;
+    if (lock && lock.rejectedBy.has(email)) continue;
+    if ((Date.now() - callData.ts) >= 60000) continue;
+    if (ssePush(email, 'inbound_call', { from: callData.from, callSid: sid })) {
+      console.log(`[SSE] Flushed pending inbound call ${sid} to reconnected agent ${email}`);
+    }
   }
 
   req.on('close', () => {
