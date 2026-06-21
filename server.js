@@ -903,13 +903,38 @@ app.post('/reject-call', (req, res) => {
 });
 
 // ── Call ended (Exotel webhook) ───────────────────────────────────
+// Exotel fires this webhook multiple times during a call's lifecycle:
+//   - CallState=active  + CallDetail=answered  → call just connected (NOT ended)
+//   - CallState=terminal + CallStatus=completed → call truly ended
+// We MUST ignore mid-call pings, otherwise telephony.externalcall.finish fires
+// while the call is still live, corrupting the BX24 timeline entry.
 app.all('/call-callback', async (req, res) => {
   const p = Object.assign({}, req.query, req.body);
   console.log('[Callback]', JSON.stringify(p));
   try {
-    const sid      = p.CallSid || p.call_sid || '';
-    const duration = parseInt(p.Duration || p.duration || '0');
-    const status   = p.Status  || p.status  || 'completed';
+    const sid       = p.CallSid || p.call_sid || '';
+    const callState = (p.CallState || p.call_state || '').toLowerCase();
+    const callDetail= (p.CallDetail || p.call_detail || '').toLowerCase();
+    const duration  = parseInt(p.Duration || p.duration || '0');
+    const status    = p.Status  || p.status  || 'completed';
+
+    // Ignore mid-call webhooks (answered, active, ringing, etc.)
+    // Only process when the call is definitively over.
+    const isTerminal = callState === 'terminal' || status === 'completed' ||
+                       callDetail === 'terminal' || callDetail === 'completed' ||
+                       (p.EndTime && String(p.EndTime).trim() !== '');
+    if (!isTerminal) {
+      console.log(`[Callback] SKIP mid-call webhook — CallState=${callState} CallDetail=${callDetail} sid=${sid}`);
+      return res.json({ status: 'ignored_mid_call' });
+    }
+
+    // Dedup guard: if we already processed the terminal callback for this sid, ignore.
+    // Exotel sometimes fires the terminal webhook twice.
+    if (sid && claimedSids.has('cb_done_' + sid)) {
+      console.log(`[Callback] SKIP duplicate terminal webhook for sid=${sid}`);
+      return res.json({ status: 'ignored_duplicate' });
+    }
+    if (sid) claimedSids.add('cb_done_' + sid);
 
     const claim    = inboundClaimMap[sid];
     const bx24Id   = claim ? claim.bx24CallId : sid;
