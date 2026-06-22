@@ -1,29 +1,38 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// exotel-recordings.js
+// exotel-recordings.js  ← EDIT ONLY THIS FILE for anything recording-related
 // ═══════════════════════════════════════════════════════════════════════════
+//
 // Architecture:
 //   Exotel records call
-//     ↓ /call-callback fires (server.js, 2-5 min after call ends)
-//     ↓ syncRecordings() called with callSid + bx24CallId
-//     ↓ fetchRecordingUrl() confirms recording exists in Exotel
-//     ↓ buildProxyUrl() builds permanent proxy URL on OUR server
-//     ↓ updateBx24CallRecord() calls telephony.externalcall.hide +
-//                              crm.activity.update to attach RECORD_URL
+//     ↓ server.js /call-callback fires → calls recordings.scheduleSync(...)
+//     ↓ scheduleSync() retries with exponential backoff (2 min → 4 min → 8 min)
+//     ↓ syncRecordings() confirms recording exists via fetchRecordingUrl()
+//     ↓ buildProxyUrl() builds a permanent proxy URL on OUR server
+//     ↓ updateBx24CallRecord() calls telephony.externalcall.hide to attach RECORD_URL
 //     ↓ Bitrix24 timeline shows native call entry with ▶ Play button
-//     ↓ Agent clicks play → browser hits /recording/:callSid on our server
-//     ↓ Our server streams audio from Exotel (authenticated, no storage)
+//     ↓ Agent clicks play → browser hits GET /recording/:callSid
+//     ↓ proxyRecordingRoute() streams audio from Exotel (authenticated, no storage)
 //
-// For historical calls (/sync-recordings):
-//     ↓ fetchRecentExotelCalls() or fetchExotelCallsForNumber()
+// For historical calls (POST/GET /sync-recordings):
+//     ↓ fetchExotelCallsForNumber() or fetchRecentExotelCalls()
 //     ↓ For each call with a recording:
-//       - If bx24CallId known → updateBx24CallRecord (update existing entry)
-//       - If not known       → createBx24CallActivity (create new entry)
+//         bx24CallId known → updateBx24CallRecord  (update existing timeline entry)
+//         bx24CallId unknown → createBx24CallActivity (create new timeline entry)
+//
+// ── What server.js does for recordings (the ONLY surface you never touch) ──
+//   • require('./exotel-recordings')
+//   • recordings.init(app)              ← registers /recording/:callSid + /sync-recordings
+//   • recordings.scheduleSync({...})    ← called from /call-callback after each call ends
+//
+// Everything else — retry logic, Exotel API calls, BX24 updates, proxy streaming —
+// lives here. Edit only this file.
 // ═══════════════════════════════════════════════════════════════════════════
 
 'use strict';
 
 const fetch = require('node-fetch');
 
+// ── Config (all from env vars — same ones server.js uses) ────────────────
 const ACCOUNT_SID  = process.env.EXOTEL_ACCOUNT_SID || '';
 const API_KEY      = process.env.EXOTEL_API_KEY      || '';
 const API_TOKEN    = process.env.EXOTEL_API_TOKEN    || '';
@@ -35,14 +44,17 @@ const isIndia         = /mum|in1|india/i.test(DOMAIN);
 const EXOTEL_API_HOST = process.env.EXOTEL_API_HOST || (isIndia ? 'api.in.exotel.com' : 'api.exotel.com');
 const EXOTEL_V1_BASE  = `https://${EXOTEL_API_HOST}/v1/Accounts/${ACCOUNT_SID}`;
 
-// In-memory skip set — prevents duplicate activity creation within one server session.
-// Entries are only added when a recording was SUCCESSFULLY posted to BX24.
+// ── Retry config — change these to tune how long we wait for Exotel ──────
+const RETRY_FIRST_DELAY_MS = 2 * 60 * 1000;  // 2 minutes after call ends
+const RETRY_MAX_ATTEMPTS   = 3;               // attempts: 2 min → 4 min → 8 min
+
+// ── In-memory dedup — prevents posting the same recording twice ──────────
 const syncedCallSids  = new Set();
 const bx24UserIdCache = {};
 
 function log(msg) { console.log('[Recordings]', msg); }
 
-// ── Exotel V1 API helper ─────────────────────────────────────────────────
+// ── Exotel V1 REST helper ────────────────────────────────────────────────
 async function exotelGet(path, params) {
   if (!ACCOUNT_SID || !API_KEY || !API_TOKEN)
     throw new Error('EXOTEL_ACCOUNT_SID / EXOTEL_API_KEY / EXOTEL_API_TOKEN not set');
@@ -84,7 +96,7 @@ async function getBx24UserId(email) {
   } catch (e) { log(`BX24 user lookup failed for ${email}: ${e.message}`); return null; }
 }
 
-// ── Phone number variants ────────────────────────────────────────────────
+// ── Phone number variants (handles +91, 0, raw digits) ──────────────────
 function phoneVariants(phoneNumber) {
   const raw      = (phoneNumber || '').trim();
   const digits   = raw.replace(/\D/g, '');
@@ -150,13 +162,13 @@ async function findBx24EntityByPhone(phoneNumber) {
   return null;
 }
 
-// ── Fetch Exotel calls ───────────────────────────────────────────────────
+// ── Fetch Exotel calls for a specific number ─────────────────────────────
 async function fetchExotelCallsForNumber(phoneNumber) {
   const calls = new Map();
   for (const field of ['From', 'To']) {
     try {
       const data = await exotelGet('/Calls.json', { [field]: phoneNumber, PageSize: 50 });
-      const list = (data && data.TwilioResponse && data.TwilioResponse.Calls && data.TwilioResponse.Calls.Call) || [];
+      const list = (data?.TwilioResponse?.Calls?.Call) || [];
       const arr  = Array.isArray(list) ? list : [list];
       arr.forEach(c => { if (c && c.Sid) calls.set(c.Sid, c); });
       log(`Exotel /Calls?${field}=${phoneNumber} → ${arr.length} result(s)`);
@@ -168,7 +180,7 @@ async function fetchExotelCallsForNumber(phoneNumber) {
 async function fetchRecentExotelCalls() {
   try {
     const data = await exotelGet('/Calls.json', { PageSize: 100 });
-    const list = (data && data.TwilioResponse && data.TwilioResponse.Calls && data.TwilioResponse.Calls.Call) || [];
+    const list = (data?.TwilioResponse?.Calls?.Call) || [];
     const arr  = Array.isArray(list) ? list : [list];
     log(`Exotel /Calls (all recent) → ${arr.length} result(s)`);
     return arr;
@@ -179,7 +191,7 @@ async function fetchRecentExotelCalls() {
 async function fetchRecordingUrl(callSid) {
   try {
     const data = await exotelGet(`/Calls/${callSid}/Recordings.json`);
-    const list = (data && data.TwilioResponse && data.TwilioResponse.Recordings && data.TwilioResponse.Recordings.Recording) || [];
+    const list = (data?.TwilioResponse?.Recordings?.Recording) || [];
     const arr  = Array.isArray(list) ? list : [list];
     if (!arr[0]) return null;
     const uri = arr[0].Uri || '';
@@ -193,9 +205,7 @@ async function fetchRecordingUrl(callSid) {
 }
 
 // ── Build permanent proxy URL ────────────────────────────────────────────
-// Instead of storing Exotel's auth-required URL in BX24, we point to our
-// own /recording/:callSid endpoint which proxies the audio on demand.
-// This URL never expires and handles auth invisibly.
+// Points to our own /recording/:callSid — never expires, handles Exotel auth invisibly.
 function buildProxyUrl(callSid) {
   return `${RENDER_URL}/recording/${callSid}`;
 }
@@ -204,18 +214,13 @@ function getOwnerTypeId(entityType) {
   return { LEAD: 1, DEAL: 2, CONTACT: 3 }[entityType] || 3;
 }
 
-// ── Update existing BX24 telephony call record with RECORD_URL ───────────
-// Used for new calls (inbound + outbound) where telephony.externalcall.register
-// was already called and we have the BX24 CALL_ID.
-// telephony.externalcall.hide updates the call's recording URL so BX24
-// renders a native ▶ Play button in the timeline.
+// ── Update existing BX24 telephony call record with recording URL ────────
+// Used for new calls where telephony.externalcall.register was already called.
 async function updateBx24CallRecord({ bx24CallId, agentBx24Id, callSid, duration, direction, clientNum, fromNum, toNum, callDate }) {
   const proxyUrl = buildProxyUrl(callSid);
   log(`Updating BX24 call CALL_ID=${bx24CallId} with RECORD_URL=${proxyUrl}`);
 
-  // telephony.externalcall.hide attaches the recording URL to an existing call activity.
-  // This is the correct BX24 API for attaching recordings — it updates the call entry
-  // that was created by telephony.externalcall.register/finish and adds the audio player.
+  // telephony.externalcall.hide attaches recording to an existing telephony entry.
   try {
     await bx24Call('telephony.externalcall.hide', {
       CALL_ID:    bx24CallId,
@@ -228,8 +233,7 @@ async function updateBx24CallRecord({ bx24CallId, agentBx24Id, callSid, duration
     log(`telephony.externalcall.hide failed (${e.message}) — falling back to activity update`);
   }
 
-  // Fallback: find the CRM activity created by telephony and update it with the recording URL
-  // in the DESCRIPTION so agents can at least click the link.
+  // Fallback: create a plain CRM activity with the recording link in the description.
   try {
     const mins = Math.floor((duration || 0) / 60);
     const secs = (duration || 0) % 60;
@@ -245,16 +249,14 @@ async function updateBx24CallRecord({ bx24CallId, agentBx24Id, callSid, duration
 
     const entity = await findBx24EntityByPhone(clientNum);
     if (entity) {
-      const ownerTypeId   = getOwnerTypeId(entity.entityType);
-      const bx24Direction = direction === 'outbound' ? 2 : 1;
       const result = await bx24Call('crm.activity.add', { fields: {
-        OWNER_TYPE_ID:    ownerTypeId,
+        OWNER_TYPE_ID:    getOwnerTypeId(entity.entityType),
         OWNER_ID:         entity.entityId,
         TYPE_ID:          2,
         SUBJECT:          `📞 Call recording — ${clientNum} (${direction})`,
         DESCRIPTION:      desc,
         DESCRIPTION_TYPE: 1,
-        DIRECTION:        bx24Direction,
+        DIRECTION:        direction === 'outbound' ? 2 : 1,
         DURATION:         duration || 0,
         START_TIME:       callDate,
         END_TIME:         callDate,
@@ -271,10 +273,8 @@ async function updateBx24CallRecord({ bx24CallId, agentBx24Id, callSid, duration
   return null;
 }
 
-// ── Create new BX24 call activity ────────────────────────────────────────
-// Used for HISTORICAL calls where telephony.externalcall.register was never
-// called (e.g. calls before this code was deployed, or outbound calls
-// from before the BX24 registration was added).
+// ── Create new BX24 call activity (historical calls) ────────────────────
+// Used when telephony.externalcall.register was never called for this call.
 async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   const fromNum   = call.From || '';
   const toNum     = call.To   || '';
@@ -332,7 +332,7 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
     log(`TYPE_ID=2 rejected (${e.message}) — falling back to TYPE_ID=4`);
   }
 
-  // Fallback: TYPE_ID=4 (custom activity — always accepted)
+  // Fallback: TYPE_ID=4 (custom activity — always accepted by BX24)
   try {
     const result = await bx24Call('crm.activity.add', { fields: {
       OWNER_TYPE_ID:    ownerTypeId,
@@ -354,18 +354,17 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   }
 }
 
-// ── Main sync function ───────────────────────────────────────────────────
-// Called from server.js /call-callback (for new calls) and /sync-recordings (historical).
+// ── syncRecordings ───────────────────────────────────────────────────────
+// Called by scheduleSync() for new calls, and directly by /sync-recordings for historical ones.
 // Parameters:
-//   phoneNumber  — client phone number (used to fetch calls + find CRM entity)
-//   agentEmail   — agent's email (for BX24 user ID lookup)
-//   callSid      — specific Exotel CallSid we're retrying for (hint: don't permanently skip)
+//   phoneNumber  — client phone number (fetch calls from Exotel + find CRM entity)
+//   agentEmail   — agent email (BX24 user ID lookup)
+//   callSid      — specific Exotel CallSid we're retrying (hint: don't permanently skip)
 //   bx24CallId   — BX24 CALL_ID if telephony.externalcall.register was already called
-//   agentBx24Id  — BX24 numeric user ID (skips lookup if already known)
+//   agentBx24Id  — BX24 numeric user ID (skips lookup when already known)
 async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24CallId, agentBx24Id } = {}) {
   const results = { processed: 0, recorded: 0, posted: 0, skipped: 0, errors: [] };
 
-  // Resolve agent BX24 ID — prefer passed-in value, fall back to email lookup
   const resolvedAgentId = agentBx24Id || (agentEmail ? await getBx24UserId(agentEmail) : null);
 
   const calls = phoneNumber
@@ -380,10 +379,9 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
     if (!callSid) continue;
     if (syncedCallSids.has(callSid)) { results.skipped++; continue; }
 
-    // Confirm recording exists in Exotel before doing anything
     const recordingExists = await fetchRecordingUrl(callSid);
     if (!recordingExists) {
-      // Don't permanently skip the hint call — it may not be ready yet (retry handles it)
+      // Don't permanently skip the hint call — it may just not be ready yet
       if (callSid !== hintSid) syncedCallSids.add(callSid);
       results.skipped++;
       continue;
@@ -393,8 +391,7 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
     let activityId = null;
 
     if (bx24CallId && callSid === hintSid) {
-      // NEW CALL PATH: telephony.externalcall.register was already called.
-      // Update the existing BX24 call record with our proxy RECORD_URL.
+      // New call: telephony.externalcall.register was already called → update it
       const rawDir    = (call.Direction || '').toLowerCase();
       const direction = rawDir.includes('outbound') ? 'outbound' : 'inbound';
       const fromNum   = call.From || '';
@@ -415,7 +412,7 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
         callDate: new Date(startTime).toISOString()
       });
     } else {
-      // HISTORICAL CALL PATH: no prior BX24 registration → create a fresh activity.
+      // Historical call: no prior BX24 registration → create a fresh activity
       activityId = await createBx24CallActivity(call, callSid, resolvedAgentId);
     }
 
@@ -431,8 +428,108 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
   return results;
 }
 
-// ── Express routes ───────────────────────────────────────────────────────
+// ── scheduleSync ─────────────────────────────────────────────────────────
+// Called from server.js /call-callback after every call ends.
+// Handles the entire retry loop with exponential backoff internally —
+// server.js never needs to know about retries or timing.
+//
+// Usage in server.js:
+//   recordings.scheduleSync({ clientNum, agentEmail: finishEmail, callSid: sid,
+//                             bx24CallId: finishBx24Id, agentBx24Id: finishAgentId,
+//                             onSuccess: () => delete outboundCallMap[sid] });
+function scheduleSync({ clientNum, agentEmail, callSid, bx24CallId, agentBx24Id, onSuccess } = {}) {
+  if (!clientNum) return;
+
+  function attempt(delayMs, attemptNum) {
+    setTimeout(async () => {
+      try {
+        log(`Recording sync attempt ${attemptNum} for ${clientNum} (delay ${delayMs / 1000}s)`);
+        const result = await syncRecordings({
+          phoneNumber: clientNum,
+          agentEmail,
+          callSid,
+          bx24CallId,
+          agentBx24Id
+        });
+        if (result && result.posted > 0) {
+          log(`Recording synced on attempt ${attemptNum}: ${JSON.stringify(result)}`);
+          if (onSuccess) onSuccess();
+        } else if (attemptNum < RETRY_MAX_ATTEMPTS) {
+          attempt(delayMs * 2, attemptNum + 1); // exponential: 2min → 4min → 8min
+        } else {
+          log(`Recording not found after ${attemptNum} attempts for ${clientNum}`);
+          if (onSuccess) onSuccess();
+        }
+      } catch (e) {
+        log(`Recording sync attempt ${attemptNum} failed: ${e.message}`);
+      }
+    }, delayMs);
+  }
+
+  attempt(RETRY_FIRST_DELAY_MS, 1);
+}
+
+// ── GET /recording/:callSid — audio proxy ────────────────────────────────
+// Streams audio from Exotel directly to the browser, authenticated server-side.
+// Bitrix24's audio player loads this URL — no storage needed, never expires.
+function proxyRecordingRoute(app) {
+  app.get('/recording/:callSid', async (req, res) => {
+    const { callSid } = req.params;
+    if (!callSid) return res.status(400).send('callSid required');
+
+    const creds = Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
+
+    try {
+      // Step 1: Fetch recording metadata to get the actual audio file URL
+      const metaUrl = `${EXOTEL_V1_BASE}/Calls/${callSid}/Recordings.json`;
+      const metaRes = await fetch(metaUrl, { headers: { Authorization: `Basic ${creds}` } });
+      if (!metaRes.ok) {
+        log(`[Proxy] Recordings.json HTTP ${metaRes.status} for ${callSid}`);
+        return res.status(404).send('Recording not found');
+      }
+      const metaBody = await metaRes.json();
+      const recList  = metaBody?.TwilioResponse?.Recordings?.Recording;
+      const rec      = Array.isArray(recList) ? recList[0] : recList;
+      if (!rec) return res.status(404).send('No recording available yet');
+
+      // Step 2: Build the raw audio URL (strip .json suffix)
+      let audioUrl = rec.Uri || '';
+      if (!audioUrl.startsWith('http'))
+        audioUrl = `https://${EXOTEL_API_HOST}${audioUrl}`;
+      audioUrl = audioUrl.replace(/\.json$/, '');
+      log(`[Proxy] Streaming ${callSid} → ${audioUrl}`);
+
+      // Step 3: Fetch audio from Exotel and pipe directly to the browser response
+      const audioRes = await fetch(audioUrl, { headers: { Authorization: `Basic ${creds}` } });
+      if (!audioRes.ok) {
+        log(`[Proxy] Audio fetch HTTP ${audioRes.status} for ${callSid}`);
+        return res.status(audioRes.status).send('Audio fetch failed');
+      }
+
+      res.setHeader('Content-Type', audioRes.headers.get('content-type') || 'audio/mpeg');
+      const contentLength = audioRes.headers.get('content-length');
+      if (contentLength) res.setHeader('Content-Length', contentLength);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Access-Control-Allow-Origin', '*'); // allow BX24 iframe to load
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+
+      audioRes.body.pipe(res);
+    } catch (e) {
+      log(`[Proxy] Error for ${callSid}: ${e.message}`);
+      if (!res.headersSent) res.status(500).send('Proxy error');
+    }
+  });
+}
+
+// ── init — registers all routes with the Express app ────────────────────
+// Called once from server.js: recordings.init(app)
+// Registers:
+//   GET  /recording/:callSid   — audio proxy (used by BX24 ▶ player)
+//   POST /sync-recordings      — manual sync trigger
+//   GET  /sync-recordings      — manual sync trigger (browser-friendly)
 function init(app) {
+  proxyRecordingRoute(app);
+
   app.post('/sync-recordings', async (req, res) => {
     const { phoneNumber, agentEmail } = req.body || {};
     log(`POST /sync-recordings — phoneNumber=${phoneNumber || '(all)'} agentEmail=${agentEmail || '(none)'}`);
@@ -447,7 +544,7 @@ function init(app) {
     catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
   });
 
-  log('Routes registered: POST /sync-recordings, GET /sync-recordings');
+  log('Routes registered: GET /recording/:callSid, POST /sync-recordings, GET /sync-recordings');
 }
 
-module.exports = { init, syncRecordings };
+module.exports = { init, scheduleSync, syncRecordings };
