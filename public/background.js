@@ -18,22 +18,30 @@ function initBG() {
 
     // Register outbound call handler (click-to-call from CRM card)
     BX24.addEvent('onExternalCallStart', function (data) {
-      bgLog('onExternalCallStart: ' + JSON.stringify(data));
-      const num    = data.PHONE_NUMBER || data.PHONE_NUMBER_INTERNATIONAL || '';
-      const callId = data.CALL_ID || '';
-      const userId = data.USER_ID || '';
-      currentCallId = callId;
-      callStartTime = Date.now();
+  bgLog('onExternalCallStart: ' + JSON.stringify(data));
+  const num    = data.PHONE_NUMBER || data.PHONE_NUMBER_INTERNATIONAL || '';
+  const callId = data.CALL_ID || '';
+  const userId = data.USER_ID || '';
+  currentCallId = callId;
+  callStartTime = Date.now();
 
-      // Send to server — server resolves BX24 userId → email via BX24 webhook
-      fetch('/bx24-call-start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ PHONE_NUMBER: num, CALL_ID: callId, USER_ID: userId })
-      }).then(r => r.json()).then(d => {
-        bgLog('Queued outbound call for: ' + (d.email || 'unknown') + ' → ' + num);
-      }).catch(e => bgLog('Queue error: ' + e.message));
-    });
+  // Open the Exotel Dialer panel so agent sees the UI immediately
+  try {
+    BX24.openApplication(
+      { bx24_start_call: '1', number: num },
+      function() { bgLog('openApplication callback fired'); }
+    );
+  } catch(e) { bgLog('openApplication failed: ' + e.message); }
+
+  // Send to server — server resolves BX24 userId → email via BX24 webhook
+  fetch('/bx24-call-start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ PHONE_NUMBER: num, CALL_ID: callId, USER_ID: userId })
+  }).then(r => r.json()).then(d => {
+    bgLog('Queued outbound call for: ' + (d.email || 'unknown') + ' → ' + num);
+  }).catch(e => bgLog('Queue error: ' + e.message));
+});
 
     // Handle call end from BX24 side
     BX24.addEvent('onExternalCallFinish', function (data) {
