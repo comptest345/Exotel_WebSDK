@@ -428,9 +428,31 @@ let sseSource  = null;
 let pollTimer  = null;
 let pollCount  = 0;
 
+// ── Handle click-to-call launched via BX24.openApplication ───
+function checkOpenApplicationParams() {
+  try {
+    const params = BX24.getOptions ? BX24.getOptions() : {};
+    const num = (params && params.number) ? params.number : null;
+    const isStartCall = params && (params.bx24_start_call === '1' || params.bx24_start_call === 1);
+    if (isStartCall && num) {
+      clog('openApplication click-to-call param detected: ' + num);
+      const phoneEl = document.getElementById('phone');
+      if (phoneEl) phoneEl.value = num;
+      // Small delay to let SDK finish registering
+      setTimeout(async () => {
+        if (!callDirection && !outboundInFlight) {
+          callDirection = 'outbound';
+          await triggerOutboundCall(num);
+        }
+      }, 800);
+    }
+  } catch(e) { clog('checkOpenApplicationParams error: ' + e.message); }
+}
+
 function startPoll() {
   startSSE();
   startPollFallback();
+  checkOpenApplicationParams();
 }
 
 function startSSE() {
@@ -581,7 +603,7 @@ async function triggerOutboundCall(number) {
     clog('OutboundCall blocked — outboundInFlight=' + outboundInFlight + ' callDirection=' + callDirection);
     return;
   }
-  outboundInFlight = false;
+  outboundInFlight = true;
   callDirection = 'outbound';
   // Mark busy immediately — no incoming calls should ring this agent while dialling.
   reportStatus('busy');
@@ -605,6 +627,7 @@ async function triggerOutboundCall(number) {
     // Failed to place — revert to free so round robin doesn't permanently
     // exclude this agent from future incoming calls.
     reportStatus('free');
+    outboundInFlight = false;
     callDirection = null;
     clog('OutboundCall error: ' + e.message);
     setStatus('Call failed: ' + e.message);
