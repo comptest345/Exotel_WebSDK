@@ -26,6 +26,11 @@ let dismissedAt      = 0;   // timestamp of last dismiss; used for native-SIP co
 // Tracks the callSid WE just claimed+accepted. Prevents the poll fallback from
 // seeing "claimed" and calling showDialer() on our own screen while we're live.
 let acceptingCallSid = null;
+let acceptTimeoutId  = null;  // watchdog: reset UI if connected event never fires after Accept
+
+function clearAcceptTimeout() {
+  if (acceptTimeoutId) { clearTimeout(acceptTimeoutId); acceptTimeoutId = null; }
+}
 
 function log(msg) { console.log('[Dialer]', msg); }
 function clog(msg, extra) {
@@ -472,16 +477,21 @@ function startSSE() {
     showIncoming(d.from, d.callSid);
   });
 
-  // Another agent claimed the call — dismiss our incoming UI.
+  // Another agent claimed the call, or caller hung up — dismiss our incoming UI.
   sseSource.addEventListener('call_dismissed', (e) => {
     const d = JSON.parse(e.data);
     const sidMatch = (currentInboundCallSid === d.callSid) || (currentInboundCallSid === null);
     if (callDirection === 'inbound' && sidMatch) {
-      clog('call_dismissed — claimed by ' + d.claimedBy + ' sid=' + d.callSid);
+      const reason = d.reason || '';
+      if (reason === 'caller_hung_up') {
+        clog('call_dismissed — caller hung up sid=' + d.callSid);
+      } else {
+        clog('call_dismissed — claimed by ' + d.claimedBy + ' sid=' + d.callSid);
+      }
       if (d.callSid) dismissedCallSids.add(d.callSid);
       dismissedAt = Date.now();
       showDialer();
-      setStatus('📞 Answered by another agent');
+      setStatus(reason === 'caller_hung_up' ? '📵 Caller hung up' : '📞 Answered by another agent');
     }
   });
 
@@ -602,7 +612,10 @@ function handleCallEvent(event) {
   const type = ((event && (event.event || event.EventType || event.type || event.state)) || '').toLowerCase();
 
   const isIncoming  = type.includes('incoming') || type.includes('ringing') || raw.includes('incoming') || raw.includes('ringing');
-  const isEnded     = type.includes('end')      || type.includes('terminat')|| type.includes('bye')     || type.includes('complet') || raw.includes('callended') || raw.includes('call_completed');
+  const isEnded     = type.includes('end')      || type.includes('terminat') || type.includes('bye')      ||
+                      type.includes('complet')   || type.includes('cancel')   || type.includes('failed')   ||
+                      type.includes('reject')    ||
+                      raw.includes('callended')  || raw.includes('call_completed') || raw.includes('call_failed');
 
   const isAcceptEvent = type.includes('accept') || raw.includes('accepted');
   const isConnected   =
@@ -640,9 +653,14 @@ function handleCallEvent(event) {
       ? (document.getElementById('callerNum')?.textContent || '')
       : (document.getElementById('phone')?.value || '');
     acceptingCallSid = null; // clear guard — we're now fully live
+    clearAcceptTimeout();   // cancel the accept timeout watchdog
     showActive(num);
     setStatus('');
   } else if (isEnded) {
+    clog('Call ended event — resetting UI');
+    clearAcceptTimeout();
+    callDirection = null;   // explicit clear — showDialer() does this too but belt+suspenders
+    reportStatus('free');
     showDialer();
     setStatus('Call ended');
   }
@@ -710,8 +728,23 @@ async function acceptCall() {
     // fire the "connected" event in handleCallEvent, which is when audio is live.
     // Calling showActive() here was Bug 2: timer started before customer answered.
     setStatus('Connecting...');
+
+    // Watchdog: if "connected" never fires within 30s (customer hung up before
+    // answering, SIP timeout, etc.), reset the UI so the agent isn't stuck.
+    clearAcceptTimeout();
+    acceptTimeoutId = setTimeout(() => {
+      if (acceptingCallSid) {
+        clog('Accept watchdog fired — connected event never received, resetting UI');
+        acceptingCallSid = null;
+        callDirection    = null;
+        reportStatus('free');
+        showDialer();
+        setStatus('Call not connected');
+      }
+    }, 30000);
   } catch (e) {
     acceptingCallSid = null; // revert guard on error
+    clearAcceptTimeout();
     clog('AcceptCall error: ' + e.message);
     setStatus('Accept failed: ' + e.message);
   }
@@ -742,7 +775,10 @@ async function rejectCall() {
 
 async function hangUp() {
   if (!webPhone) return;
+  clearAcceptTimeout();
+  callDirection = null;
   try { await webPhone.HangupCall(); } catch (e) { clog('Hangup err: ' + e.message); }
+  reportStatus('free');
   showDialer(); setStatus('Call ended');
 }
 
