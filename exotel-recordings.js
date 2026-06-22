@@ -67,12 +67,32 @@ const EXOTEL_API_HOST = process.env.EXOTEL_API_HOST || (isIndia ? 'api.in.exotel
 const EXOTEL_V1_BASE  = `https://${EXOTEL_API_HOST}/v1/Accounts/${ACCOUNT_SID}`;
 
 // ── Retry config — change these to tune how long we wait for Exotel ──────
-const RETRY_FIRST_DELAY_MS = 2 * 60 * 1000;  // 2 minutes after call ends
-const RETRY_MAX_ATTEMPTS   = 3;               // attempts: 2 min → 4 min → 8 min
+// First retry delay: default 30 s (fast feedback in dev/test).
+// Set EXOTEL_RECORDING_DELAY_SEC=120 in env to restore the 2-min production delay.
+const RETRY_FIRST_DELAY_MS = (parseInt(process.env.EXOTEL_RECORDING_DELAY_SEC || '30') * 1000);
+const RETRY_MAX_ATTEMPTS   = 4;               // attempts: 30s → 60s → 120s → 240s
 
-// ── In-memory dedup — prevents posting the same recording twice ──────────
-const syncedCallSids  = new Set();
+// ── Dedup — prevents posting the same recording twice ───────────────────
+// Persisted to disk so server restarts don't create duplicate BX24 activities.
+const DEDUP_FILE     = process.env.DEDUP_FILE || '/tmp/synced_call_sids.json';
+const syncedCallSids = new Set();
 const bx24UserIdCache = {};
+
+// Load persisted sids on startup (non-fatal if file doesn't exist)
+try {
+  const fs   = require('fs');
+  const data = JSON.parse(fs.readFileSync(DEDUP_FILE, 'utf8'));
+  if (Array.isArray(data)) data.forEach(s => syncedCallSids.add(s));
+  log(`Loaded ${syncedCallSids.size} dedup SIDs from ${DEDUP_FILE}`);
+} catch (_) { /* file doesn't exist yet — that's fine */ }
+
+// Save dedup state after each new SID is added
+function persistDedupSids() {
+  try {
+    const fs = require('fs');
+    fs.writeFileSync(DEDUP_FILE, JSON.stringify([...syncedCallSids]), 'utf8');
+  } catch (e) { log(`Dedup persist failed (non-fatal): ${e.message}`); }
+}
 
 function log(msg) { console.log('[Recordings]', msg); }
 
@@ -120,13 +140,17 @@ async function getBx24UserId(email) {
 
 // ── Phone number variants (handles +91, 0, raw digits) ──────────────────
 function phoneVariants(phoneNumber) {
-  const raw      = (phoneNumber || '').trim();
-  const digits   = raw.replace(/\D/g, '');
+  const raw    = (phoneNumber || '').trim();
+  const digits = raw.replace(/\D/g, '');
+  // For Indian 10-digit numbers: also try with leading 0 and +91 prefix
+  const last10  = digits.length > 10 ? digits.slice(-10) : digits;
   const withPlus = digits ? `+${digits}` : '';
+  const with91   = last10.length === 10 ? `+91${last10}` : '';
+  const with0    = last10.length === 10 ? `0${last10}`   : '';
   const seen = new Set();
   const variants = [];
-  for (const v of [raw, withPlus, digits]) {
-    if (v && !seen.has(v)) { seen.add(v); variants.push(v); }
+  for (const v of [raw, withPlus, with91, digits, last10, with0]) {
+    if (v && v.length >= 7 && !seen.has(v)) { seen.add(v); variants.push(v); }
   }
   return variants;
 }
@@ -202,14 +226,17 @@ async function fetchExotelCallsForNumber(phoneNumber) {
 // Fetch recent calls, optionally filtered by direction.
 // direction may be a single string or comma-separated list, e.g.:
 //   'inbound'  |  'outbound-api'  |  'inbound,outbound-api,outbound-dial'
-async function fetchRecentExotelCalls(direction) {
+async function fetchRecentExotelCalls(direction, fromDate, toDate) {
   try {
-    const params = { PageSize: 100 };
+    const params = { PageSize: 200 };
     if (direction) params.Direction = direction;
+    // Date format Exotel expects: YYYY-MM-DD HH:MM:SS (URL-encoded)
+    if (fromDate) params.DateCreated = fromDate;   // e.g. '2026-06-01'
+    if (toDate)   params.DateUpdated = toDate;
     const data = await exotelGet('/Calls.json', params);
     const list = (data?.TwilioResponse?.Calls?.Call) || [];
     const arr  = Array.isArray(list) ? list : [list];
-    log(`Exotel /Calls (direction=${direction || 'all'}) → ${arr.length} result(s)`);
+    log(`Exotel /Calls (direction=${direction || 'all'} from=${fromDate || '-'} to=${toDate || '-'}) → ${arr.length} result(s)`);
     return arr;
   } catch (e) { log(`Exotel all-calls fetch failed: ${e.message}`); return []; }
 }
@@ -250,7 +277,7 @@ function getOwnerTypeId(entityType) {
 // can see all fields: Direction, From, To, Agent, Start, End, Duration, Status,
 // Call SID, and a clickable View Recording link.
 async function updateBx24CallRecord({
-  bx24CallId, agentBx24Id, callSid,
+  bx24CallId, agentBx24Id, agentEmail, callSid,
   duration, direction, status,
   clientNum, fromNum, toNum,
   callDate, endDate
@@ -276,7 +303,7 @@ async function updateBx24CallRecord({
   const secs = (duration || 0) % 60;
   const desc =
     `☎ ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call\n\n` +
-    `Agent     : ${agentBx24Id ? `User #${agentBx24Id}` : 'Unassigned'}\n` +
+    `Agent     : ${agentEmail || (agentBx24Id ? `User #${agentBx24Id}` : 'Unassigned')}\n` +
     `From      : ${fromNum}\n` +
     `To        : ${toNum}\n` +
     `Customer  : ${clientNum}\n` +
@@ -416,14 +443,14 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
 //   agentBx24Id  — BX24 numeric user ID (skips lookup when already known)
 //   direction    — optional direction filter for bulk fetch: 'inbound', 'outbound-api',
 //                  or comma-separated e.g. 'inbound,outbound-api,outbound-dial'
-async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24CallId, agentBx24Id, direction } = {}) {
+async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24CallId, agentBx24Id, direction, fromDate, toDate } = {}) {
   const results = { processed: 0, recorded: 0, posted: 0, skipped: 0, errors: [] };
 
   const resolvedAgentId = agentBx24Id || (agentEmail ? await getBx24UserId(agentEmail) : null);
 
   const calls = phoneNumber
     ? await fetchExotelCallsForNumber(phoneNumber)
-    : await fetchRecentExotelCalls(direction);
+    : await fetchRecentExotelCalls(direction, fromDate, toDate);
 
   results.processed = calls.length;
   log(`Processing ${calls.length} call(s)` + (phoneNumber ? ` for ${phoneNumber}` : ' (all recent)'));
@@ -464,6 +491,7 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
       activityId = await updateBx24CallRecord({
         bx24CallId,
         agentBx24Id: resolvedAgentId,
+        agentEmail,
         callSid,
         duration,
         direction:  dir,
@@ -482,6 +510,7 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
     if (activityId) {
       results.posted++;
       syncedCallSids.add(callSid);
+      persistDedupSids();
     } else {
       results.errors.push({ callSid, reason: 'BX24 update/create failed' });
     }
@@ -571,16 +600,16 @@ function init(app) {
   recordingRedirectRoute(app);
 
   app.post('/sync-recordings', async (req, res) => {
-    const { phoneNumber, agentEmail, direction } = req.body || {};
-    log(`POST /sync-recordings — phoneNumber=${phoneNumber || '(all)'} agentEmail=${agentEmail || '(none)'} direction=${direction || '(all)'}`);
-    try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail, direction }) }); }
+    const { phoneNumber, agentEmail, direction, fromDate, toDate } = req.body || {};
+    log(`POST /sync-recordings — phoneNumber=${phoneNumber || '(all)'} direction=${direction || '(all)'} from=${fromDate || '-'} to=${toDate || '-'}`);
+    try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail, direction, fromDate, toDate }) }); }
     catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
   });
 
   app.get('/sync-recordings', async (req, res) => {
-    const { phoneNumber, agentEmail, direction } = req.query;
-    log(`GET /sync-recordings — phoneNumber=${phoneNumber || '(all)'} agentEmail=${agentEmail || '(none)'} direction=${direction || '(all)'}`);
-    try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail, direction }) }); }
+    const { phoneNumber, agentEmail, direction, fromDate, toDate } = req.query;
+    log(`GET /sync-recordings — phoneNumber=${phoneNumber || '(all)'} direction=${direction || '(all)'} from=${fromDate || '-'} to=${toDate || '-'}`);
+    try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail, direction, fromDate, toDate }) }); }
     catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
   });
 
