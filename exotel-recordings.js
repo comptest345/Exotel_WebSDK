@@ -307,17 +307,21 @@ async function updateBx24CallRecord({
   const recordingLink = buildRecordingLink(callSid);
   log(`Updating BX24 call CALL_ID=${bx24CallId} — recording link: ${recordingLink}`);
 
-  // Attach recording link to the existing telephony entry (shows ▶ in BX24 call log).
-  // RECORD_URL is our redirect link — never the raw Exotel URL.
+  // Attach recording link by calling telephony.externalcall.finish again with RECORD_URL.
+  // telephony.externalcall.hide is a no-op once finish has already been called (which
+  // server.js does immediately on call end). Calling finish a second time with RECORD_URL
+  // is the correct Bitrix24 way to retrofit the recording link onto a closed telephony entry.
   try {
-    await bx24Call('telephony.externalcall.hide', {
-      CALL_ID:    bx24CallId,
-      USER_ID:    agentBx24Id || '1',
-      RECORD_URL: recordingLink
+    await bx24Call('telephony.externalcall.finish', {
+      CALL_ID:     bx24CallId,
+      USER_ID:     agentBx24Id || '1',
+      DURATION:    duration || 0,
+      STATUS_CODE: 200,
+      RECORD_URL:  recordingLink
     });
-    log(`BX24 telephony.externalcall.hide OK — CALL_ID=${bx24CallId}`);
+    log(`BX24 telephony.externalcall.finish (with RECORD_URL) OK — CALL_ID=${bx24CallId}`);
   } catch (e) {
-    log(`telephony.externalcall.hide failed (${e.message}) — continuing to activity card`);
+    log(`telephony.externalcall.finish (RECORD_URL update) failed (${e.message}) — continuing to activity card`);
   }
 
   // Always also create a metadata activity card so agents see all fields.
@@ -335,7 +339,7 @@ async function updateBx24CallRecord({
     `Duration  : ${mins}m ${secs}s\n` +
     `Status    : ${status || 'Completed'}\n` +
     `Call SID  : ${callSid}\n\n` +
-    `Recording : [URL=${recordingLink}]View Recording[/URL]`;
+    `Recording : <a href="${recordingLink}">▶ View Recording</a>`;
 
   const entity = await findBx24EntityByPhone(clientNum);
   if (!entity) {
@@ -350,7 +354,7 @@ async function updateBx24CallRecord({
       TYPE_ID:          2,
       SUBJECT:          `📞 ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call — ${clientNum}`,
       DESCRIPTION:      desc,
-      DESCRIPTION_TYPE: 2,   // BBCode — required for [URL=…] to render as a clickable link
+      DESCRIPTION_TYPE: 3,   // HTML — renders <a href> as clickable link in modern BX24
       DIRECTION:        direction === 'outbound' ? 2 : 1,
       DURATION:         duration || 0,
       START_TIME:       callDate,
@@ -399,7 +403,7 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
     `Duration  : ${mins}m ${secs}s\n` +
     `Status    : ${status}\n` +
     `Call SID  : ${callSid}\n\n` +
-    `Recording : [URL=${recordingLink}]View Recording[/URL]`;
+    `Recording : <a href="${recordingLink}">▶ View Recording</a>`;
 
   const entity = await findBx24EntityByPhone(clientNum);
   if (!entity) {
@@ -420,7 +424,7 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
       TYPE_ID:          2,
       SUBJECT:          subject,
       DESCRIPTION:      desc,
-      DESCRIPTION_TYPE: 2,   // BBCode — required for [URL=…] to render as a clickable link
+      DESCRIPTION_TYPE: 3,   // HTML — renders <a href> as clickable link in modern BX24
       DIRECTION:        bx24Direction,
       DURATION:         duration,
       START_TIME:       callDate,
@@ -443,7 +447,7 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
       TYPE_ID:          4,
       SUBJECT:          subject,
       DESCRIPTION:      desc,
-      DESCRIPTION_TYPE: 2,
+      DESCRIPTION_TYPE: 3,
       START_TIME:       callDate,
       END_TIME:         endDate,
       COMPLETED:        'Y',
@@ -614,12 +618,78 @@ function recordingRedirectRoute(app) {
   });
 }
 
+// ── Continuous recording poller ──────────────────────────────────────────
+// Runs every POLL_INTERVAL_MS (default 10 s). Fetches the last 50 calls from
+// Exotel (both inbound and outbound) and immediately posts any call that has a
+// recording and hasn't been synced yet to Bitrix24 — no webhook dependency,
+// no exponential backoff, no waiting.
+//
+// Set EXOTEL_RECORDING_POLL_SEC=10 in env to control interval (min 5 s).
+// Set EXOTEL_RECORDING_POLL_DISABLED=true to disable if you only want manual sync.
+const POLL_INTERVAL_MS = Math.max(5, parseInt(process.env.EXOTEL_RECORDING_POLL_SEC || '10')) * 1000;
+let   _pollActive = false;
+
+async function pollOnce() {
+  if (_pollActive) return; // skip if previous run still in progress
+  _pollActive = true;
+  try {
+    // Fetch last 50 calls of each direction — covers both Incoming and Outgoing
+    const [inbound, outbound] = await Promise.all([
+      fetchRecentExotelCalls('inbound',      null, null).catch(() => []),
+      fetchRecentExotelCalls('outbound-api', null, null).catch(() => [])
+    ]);
+
+    // Deduplicate by Sid
+    const seen = new Set();
+    const calls = [];
+    for (const c of [...inbound, ...outbound]) {
+      if (c && c.Sid && !seen.has(c.Sid)) { seen.add(c.Sid); calls.push(c); }
+    }
+
+    let posted = 0;
+    for (const call of calls) {
+      const callSid = call.Sid;
+      if (!callSid)                    continue;
+      if (syncedCallSids.has(callSid)) continue; // already posted
+
+      // Only process calls that already have a recording
+      const hasRec = !!(call.RecordingUrl || call.PreSignedRecordingUrl);
+      if (!hasRec) continue;
+
+      const activityId = await createBx24CallActivity(call, callSid, null);
+      if (activityId) {
+        posted++;
+        syncedCallSids.add(callSid);
+        persistDedupSids();
+        log(`[Poll] Posted recording for ${callSid} -> BX24 activity ${activityId}`);
+      }
+    }
+
+    if (posted > 0) log(`[Poll] Cycle done — posted ${posted} new recording(s)`);
+  } catch (e) {
+    log(`[Poll] Error: ${e.message}`);
+  } finally {
+    _pollActive = false;
+  }
+}
+
+function startPolling() {
+  if (process.env.EXOTEL_RECORDING_POLL_DISABLED === 'true') {
+    log('Recording poller disabled (EXOTEL_RECORDING_POLL_DISABLED=true)');
+    return;
+  }
+  log(`Recording poller started — interval ${POLL_INTERVAL_MS / 1000}s`);
+  pollOnce();
+  setInterval(pollOnce, POLL_INTERVAL_MS);
+}
+
 // ── init — registers all routes with the Express app ────────────────────
 // Called once from server.js: recordings.init(app)
 // Registers:
 //   GET  /recording/:callSid   — 302 redirect to fresh Exotel recording URL
 //   POST /sync-recordings      — manual sync trigger
 //   GET  /sync-recordings      — manual sync trigger (browser-friendly)
+// Also starts the continuous recording poller automatically.
 function init(app) {
   recordingRedirectRoute(app);
 
@@ -638,6 +708,9 @@ function init(app) {
   });
 
   log('Routes registered: GET /recording/:callSid (redirect), POST /sync-recordings, GET /sync-recordings');
+
+  // Start continuous poller — picks up recordings as soon as Exotel has them
+  startPolling();
 }
 
-module.exports = { init, scheduleSync, syncRecordings };
+module.exports = { init, scheduleSync, syncRecordings, startPolling, pollOnce };
