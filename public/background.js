@@ -2,6 +2,13 @@
 // background.js — Multi-agent version
 // Registers Bitrix24 telephony + handles BX24 events.
 // BX24 user is resolved dynamically — no hardcoded IDs.
+//
+// NOTE: BX24.openApplication() is intentionally NOT called here.
+// The popup.html is a CRM_ACTIVITY_SIDEBAR — it is already open
+// on the CRM page. The server pushes an SSE outbound_call event
+// to the sidebar via /bx24-call-start. Calling openApplication()
+// from the background page triggers BX24's own native call card
+// UI instead of the Exotel sidebar, which is the wrong behaviour.
 // ═══════════════════════════════════════════════════════════════
 
 let currentCallId  = null;
@@ -18,38 +25,35 @@ function initBG() {
     bgLog('BX24 ready');
 
     // ── Outbound click-to-call from CRM card / phone number ──
+    // Bitrix24 fires this when the agent clicks a phone number.
+    // We POST to /bx24-call-start which pushes outbound_call SSE
+    // to the agent's Exotel sidebar (popup.html), which then calls
+    // triggerOutboundCall() to hit the Exotel API.
     BX24.addEvent('onExternalCallStart', function (data) {
       bgLog('onExternalCallStart: ' + JSON.stringify(data));
       const num    = (data.PHONE_NUMBER_INTERNATIONAL || data.PHONE_NUMBER || '').trim();
       const callId = data.CALL_ID || '';
       const userId = String(data.USER_ID || '');
+
+      if (!num) { bgLog('onExternalCallStart: no number, ignoring'); return; }
+
       currentCallId  = callId;
       currentCallNum = num;
       callStartTime  = Date.now();
 
-      if (!num) { bgLog('onExternalCallStart: no number, ignoring'); return; }
-
-      // 1. POST to server first — this queues the outbound_call SSE to the agent.
-      //    Do this BEFORE openApplication so the SSE arrives right as popup opens.
+      // Tell server to queue the outbound call for this agent.
+      // Server resolves userId → email, then pushes outbound_call SSE
+      // to the agent's open sidebar popup, which places the Exotel call.
       fetch('/bx24-call-start', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ PHONE_NUMBER: num, CALL_ID: callId, USER_ID: userId })
       }).then(r => r.json()).then(d => {
-        bgLog('bx24-call-start queued for: ' + (d.email || 'unknown') + ' → ' + num);
+        bgLog('bx24-call-start OK: ' + JSON.stringify(d));
       }).catch(e => bgLog('bx24-call-start error: ' + e.message));
-
-      // 2. Open the Exotel Dialer popup — passes number so popup can call immediately
-      //    even if SSE hasn't arrived yet (checkOpenApplicationParams fallback).
-      try {
-        BX24.openApplication(
-          { bx24_start_call: '1', number: num },
-          function() { bgLog('openApplication callback fired'); }
-        );
-      } catch(e) { bgLog('openApplication failed: ' + e.message); }
     });
 
-    // ── Call finished from BX24 side ──────────────────────────
+    // ── Call finished ─────────────────────────────────────────
     BX24.addEvent('onExternalCallFinish', function (data) {
       bgLog('onExternalCallFinish: ' + JSON.stringify(data));
       const finishCallId = data.CALL_ID || currentCallId;
