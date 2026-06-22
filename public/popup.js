@@ -536,8 +536,7 @@ async function doPoll() {
       //   3. activePanel is already showing (we're live on a call)
       // Without all three, the poll fires showDialer() on the accepting agent's
       // screen mid-call because acceptingCallSid was already cleared to null.
-      const weClaimedIt = (data.callSid === acceptingCallSid) ||
-                          (data.callSid && dismissedCallSids.has(data.callSid));
+      const weClaimedIt = (data.callSid === acceptingCallSid);
       const activePanelEl = document.getElementById('activePanel');
       const isLive = activePanelEl && activePanelEl.style.display === 'block';
       if (callDirection === 'inbound' && !weClaimedIt && !isLive) {
@@ -577,10 +576,11 @@ async function triggerOutboundCall(number) {
   if (!sdkReady)        { clog('OutboundCall: not registered'); setStatus('Not registered yet'); return; }
   if (!currentUserEmail){ clog('OutboundCall: email not resolved'); setStatus('⚠️ Email not resolved — reload'); return; }
   // Guard: prevent double-fire (SSE reconnect, poll race, etc.)
-  if (callDirection && callDirection !== 'outbound') {
-    clog('OutboundCall blocked — already on ' + callDirection + ' call');
+  if (outboundInFlight || callDirection) {
+    clog('OutboundCall blocked — outboundInFlight=' + outboundInFlight + ' callDirection=' + callDirection);
     return;
   }
+  outboundInFlight = true;
   callDirection = 'outbound';
   // Mark busy immediately — no incoming calls should ring this agent while dialling.
   reportStatus('busy');
