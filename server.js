@@ -575,26 +575,55 @@ app.post('/make-outbound-call', async (req, res) => {
 });
 
 app.post('/bx24-call-start', async (req, res) => {
-  console.log('[BX24-CallStart]', JSON.stringify(req.body));
+  console.log('[BX24-CallStart] raw body:', JSON.stringify(req.body));
   try {
-    const d          = req.body.data || req.body;
-    const bx24UserId = String(d.USER_ID || BX24_USER_ID);
-    const number     = d.PHONE_NUMBER || '';
-    const callId     = d.CALL_ID     || ('ext_' + Date.now());
+    const d    = (typeof req.body.data === 'object' && req.body.data) ? req.body.data : req.body;
+    const auth = (typeof req.body.auth === 'object' && req.body.auth) ? req.body.auth : null;
+    const bx24UserId = String(d.USER_ID || d['data[USER_ID]'] || BX24_USER_ID);
+    const number     = (d.PHONE_NUMBER_INTERNATIONAL || d.PHONE_NUMBER || d['data[PHONE_NUMBER]'] || '').trim();
+    const callId     = d.CALL_ID || d['data[CALL_ID]'] || ('ext_' + Date.now());
     const email = await getBx24UserEmail(bx24UserId);
-    if (!email) {
-      console.warn(`[BX24-CallStart] Could not resolve email for BX24 user ${bx24UserId}`);
-      pendingCallMap['bx24_' + bx24UserId] = { number, callId, ts: Date.now() };
-    } else {
-      const key = email.toLowerCase();
-      const pushed = ssePush(key, 'outbound_call', { number, callId });
-      if (!pushed) {
-        pendingCallMap[key] = { number, callId, ts: Date.now() };
-        console.log(`[BX24-CallStart] Queued (no SSE) for ${email} → ${number}`);
+    if (!number) return res.json({ status: 'ignored', reason: 'no_number' });
+
+    // Prefer fresh access_token from event auth over static webhook
+    let email = null;
+    if (auth && auth.access_token && auth.client_endpoint) {
+      try {
+        const r = await fetch(`${auth.client_endpoint}user.current.json`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ auth: auth.access_token })
+        });
+        const u = await r.json();
+        email = (u.result && u.result.EMAIL) || null;
+        if (email) {
+          bx24EmailCache[bx24UserId] = email; // also warm the cache
+          console.log(`[BX24-CallStart] Resolved email from event auth: ${email}`);
+        }
+      } catch (e) {
+        console.warn('[BX24-CallStart] auth token lookup failed, falling back to webhook:', e.message);
       }
     }
-    res.json({ status: 'ok' });
-  } catch (e) { res.json({ status: 'error', message: e.message }); }
+
+    // Fallback: use static BX24 webhook
+    if (!email) email = await getBx24UserEmail(bx24UserId);
+
+    if (!email) {
+      console.warn(`[BX24-CallStart] Could not resolve email for userId ${bx24UserId} — queuing by userId`);
+      pendingCallMap['bx24_' + bx24UserId] = { number, callId, ts: Date.now() };
+      return res.json({ status: 'queued_no_email' });
+    }
+
+    const key    = email.toLowerCase();
+    const pushed = ssePush(key, 'outbound_call', { number, callId });
+    console.log(`[BX24-CallStart] SSE push to ${key}: ${pushed ? 'SUCCESS' : 'QUEUED (no SSE)'}`);
+    if (!pushed) pendingCallMap[key] = { number, callId, ts: Date.now() };
+
+    res.json({ status: 'ok', email, pushed });
+  } catch (e) {
+    console.error('[BX24-CallStart]', e.message);
+    res.json({ status: 'error', message: e.message });
+  }
 });
 
 // ── Pending call poll ─────────────────────────────────────────────
