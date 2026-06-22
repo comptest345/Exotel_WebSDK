@@ -186,11 +186,16 @@ function showIncoming(from, callSid) {
 function showActive(num) {
   const el = document.getElementById('activeNum');
   if (el) el.textContent = num || '';
-  document.getElementById('incomingPanel').style.display = 'none';
-  document.getElementById('activePanel').style.display   = 'block';
-  document.getElementById('dialerPanel').style.display   = 'none';
-  document.getElementById('hangupBtn').style.display     = 'block';
-  document.getElementById('callBtn').style.display       = 'none';
+  const incomingPanel = document.getElementById('incomingPanel');
+  const activePanel   = document.getElementById('activePanel');
+  const dialerPanel   = document.getElementById('dialerPanel');
+  const hangupBtn     = document.getElementById('hangupBtn');
+  const callBtn       = document.getElementById('callBtn');
+  if (incomingPanel) incomingPanel.style.display = 'none';
+  if (activePanel)   activePanel.style.display   = 'block';
+  if (dialerPanel)   dialerPanel.style.display   = 'none';
+  if (hangupBtn)     hangupBtn.style.display      = 'block';
+  if (callBtn)       callBtn.style.display        = 'none';
   startTimer();
   // Round robin: tell server this agent is now busy on a call (inbound or outbound).
   // New incoming calls will skip this agent and ring others who are free.
@@ -626,6 +631,14 @@ function handleCallEvent(event) {
       // "Connecting..." status we set right after AcceptCall().
       if (acceptingCallSid) {
         clog('Native incoming event ignored — already accepted sid=' + acceptingCallSid);
+        return;
+      }
+      // If we already called showActive() (activePanel is visible), don't clobber it
+      // back to incoming. Exotel fires a second ringing event for the dial leg after
+      // AcceptCall() which would overwrite the active UI back to incoming panel.
+      const activePanelEl = document.getElementById('activePanel');
+      if (activePanelEl && activePanelEl.style.display === 'block') {
+        clog('Native incoming event ignored — activePanel already showing (call is live)');
         return;
       }
       if (currentInboundCallSid && dismissedCallSids.has(currentInboundCallSid)) {
