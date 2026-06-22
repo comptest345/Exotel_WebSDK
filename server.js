@@ -745,6 +745,13 @@ function normalizePhone(n) {
   return digits.slice(-10) || String(n || '').trim().toLowerCase();
 }
 
+// ── Round-robin state ────────────────────────────────────────────
+// rrPointer: index into connected agents list, advances after each inbound call
+let rrPointer = 0;
+// ringTimers: callSid → { timer, agentList, currentIdx }
+const ringTimers = {};
+const RING_TIMEOUT_MS = 15000; // 15 s per agent before moving to next
+
 // ── Agent presence ────────────────────────────────────────────────
 const agentStatus = new Map();
 
@@ -768,6 +775,39 @@ function setAgentBusy(email, busy) {
 }
 
 // ── /agent-status ─────────────────────────────────────────────────
+// ── Round-robin: ring next available agent ───────────────────────
+function ringNextAgent(callSid) {
+  const state = ringTimers[callSid];
+  if (!state) return;
+
+  const { agentList, currentIdx } = state;
+  const nextIdx = currentIdx + 1;
+  const callData = pendingInboundMap[callSid];
+
+  if (!callData || nextIdx >= agentList.length) {
+    delete ringTimers[callSid];
+    console.log(`[RR] All agents tried for ${callSid} — no answer`);
+    return;
+  }
+
+  state.currentIdx = nextIdx;
+  const prevAgent  = agentList[currentIdx];
+  const nextAgent  = agentList[nextIdx];
+
+  // Mark previous agent as rejected so they won't be re-notified
+  const lock = callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
+  if (lock) lock.rejectedBy.add(prevAgent);
+
+  // Dismiss previous agent's UI
+  ssePush(prevAgent, 'call_dismissed', { callSid, reason: 'no_answer_timeout' });
+
+  console.log(`[RR] Timeout — ${callSid}: ${prevAgent} → ${nextAgent}`);
+  ssePush(nextAgent, 'inbound_call', { from: callData.from, callSid });
+
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = setTimeout(() => ringNextAgent(callSid), RING_TIMEOUT_MS);
+}
+
 app.post('/agent-status', (req, res) => {
   const { email, status } = req.body || {};
   if (!email || !['free', 'busy'].includes(status))
@@ -808,16 +848,46 @@ app.all('/incoming-call', async (req, res) => {
 
     pendingInboundMap[sid] = { from, to: toNum, ts: Date.now(), phoneKey };
 
-    const allAgents = Object.keys(sseClients);
-    let targets = allAgents.filter(e =>
-      (agentStatus.get(e)?.status !== 'busy') && !lock.rejectedBy.has(e)
-    );
-    if (targets.length === 0) targets = allAgents.filter(e => !lock.rejectedBy.has(e));
-    if (targets.length === 0) targets = allAgents;
+    // ── Round-robin agent selection ──────────────────────────────────
+    // Build ordered list: all SSE-connected agents, starting from rrPointer,
+    // skipping busy agents first. If all are busy, include them anyway.
+    const allConnected = Object.keys(sseClients).filter(e => !e.startsWith('bx24_'));
+    if (allConnected.length === 0) {
+      console.log(`[Incoming] sid=${sid} from=${from} — no agents connected`);
+      return res.json({ status: 'no_agents' });
+    }
 
-    const pushed = targets.reduce((n, agentEmail) =>
-      n + (ssePush(agentEmail, 'inbound_call', { from, callSid: sid }) ? 1 : 0), 0);
-    console.log(`[Incoming] sid=${sid} from=${from} → broadcast to ${pushed}/${allAgents.length} agent(s)`);
+    // Build ordered list starting from current rrPointer (strict round robin)
+    const ordered = [];
+    for (let i = 0; i < allConnected.length; i++) {
+      ordered.push(allConnected[(rrPointer + i) % allConnected.length]);
+    }
+    // Advance pointer for next call
+    rrPointer = (rrPointer + 1) % allConnected.length;
+
+    // Filter: skip agents who already rejected this call
+    const eligible = ordered.filter(e => !lock.rejectedBy.has(e));
+    // Prefer free agents; fall back to busy if everyone is busy
+    let freeEligible = eligible.filter(e => agentStatus.get(e)?.status !== 'busy');
+    const agentList  = freeEligible.length > 0 ? freeEligible : eligible;
+
+    if (agentList.length === 0) {
+      console.log(`[Incoming] sid=${sid} — all agents busy or rejected, queuing`);
+      return res.json({ status: 'queued' });
+    }
+
+    // Ring the first agent in the round-robin order
+    const firstAgent = agentList[0];
+    ssePush(firstAgent, 'inbound_call', { from, callSid: sid });
+    console.log(`[Incoming] sid=${sid} from=${from} → ringing ${firstAgent} (RR idx ${rrPointer-1}/${allConnected.length})`);
+
+    // Start ring timeout — if no answer in RING_TIMEOUT_MS, move to next agent
+    if (ringTimers[sid]) clearTimeout(ringTimers[sid].timer);
+    ringTimers[sid] = {
+      timer:      setTimeout(() => ringNextAgent(sid), RING_TIMEOUT_MS),
+      agentList,
+      currentIdx: 0
+    };
 
     res.json({ status: 'received' });
   } catch (e) { console.error('[Incoming]', e.message); res.json({ status: 'error', message: e.message }); }
@@ -837,6 +907,12 @@ app.post('/claim-call', async (req, res) => {
   inboundClaimMap[callSid] = { email, bx24UserId: bx24UserId || null, bx24CallId: null, ts: Date.now() };
   claimedSids.add(callSid);
   console.log(`[Claim] ${email} claimed ${callSid}`);
+
+  // Cancel any pending ring-timeout timer for this call
+  if (ringTimers[callSid]) {
+    clearTimeout(ringTimers[callSid].timer);
+    delete ringTimers[callSid];
+  }
 
   const callData = pendingInboundMap[callSid];
   if (callData && callData.phoneKey) {
@@ -930,7 +1006,20 @@ app.post('/reject-call', (req, res) => {
   const lock = callData && callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
   if (lock) lock.rejectedBy.add(email.toLowerCase());
   setAgentBusy(email, false);
-  console.log(`[Reject] ${email} declined ${callSid} — still ringing for other free agents`);
+  console.log(`[Reject] ${email} declined ${callSid} — advancing round-robin`);
+
+  // Immediately advance to next agent in the round-robin sequence
+  const state = ringTimers[callSid];
+  if (state) {
+    clearTimeout(state.timer);
+    // Mark current agent as rejected in the agentList so ringNextAgent skips them
+    // (lock.rejectedBy already updated above)
+    // Find this agent's position and advance from there
+    const agentIdx = state.agentList.indexOf(email.toLowerCase());
+    if (agentIdx !== -1) state.currentIdx = agentIdx;
+    ringNextAgent(callSid);
+  }
+
   res.json({ ok: true });
 });
 
@@ -965,24 +1054,27 @@ app.all('/call-callback', async (req, res) => {
     const agentId  = claim ? (claim.bx24UserId || BX24_USER_ID) : BX24_USER_ID;
     const outbound = outboundCallMap[sid];
 
+    // Declare finishEmail BEFORE using it
+    const finishBx24Id  = outbound ? outbound.bx24CallId      : bx24Id;
+    const finishAgentId = outbound ? outbound.agentBx24UserId  : agentId;
+    const finishEmail   = outbound ? outbound.agentEmail        : (claim ? claim.email : null);
+
     if (claim)   { setAgentBusy(claim.email, false); delete inboundClaimMap[sid]; }
     if (outbound) { setAgentBusy(outbound.agentEmail, false); }
 
-    // ── Instant hangup: push call_ended SSE to agent popup immediately ──
-    const endEmail = finishEmail || (claim ? claim.email : null) || (outbound ? outbound.agentEmail : null);
-    if (endEmail) {
-      ssePush(endEmail, 'call_ended', { callSid: sid, reason: 'terminal' });
-      console.log(`[Callback] Pushed call_ended SSE to ${endEmail} for sid=${sid}`);
+    // Cancel any pending ring timer (call is now terminal)
+    if (ringTimers[sid]) { clearTimeout(ringTimers[sid].timer); delete ringTimers[sid]; }
+
+    // Push call_ended SSE to agent popup immediately
+    if (finishEmail) {
+      ssePush(finishEmail, 'call_ended', { callSid: sid, reason: 'terminal' });
+      console.log(`[Callback] Pushed call_ended SSE to ${finishEmail} for sid=${sid}`);
     }
 
     const callData = pendingInboundMap[sid];
     if (callData && callData.phoneKey) callerLocks.delete(callData.phoneKey);
     if (pendingInboundMap[sid]) delete pendingInboundMap[sid];
     claimedSids.delete(sid);
-
-    const finishBx24Id  = outbound ? outbound.bx24CallId      : bx24Id;
-    const finishAgentId = outbound ? outbound.agentBx24UserId  : agentId;
-    const finishEmail   = outbound ? outbound.agentEmail        : (claim ? claim.email : null);
 
     if (BX24_WEBHOOK && finishBx24Id) {
       try {
