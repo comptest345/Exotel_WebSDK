@@ -519,7 +519,7 @@ app.post('/make-outbound-call', async (req, res) => {
       to: { customer_contact_uri: toNumber },
       virtual_number: VIRTUAL_NUMBER,
       recording: true,
-      status_callback: `${RENDER_URL}/call-callback`
+      status_callback: [{ url: `${RENDER_URL}/call-callback`, method: 'POST' }]
     };
 
     console.log(`[OutboundCall] ${agentEmail} → ${toNumber} record:true`);
