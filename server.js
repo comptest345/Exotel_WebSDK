@@ -522,17 +522,18 @@ app.post('/make-outbound-call', async (req, res) => {
     const appUserId = String(user.AppUserId || '');
     const sipId     = user.SipId || '';
 
-    // POST to Exotel integrations outbound_call endpoint with record:true
+    // POST to Exotel integrations /call endpoint with record:true
+    // The correct Exotel V3 integrations API path is /call (not /call/outbound_call).
+    // Field names must match the Exotel spec: AppUserId (not user_id), ToNumber (not to).
     const payload = {
-      customer_id: CUSTOMER_ID,
-      app_id:      APP_ID,
-      to:          toNumber,
-      user_id:     appUserId,
-      record:      true       // ← THE FIX: force recording on every outbound call
+      AppUserId:  appUserId,
+      ToNumber:   toNumber,
+      Record:     true,       // force recording on every outbound call
+      CallbackUrl: `${RENDER_URL}/call-callback`
     };
 
     console.log(`[OutboundCall] ${agentEmail} → ${toNumber} record:true`);
-    const callRes = await fetch(`${BASE}/call/outbound_call`, {
+    const callRes = await fetch(`${BASE}/call`, {
       method:  'POST',
       headers: { 'Authorization': appToken, 'Content-Type': 'application/json' },
       body:    JSON.stringify(payload)
@@ -544,7 +545,7 @@ app.post('/make-outbound-call', async (req, res) => {
 
     // Register the outbound call with BX24 telephony API so it appears in the
     // timeline as a native call entry (with audio player) instead of a plain activity.
-    const exotelCallSid = callData?.Data?.CallSid || null;
+    const exotelCallSid = callData?.Data?.CallSid || callData?.CallSid || null;
     if (BX24_WEBHOOK && exotelCallSid) {
       try {
         const agentBx24Id = await getBx24UserEmail_toBx24Id(agentEmail);
@@ -677,10 +678,8 @@ app.get('/events', (req, res) => {
   }
 
   // Also flush any unclaimed inbound call this agent hasn't rejected.
-  // This covers the case where the inbound webhook fired while this agent's
-  // SSE was dropped (Render 30s timeout) — on reconnect they get the ring.
   for (const [sid, callData] of Object.entries(pendingInboundMap)) {
-    if (claimedSids.has(sid)) continue;
+    if (inboundClaimMap[sid]) continue;  // already claimed by someone
     const lock = callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
     if (lock && lock.claimedBy) continue;
     if (lock && lock.rejectedBy.has(email)) continue;
@@ -766,8 +765,8 @@ app.post('/agent-status', (req, res) => {
 app.all('/incoming-call', async (req, res) => {
   const p  = Object.assign({}, req.query, req.body);
   console.log('[Incoming]', JSON.stringify(p));
-  const et = (p.EventType || p.Status || '').toLowerCase();
-  if (['free','terminal','completed','busy','noanswer'].includes(et)) return res.json({ status: 'ignored' });
+  const et = (p.EventType || p.Status || p.CallStatus || '').toLowerCase();
+  if (['free','terminal','terminated','completed','busy','noanswer','no-answer','failed'].includes(et)) return res.json({ status: 'ignored' });
   try {
     const from   = p.From || p.CallFrom || p.caller_id || p.CallerId || p.callerid || 'Unknown';
     const toNum  = p.To || p.DialWhomNumber || p.CallTo || VIRTUAL_NUMBER || 'Unknown';
@@ -920,8 +919,9 @@ app.all('/call-callback', async (req, res) => {
 
     // Ignore mid-call webhooks (answered, active, ringing, etc.)
     // Only process when the call is definitively over.
-    const isTerminal = callState === 'terminal' || status === 'completed' ||
-                       callDetail === 'terminal' || callDetail === 'completed' ||
+    const isTerminal = callState === 'terminal' || callState === 'terminated' ||
+                       status === 'completed'   || status === 'terminated'   ||
+                       callDetail === 'terminal'|| callDetail === 'completed' ||
                        (p.EndTime && String(p.EndTime).trim() !== '');
     if (!isTerminal) {
       console.log(`[Callback] SKIP mid-call webhook — CallState=${callState} CallDetail=${callDetail} sid=${sid}`);
@@ -987,37 +987,15 @@ app.all('/call-callback', async (req, res) => {
       ? (p.ToNumber || p.To || callFrom).trim()
       : callFrom;
 
-    if (clientNum) {
-      // Exotel takes 2-5 minutes to process and generate a recording after a call ends.
-      // On each retry: fetch the recording URL via proxy, then update the BX24 call
-      // activity with RECORD_URL so agents get an inline audio player in the timeline.
-      const syncWithRetry = (delayMs, attempt) => {
-        setTimeout(async () => {
-          try {
-            console.log(`[Callback] Recording sync attempt ${attempt} for ${clientNum} (delay ${delayMs/1000}s)`);
-            const result = await recordings.syncRecordings({
-              phoneNumber: clientNum,
-              agentEmail:  finishEmail,
-              callSid:     sid,
-              bx24CallId:  finishBx24Id,
-              agentBx24Id: finishAgentId
-            });
-            if (result && result.posted > 0) {
-              console.log(`[Callback] Recording synced on attempt ${attempt}: ${JSON.stringify(result)}`);
-              if (outbound) delete outboundCallMap[sid];
-            } else if (attempt < 3) {
-              syncWithRetry(delayMs * 2, attempt + 1); // exponential: 2min → 4min → 8min
-            } else {
-              console.log(`[Callback] Recording not found after ${attempt} attempts for ${clientNum}`);
-              if (outbound) delete outboundCallMap[sid];
-            }
-          } catch (e) {
-            console.warn(`[Callback] Recording sync attempt ${attempt} failed:`, e.message);
-          }
-        }, delayMs);
-      };
-      syncWithRetry(2 * 60 * 1000, 1); // first attempt 2 minutes after call ends
-    }
+    // Schedule recording sync with automatic retry — all retry logic lives in exotel-recordings.js
+    recordings.scheduleSync({
+      clientNum,
+      agentEmail:  finishEmail,
+      callSid:     sid,
+      bx24CallId:  finishBx24Id,
+      agentBx24Id: finishAgentId,
+      onSuccess:   outbound ? () => { delete outboundCallMap[sid]; } : null
+    });
 
     res.json({ status: 'received' });
   } catch (e) { console.error('[Callback]', e.message); res.json({ status: 'error', message: e.message }); }
@@ -1214,69 +1192,6 @@ function sendTokenResponse(res, appToken, userObj, creds, email) {
     }))
   });
 }
-
-// ── Recording proxy ───────────────────────────────────────────────
-// Streams a call recording directly from Exotel to the browser.
-// Bitrix24's audio player hits this URL; we authenticate with Exotel
-// credentials server-side and pipe the audio back — no storage, no upload,
-// no Bitrix24 storage used. URL is permanent (never expires like signed URLs).
-// Format: GET /recording/:callSid
-app.get('/recording/:callSid', async (req, res) => {
-  const { callSid } = req.params;
-  if (!callSid) return res.status(400).send('callSid required');
-
-  const ACCOUNT_SID = process.env.EXOTEL_ACCOUNT_SID || '';
-  const API_KEY     = process.env.EXOTEL_API_KEY     || '';
-  const API_TOKEN   = process.env.EXOTEL_API_TOKEN   || '';
-  const DOMAIN      = process.env.EXOTEL_DOMAIN      || 'singapore';
-  const isIndia_    = /mum|in1|india/i.test(DOMAIN);
-  const API_HOST    = process.env.EXOTEL_API_HOST || (isIndia_ ? 'api.in.exotel.com' : 'api.exotel.com');
-
-  try {
-    // Step 1: Fetch the recording metadata to get the actual audio URL
-    const creds   = Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
-    const metaUrl = `https://${API_HOST}/v1/Accounts/${ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
-    const metaRes = await fetch(metaUrl, { headers: { Authorization: `Basic ${creds}` } });
-    if (!metaRes.ok) {
-      console.warn(`[RecProxy] Recordings.json HTTP ${metaRes.status} for ${callSid}`);
-      return res.status(404).send('Recording not found');
-    }
-    const metaBody = await metaRes.json();
-    const recList  = metaBody?.TwilioResponse?.Recordings?.Recording;
-    const rec      = Array.isArray(recList) ? recList[0] : recList;
-    if (!rec) return res.status(404).send('No recording available yet');
-
-    // Step 2: Build the raw audio URL (.mp3, no .json)
-    let audioUrl = rec.Uri || '';
-    if (!audioUrl.startsWith('http'))
-      audioUrl = `https://${API_HOST}${audioUrl}`;
-    audioUrl = audioUrl.replace(/\.json$/, '');
-
-    console.log(`[RecProxy] Streaming ${callSid} → ${audioUrl}`);
-
-    // Step 3: Fetch the audio from Exotel (authenticated) and pipe to browser
-    const audioRes = await fetch(audioUrl, { headers: { Authorization: `Basic ${creds}` } });
-    if (!audioRes.ok) {
-      console.warn(`[RecProxy] Audio fetch HTTP ${audioRes.status} for ${callSid}`);
-      return res.status(audioRes.status).send('Audio fetch failed');
-    }
-
-    // Forward content headers so the browser knows it's audio
-    res.setHeader('Content-Type', audioRes.headers.get('content-type') || 'audio/mpeg');
-    const contentLength = audioRes.headers.get('content-length');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-    res.setHeader('Accept-Ranges', 'bytes');
-    // Allow Bitrix24 iframe to load the audio
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-
-    // Pipe the audio stream directly to the response — nothing stored on our server
-    audioRes.body.pipe(res);
-  } catch (e) {
-    console.error(`[RecProxy] Error for ${callSid}:`, e.message);
-    if (!res.headersSent) res.status(500).send('Proxy error');
-  }
-});
 
 // ── Static files ──────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
