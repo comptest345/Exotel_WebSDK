@@ -7,14 +7,24 @@
 //     ↓ server.js /call-callback fires → calls recordings.scheduleSync(...)
 //     ↓ scheduleSync() retries with exponential backoff (2 min → 4 min → 8 min)
 //     ↓ syncRecordings() confirms recording exists via fetchRecordingUrl()
+//         fetchRecordingUrl() uses GET /Calls/<CallSid>.json (Call Details API)
+//         Prefers PreSignedRecordingUrl (secure accounts) → RecordingUrl fallback
 //     ↓ buildProxyUrl() builds a permanent proxy URL on OUR server
 //     ↓ updateBx24CallRecord() calls telephony.externalcall.hide to attach RECORD_URL
 //     ↓ Bitrix24 timeline shows native call entry with ▶ Play button
 //     ↓ Agent clicks play → browser hits GET /recording/:callSid
-//     ↓ proxyRecordingRoute() streams audio from Exotel (authenticated, no storage)
+//     ↓ proxyRecordingRoute() fetches call details → streams audio from Exotel
+//         (authenticated, no storage, supports PreSignedRecordingUrl)
+//
+// Recording URL resolution (official Exotel approach — no separate Recordings API):
+//   GET /Calls/<CallSid>.json
+//   Response contains:
+//     { "Call": { "RecordingUrl": "https://...", "PreSignedRecordingUrl": "https://..." } }
+//   PreSignedRecordingUrl is present on secure-recording accounts and should be preferred.
 //
 // For historical calls (POST/GET /sync-recordings):
-//     ↓ fetchExotelCallsForNumber() or fetchRecentExotelCalls()
+//     ↓ fetchExotelCallsForNumber() or fetchRecentExotelCalls(direction?)
+//         direction filter: 'inbound' | 'outbound-api' | 'inbound,outbound-api,outbound-dial'
 //     ↓ For each call with a recording:
 //         bx24CallId known → updateBx24CallRecord  (update existing timeline entry)
 //         bx24CallId unknown → createBx24CallActivity (create new timeline entry)
@@ -177,27 +187,33 @@ async function fetchExotelCallsForNumber(phoneNumber) {
   return Array.from(calls.values());
 }
 
-async function fetchRecentExotelCalls() {
+// Fetch recent calls, optionally filtered by direction.
+// direction may be a single string or comma-separated list, e.g.:
+//   'inbound'  |  'outbound-api'  |  'inbound,outbound-api,outbound-dial'
+async function fetchRecentExotelCalls(direction) {
   try {
-    const data = await exotelGet('/Calls.json', { PageSize: 100 });
+    const params = { PageSize: 100 };
+    if (direction) params.Direction = direction;
+    const data = await exotelGet('/Calls.json', params);
     const list = (data?.TwilioResponse?.Calls?.Call) || [];
     const arr  = Array.isArray(list) ? list : [list];
-    log(`Exotel /Calls (all recent) → ${arr.length} result(s)`);
+    log(`Exotel /Calls (direction=${direction || 'all'}) → ${arr.length} result(s)`);
     return arr;
   } catch (e) { log(`Exotel all-calls fetch failed: ${e.message}`); return []; }
 }
 
-// ── Fetch recording URL from Exotel ─────────────────────────────────────
+// ── Fetch recording URL from Exotel (via Call Details API) ───────────────
+// Uses GET /Calls/<CallSid>.json — the official way to retrieve recordings.
+// Prefers PreSignedRecordingUrl (secure accounts) over RecordingUrl.
+// Returns null if the call has no recording yet.
 async function fetchRecordingUrl(callSid) {
   try {
-    const data = await exotelGet(`/Calls/${callSid}/Recordings.json`);
-    const list = (data?.TwilioResponse?.Recordings?.Recording) || [];
-    const arr  = Array.isArray(list) ? list : [list];
-    if (!arr[0]) return null;
-    const uri = arr[0].Uri || '';
-    return uri.startsWith('http')
-      ? uri.replace(/\.json$/, '')
-      : `https://${EXOTEL_API_HOST}${uri}`.replace(/\.json$/, '');
+    const data = await exotelGet(`/Calls/${callSid}.json`);
+    const call = data?.TwilioResponse?.Call || data?.Call || {};
+    // PreSignedRecordingUrl takes priority on accounts with signed URL access
+    const url = call.PreSignedRecordingUrl || call.RecordingUrl || null;
+    if (url) log(`Recording URL for ${callSid}: ${url.slice(0, 80)}…`);
+    return url || null;
   } catch (e) {
     if (!e.message.includes('404')) log(`Recording fetch failed for ${callSid}: ${e.message}`);
     return null;
@@ -362,14 +378,16 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
 //   callSid      — specific Exotel CallSid we're retrying (hint: don't permanently skip)
 //   bx24CallId   — BX24 CALL_ID if telephony.externalcall.register was already called
 //   agentBx24Id  — BX24 numeric user ID (skips lookup when already known)
-async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24CallId, agentBx24Id } = {}) {
+//   direction    — optional direction filter for bulk fetch: 'inbound', 'outbound-api',
+//                  or comma-separated e.g. 'inbound,outbound-api,outbound-dial'
+async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24CallId, agentBx24Id, direction } = {}) {
   const results = { processed: 0, recorded: 0, posted: 0, skipped: 0, errors: [] };
 
   const resolvedAgentId = agentBx24Id || (agentEmail ? await getBx24UserId(agentEmail) : null);
 
   const calls = phoneNumber
     ? await fetchExotelCallsForNumber(phoneNumber)
-    : await fetchRecentExotelCalls();
+    : await fetchRecentExotelCalls(direction);
 
   results.processed = calls.length;
   log(`Processing ${calls.length} call(s)` + (phoneNumber ? ` for ${phoneNumber}` : ' (all recent)'));
@@ -471,6 +489,8 @@ function scheduleSync({ clientNum, agentEmail, callSid, bx24CallId, agentBx24Id,
 
 // ── GET /recording/:callSid — audio proxy ────────────────────────────────
 // Streams audio from Exotel directly to the browser, authenticated server-side.
+// Uses Call Details API (GET /Calls/<callSid>.json) to retrieve the recording URL.
+// Prefers PreSignedRecordingUrl (secure accounts) — falls back to RecordingUrl.
 // Bitrix24's audio player loads this URL — no storage needed, never expires.
 function proxyRecordingRoute(app) {
   app.get('/recording/:callSid', async (req, res) => {
@@ -480,26 +500,27 @@ function proxyRecordingRoute(app) {
     const creds = Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
 
     try {
-      // Step 1: Fetch recording metadata to get the actual audio file URL
-      const metaUrl = `${EXOTEL_V1_BASE}/Calls/${callSid}/Recordings.json`;
-      const metaRes = await fetch(metaUrl, { headers: { Authorization: `Basic ${creds}` } });
-      if (!metaRes.ok) {
-        log(`[Proxy] Recordings.json HTTP ${metaRes.status} for ${callSid}`);
-        return res.status(404).send('Recording not found');
+      // Step 1: Fetch call details to obtain the recording URL
+      const detailUrl = `${EXOTEL_V1_BASE}/Calls/${callSid}.json`;
+      const detailRes = await fetch(detailUrl, { headers: { Authorization: `Basic ${creds}` } });
+      if (!detailRes.ok) {
+        log(`[Proxy] Call details HTTP ${detailRes.status} for ${callSid}`);
+        return res.status(404).send('Call not found');
       }
-      const metaBody = await metaRes.json();
-      const recList  = metaBody?.TwilioResponse?.Recordings?.Recording;
-      const rec      = Array.isArray(recList) ? recList[0] : recList;
-      if (!rec) return res.status(404).send('No recording available yet');
+      const detailBody = await detailRes.json();
+      const call       = detailBody?.TwilioResponse?.Call || detailBody?.Call || {};
 
-      // Step 2: Build the raw audio URL (strip .json suffix)
-      let audioUrl = rec.Uri || '';
-      if (!audioUrl.startsWith('http'))
-        audioUrl = `https://${EXOTEL_API_HOST}${audioUrl}`;
-      audioUrl = audioUrl.replace(/\.json$/, '');
-      log(`[Proxy] Streaming ${callSid} → ${audioUrl}`);
+      // Prefer PreSignedRecordingUrl (secure/signed-URL accounts), fall back to RecordingUrl
+      const audioUrl = call.PreSignedRecordingUrl || call.RecordingUrl || null;
+      if (!audioUrl) {
+        log(`[Proxy] No recording URL in call details for ${callSid}`);
+        return res.status(404).send('No recording available yet');
+      }
+      log(`[Proxy] Streaming ${callSid} → ${audioUrl.slice(0, 80)}…`);
 
-      // Step 3: Fetch audio from Exotel and pipe directly to the browser response
+      // Step 2: Fetch audio from Exotel and pipe directly to the browser response.
+      // PreSignedRecordingUrl is self-authenticated (no Basic auth header needed).
+      // RecordingUrl requires Basic auth. We send the header in both cases — harmless for signed URLs.
       const audioRes = await fetch(audioUrl, { headers: { Authorization: `Basic ${creds}` } });
       if (!audioRes.ok) {
         log(`[Proxy] Audio fetch HTTP ${audioRes.status} for ${callSid}`);
@@ -531,16 +552,16 @@ function init(app) {
   proxyRecordingRoute(app);
 
   app.post('/sync-recordings', async (req, res) => {
-    const { phoneNumber, agentEmail } = req.body || {};
-    log(`POST /sync-recordings — phoneNumber=${phoneNumber || '(all)'} agentEmail=${agentEmail || '(none)'}`);
-    try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail }) }); }
+    const { phoneNumber, agentEmail, direction } = req.body || {};
+    log(`POST /sync-recordings — phoneNumber=${phoneNumber || '(all)'} agentEmail=${agentEmail || '(none)'} direction=${direction || '(all)'}`);
+    try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail, direction }) }); }
     catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
   });
 
   app.get('/sync-recordings', async (req, res) => {
-    const { phoneNumber, agentEmail } = req.query;
-    log(`GET /sync-recordings — phoneNumber=${phoneNumber || '(all)'} agentEmail=${agentEmail || '(none)'}`);
-    try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail }) }); }
+    const { phoneNumber, agentEmail, direction } = req.query;
+    log(`GET /sync-recordings — phoneNumber=${phoneNumber || '(all)'} agentEmail=${agentEmail || '(none)'} direction=${direction || '(all)'}`);
+    try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail, direction }) }); }
     catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
   });
 
