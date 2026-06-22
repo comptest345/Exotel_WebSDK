@@ -739,4 +739,4 @@ function init(app) {
   startPolling();
 }
 
-module.exports = { init, scheduleSync, syncRecordings, startPolling, pollOnce };
+module.exports = { init, scheduleSync, syncRecordings, startPolling, pollOnce, setAgentResolver };
