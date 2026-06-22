@@ -881,6 +881,13 @@ app.all('/call-callback', async (req, res) => {
     if (claim)   { setAgentBusy(claim.email, false); delete inboundClaimMap[sid]; }
     if (outbound) { setAgentBusy(outbound.agentEmail, false); }
 
+    // ── Instant hangup: push call_ended SSE to agent popup immediately ──
+    const endEmail = finishEmail || (claim ? claim.email : null) || (outbound ? outbound.agentEmail : null);
+    if (endEmail) {
+      ssePush(endEmail, 'call_ended', { callSid: sid, reason: 'terminal' });
+      console.log(`[Callback] Pushed call_ended SSE to ${endEmail} for sid=${sid}`);
+    }
+
     const callData = pendingInboundMap[sid];
     if (callData && callData.phoneKey) callerLocks.delete(callData.phoneKey);
     if (pendingInboundMap[sid]) delete pendingInboundMap[sid];
