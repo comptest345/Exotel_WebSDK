@@ -46,6 +46,19 @@ function initBG() {
     // Handle call end from BX24 side
     BX24.addEvent('onExternalCallFinish', function (data) {
       bgLog('onExternalCallFinish: ' + JSON.stringify(data));
+      const finishCallId = data.CALL_ID || currentCallId;
+      const userId       = data.USER_ID || '';
+      const duration     = data.DURATION || Math.round((Date.now() - callStartTime) / 1000) || 0;
+      if (finishCallId) {
+        BX24.callMethod('telephony.externalcall.finish', {
+          CALL_ID:     finishCallId,
+          USER_ID:     userId,
+          DURATION:    duration,
+          STATUS_CODE: 200
+        }, function(r) {
+          bgLog('externalcall.finish result: ' + JSON.stringify(r && r.data ? r.data() : null));
+        });
+      }
       currentCallId = null;
       callStartTime = 0;
     });
