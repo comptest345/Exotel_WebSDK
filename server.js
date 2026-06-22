@@ -669,8 +669,19 @@ app.get('/pending-call', (req, res) => {
 // ── SSE subscription endpoint ────────────────────────────────────
 app.get('/events', (req, res) => {
   const email = (req.query.email || '').toLowerCase();
-  if (!email) return res.status(400).end('email required');
-
+  const bx24UserId = req.query.bx24_user_id || '';
+if (email) {
+    if (sseClients[email]) {
+      clearInterval(sseClients[email].hb);
+      try { sseClients[email].res.end(); } catch(_) {}
+    }
+    sseClients[email] = res;
+  }
+   // ALSO register under bx24_ key so /bx24-call-start can find it before email resolves
+  if (bx24UserId) {
+    const bx24Key = 'bx24_' + bx24UserId;
+    sseClients[bx24Key] = res; // same res object, two keys
+  }
   res.set({
     'Content-Type':  'text/event-stream',
     'Cache-Control': 'no-cache',
