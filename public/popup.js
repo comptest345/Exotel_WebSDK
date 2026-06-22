@@ -441,7 +441,6 @@ function checkOpenApplicationParams() {
       // Small delay to let SDK finish registering
       setTimeout(async () => {
         if (!callDirection && !outboundInFlight) {
-          callDirection = 'outbound';
           await triggerOutboundCall(num);
         }
       }, 800);
@@ -637,6 +636,7 @@ async function triggerOutboundCall(number) {
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Server error');
     clog('OutboundCall placed via server: ' + JSON.stringify(data));
+    showOutboundRinging(number);
   } catch (e) {
     // Failed to place — revert to free so round robin doesn't permanently
     // exclude this agent from future incoming calls.
