@@ -518,7 +518,8 @@ app.post('/make-outbound-call', async (req, res) => {
         : { user_id: appUserId },
       to: { customer_contact_uri: toNumber },
       virtual_number: VIRTUAL_NUMBER,
-      recording: true,
+      // NOTE: recording is controlled at app level in Exotel dashboard for WebSDK calls.
+      // Do NOT send recording:true here — it is ignored for WebSDK and causes confusion.
       status_callback: [{ url: `${RENDER_URL}/call-callback`, method: 'POST' }]
     };
 
@@ -539,8 +540,8 @@ app.post('/make-outbound-call', async (req, res) => {
 
     console.log(`[OutboundCall] Placed: ${JSON.stringify(callData)}`);
 
-    // CCM v2 response: { response: { call_details: { sid: "..." } } }
-    const exotelCallSid = callData?.response?.call_details?.sid || callData?.Data?.CallSid || callData?.CallSid || null;
+    // CCM v2 response: { response: { data: { call_sid: "..." } } }
+    const exotelCallSid = callData?.response?.data?.call_sid || callData?.response?.call_details?.sid || callData?.Data?.CallSid || callData?.CallSid || null;
     if (BX24_WEBHOOK && exotelCallSid) {
       try {
         const agentBx24Id = await getBx24UserEmail_toBx24Id(agentEmail);
