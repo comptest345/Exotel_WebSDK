@@ -514,6 +514,19 @@ function startSSE() {
     }
   });
 
+  // Instant hangup: server pushes this when Exotel terminal webhook arrives
+sseSource.addEventListener('call_ended', (e) => {
+  const d = JSON.parse(e.data);
+  clog('SSE call_ended received — resetting UI instantly. sid=' + d.callSid);
+  if (!callDirection) return; // already reset, ignore
+  callDirection    = null;
+  outboundInFlight = false;
+  acceptingCallSid = null;
+  reportStatus('free');
+  showDialer();
+  setStatus('Call ended');
+});
+
   sseSource.onopen  = () => clog('SSE connected');
   sseSource.onerror = () => {
     clog('SSE error — reconnecting in 3s');
