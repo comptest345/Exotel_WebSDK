@@ -695,6 +695,8 @@ const claimedSids = new Set();
 // ── Caller-based call lock ─────────────────────────────────────────────────
 const callerLocks = new Map();
 const LOCK_TTL_MS  = 90 * 1000;
+const recentHangups = new Map(); // phoneKey → timestamp of last terminal event
+const HANGUP_COOLDOWN_MS = 10000; // suppress new inbounds for 10s after hangup
 
 function normalizePhone(n) {
   const digits = String(n || '').replace(/\D/g, '');
