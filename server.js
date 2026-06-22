@@ -1308,6 +1308,24 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.static(path.join(__dirname, 'public', 'target')));
 
 // ── Recording sync routes (Exotel → BX24 Activity timeline) ──────
+// Wire the agent resolver so the poller can map virtual/SIP numbers → BX24 user.
+// getMappedUserMap() returns a Map<email, {SipId, BxUserId, Email, ...}>
+// We build a reverse map: virtualNumber/sipId → { bx24UserId, email }
+recordings.setAgentResolver(async (phoneOrSip) => {
+  try {
+    const map = await getMappedUserMap(false);
+    for (const [email, u] of map.entries()) {
+      const sipId  = (u.SipId          || '').toLowerCase();
+      const virtNr = (u.VirtualNumber  || VIRTUAL_NUMBER || '').replace(/\D/g,'');
+      const lookup = (phoneOrSip || '').replace(/\D/g,'');
+      if (lookup && (sipId === lookup || (virtNr && virtNr === lookup))) {
+        const bx24UserId = u.BxUserId || u.Bx24UserId || null;
+        return { bx24UserId: bx24UserId ? String(bx24UserId) : null, email };
+      }
+    }
+  } catch (e) { console.warn('[AgentResolver]', e.message); }
+  return null;
+});
 recordings.init(app);
 
 const PORT = process.env.PORT || 3000;
