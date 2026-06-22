@@ -2,25 +2,37 @@
 // exotel-recordings.js  ← EDIT ONLY THIS FILE for anything recording-related
 // ═══════════════════════════════════════════════════════════════════════════
 //
+// IMPORTANT — NO AUDIO STREAMING INSIDE BITRIX24.
+// Bitrix24 only ever shows METADATA (call type, caller, agent, start/end time,
+// duration, status, Exotel Call SID, and a "View Recording" link). The
+// recording itself is NEVER stored, proxied, or streamed through our server —
+// clicking "View Recording" redirects the browser straight to a freshly
+// fetched Exotel URL, so it can never expire and we never host any audio.
+//
 // Architecture:
 //   Exotel records call
 //     ↓ server.js /call-callback fires → calls recordings.scheduleSync(...)
 //     ↓ scheduleSync() retries with exponential backoff (2 min → 4 min → 8 min)
-//     ↓ syncRecordings() confirms recording exists via fetchRecordingUrl()
-//         fetchRecordingUrl() uses GET /Calls/<CallSid>.json (Call Details API)
-//         Prefers PreSignedRecordingUrl (secure accounts) → RecordingUrl fallback
-//     ↓ buildProxyUrl() builds a permanent proxy URL on OUR server
-//     ↓ updateBx24CallRecord() calls telephony.externalcall.hide to attach RECORD_URL
-//     ↓ Bitrix24 timeline shows native call entry with ▶ Play button
-//     ↓ Agent clicks play → browser hits GET /recording/:callSid
-//     ↓ proxyRecordingRoute() fetches call details → streams audio from Exotel
-//         (authenticated, no storage, supports PreSignedRecordingUrl)
+//     ↓ syncRecordings() confirms recording exists — checks RecordingUrl /
+//         PreSignedRecordingUrl already on the call object first (no extra
+//         API call needed), falls back to fetchRecordingUrl() only if absent
+//     ↓ buildRecordingLink() builds a permanent link on OUR server:
+//         GET /recording/:callSid  ← stored in Bitrix24, never the raw Exotel URL
+//     ↓ updateBx24CallRecord() / createBx24CallActivity() write ONLY
+//         metadata + Call SID + the permanent link into Bitrix24
+//     ↓ Bitrix24 timeline card shows: Direction, From, To, Agent, Start,
+//         End, Duration, Status, Call SID, and a clickable "View Recording"
+//     ↓ Agent clicks "View Recording" → GET /recording/:callSid on our server
+//     ↓ recordingRedirectRoute() calls Exotel Call Details API right then,
+//         reads PreSignedRecordingUrl || RecordingUrl, 302-redirects browser.
+//         Nothing is stored or piped through us.
 //
-// Recording URL resolution (official Exotel approach — no separate Recordings API):
+// Recording URL resolution (official Exotel approach):
 //   GET /Calls/<CallSid>.json
-//   Response contains:
-//     { "Call": { "RecordingUrl": "https://...", "PreSignedRecordingUrl": "https://..." } }
-//   PreSignedRecordingUrl is present on secure-recording accounts and should be preferred.
+//   Response: { "Call": { "RecordingUrl": "...", "PreSignedRecordingUrl": "..." } }
+//   PreSignedRecordingUrl is preferred (secure-recording accounts).
+//   Because the URL is fetched fresh on every click, expiring signed URLs
+//   are a non-issue — we never persist a recording URL anywhere.
 //
 // For historical calls (POST/GET /sync-recordings):
 //     ↓ fetchExotelCallsForNumber() or fetchRecentExotelCalls(direction?)
@@ -34,7 +46,7 @@
 //   • recordings.init(app)              ← registers /recording/:callSid + /sync-recordings
 //   • recordings.scheduleSync({...})    ← called from /call-callback after each call ends
 //
-// Everything else — retry logic, Exotel API calls, BX24 updates, proxy streaming —
+// Everything else — retry logic, Exotel API calls, BX24 updates, redirect —
 // lives here. Edit only this file.
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -210,8 +222,7 @@ async function fetchRecordingUrl(callSid) {
   try {
     const data = await exotelGet(`/Calls/${callSid}.json`);
     const call = data?.TwilioResponse?.Call || data?.Call || {};
-    // PreSignedRecordingUrl takes priority on accounts with signed URL access
-    const url = call.PreSignedRecordingUrl || call.RecordingUrl || null;
+    const url  = call.PreSignedRecordingUrl || call.RecordingUrl || null;
     if (url) log(`Recording URL for ${callSid}: ${url.slice(0, 80)}…`);
     return url || null;
   } catch (e) {
@@ -220,9 +231,11 @@ async function fetchRecordingUrl(callSid) {
   }
 }
 
-// ── Build permanent proxy URL ────────────────────────────────────────────
-// Points to our own /recording/:callSid — never expires, handles Exotel auth invisibly.
-function buildProxyUrl(callSid) {
+// ── Build permanent "View Recording" link ────────────────────────────────
+// Points to our own GET /recording/:callSid.
+// This is what gets stored in Bitrix24 — NEVER the raw Exotel URL.
+// Clicking it does a 302-redirect to a freshly fetched Exotel URL on demand.
+function buildRecordingLink(callSid) {
   return `${RENDER_URL}/recording/${callSid}`;
 }
 
@@ -230,89 +243,112 @@ function getOwnerTypeId(entityType) {
   return { LEAD: 1, DEAL: 2, CONTACT: 3 }[entityType] || 3;
 }
 
-// ── Update existing BX24 telephony call record with recording URL ────────
+// ── Update existing BX24 telephony call record ───────────────────────────
 // Used for new calls where telephony.externalcall.register was already called.
-async function updateBx24CallRecord({ bx24CallId, agentBx24Id, callSid, duration, direction, clientNum, fromNum, toNum, callDate }) {
-  const proxyUrl = buildProxyUrl(callSid);
-  log(`Updating BX24 call CALL_ID=${bx24CallId} with RECORD_URL=${proxyUrl}`);
+// Attaches the permanent "View Recording" link via telephony.externalcall.hide,
+// then (always) creates a metadata activity card on the CRM entity so agents
+// can see all fields: Direction, From, To, Agent, Start, End, Duration, Status,
+// Call SID, and a clickable View Recording link.
+async function updateBx24CallRecord({
+  bx24CallId, agentBx24Id, callSid,
+  duration, direction, status,
+  clientNum, fromNum, toNum,
+  callDate, endDate
+}) {
+  const recordingLink = buildRecordingLink(callSid);
+  log(`Updating BX24 call CALL_ID=${bx24CallId} — recording link: ${recordingLink}`);
 
-  // telephony.externalcall.hide attaches recording to an existing telephony entry.
+  // Attach recording link to the existing telephony entry (shows ▶ in BX24 call log).
+  // RECORD_URL is our redirect link — never the raw Exotel URL.
   try {
     await bx24Call('telephony.externalcall.hide', {
       CALL_ID:    bx24CallId,
       USER_ID:    agentBx24Id || '1',
-      RECORD_URL: proxyUrl
+      RECORD_URL: recordingLink
     });
-    log(`BX24 telephony.externalcall.hide OK — CALL_ID=${bx24CallId} recording attached`);
-    return bx24CallId;
+    log(`BX24 telephony.externalcall.hide OK — CALL_ID=${bx24CallId}`);
   } catch (e) {
-    log(`telephony.externalcall.hide failed (${e.message}) — falling back to activity update`);
+    log(`telephony.externalcall.hide failed (${e.message}) — continuing to activity card`);
   }
 
-  // Fallback: create a plain CRM activity with the recording link in the description.
+  // Always also create a metadata activity card so agents see all fields.
+  const mins = Math.floor((duration || 0) / 60);
+  const secs = (duration || 0) % 60;
+  const desc =
+    `☎ ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call\n\n` +
+    `Agent     : ${agentBx24Id ? `User #${agentBx24Id}` : 'Unassigned'}\n` +
+    `From      : ${fromNum}\n` +
+    `To        : ${toNum}\n` +
+    `Customer  : ${clientNum}\n` +
+    `Start     : ${callDate}\n` +
+    `End       : ${endDate || callDate}\n` +
+    `Duration  : ${mins}m ${secs}s\n` +
+    `Status    : ${status || 'Completed'}\n` +
+    `Call SID  : ${callSid}\n\n` +
+    `Recording : [URL=${recordingLink}]View Recording[/URL]`;
+
+  const entity = await findBx24EntityByPhone(clientNum);
+  if (!entity) {
+    log(`No BX24 entity found for ${clientNum} — skipping metadata activity`);
+    return bx24CallId;
+  }
+
   try {
-    const mins = Math.floor((duration || 0) / 60);
-    const secs = (duration || 0) % 60;
-    const desc =
-      `📞 Exotel Call Recording\n` +
-      `Direction : ${direction === 'outbound' ? 'Outbound ↑' : 'Inbound ↓'}\n` +
-      `From      : ${fromNum}\n` +
-      `To        : ${toNum}\n` +
-      `Client    : ${clientNum}\n` +
-      `Duration  : ${mins}m ${secs}s\n` +
-      `Call SID  : ${callSid}\n\n` +
-      `▶ Play Recording:\n${proxyUrl}`;
-
-    const entity = await findBx24EntityByPhone(clientNum);
-    if (entity) {
-      const result = await bx24Call('crm.activity.add', { fields: {
-        OWNER_TYPE_ID:    getOwnerTypeId(entity.entityType),
-        OWNER_ID:         entity.entityId,
-        TYPE_ID:          2,
-        SUBJECT:          `📞 Call recording — ${clientNum} (${direction})`,
-        DESCRIPTION:      desc,
-        DESCRIPTION_TYPE: 1,
-        DIRECTION:        direction === 'outbound' ? 2 : 1,
-        DURATION:         duration || 0,
-        START_TIME:       callDate,
-        END_TIME:         callDate,
-        COMPLETED:        'Y',
-        RESPONSIBLE_ID:   agentBx24Id || '1',
-        COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }]
-      }});
-      log(`BX24 activity fallback created: ID=${result}`);
-      return result;
-    }
-  } catch (e2) {
-    log(`BX24 activity fallback also failed: ${e2.message}`);
+    const result = await bx24Call('crm.activity.add', { fields: {
+      OWNER_TYPE_ID:    getOwnerTypeId(entity.entityType),
+      OWNER_ID:         entity.entityId,
+      TYPE_ID:          2,
+      SUBJECT:          `📞 ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call — ${clientNum}`,
+      DESCRIPTION:      desc,
+      DESCRIPTION_TYPE: 2,   // BBCode — required for [URL=…] to render as a clickable link
+      DIRECTION:        direction === 'outbound' ? 2 : 1,
+      DURATION:         duration || 0,
+      START_TIME:       callDate,
+      END_TIME:         endDate || callDate,
+      COMPLETED:        'Y',
+      RESPONSIBLE_ID:   agentBx24Id || '1',
+      COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }]
+    }});
+    log(`BX24 metadata activity created: ID=${result} on ${entity.entityType}=${entity.entityId}`);
+    return result;
+  } catch (e) {
+    log(`BX24 crm.activity.add (update path) failed: ${e.message}`);
   }
-  return null;
+  return bx24CallId;
 }
 
-// ── Create new BX24 call activity (historical calls) ────────────────────
+// ── Create new BX24 call activity (historical / unregistered calls) ──────
 // Used when telephony.externalcall.register was never called for this call.
+// Stores ONLY metadata + the permanent "View Recording" link — never the raw
+// Exotel URL. The activity description is BBCode so the link is clickable.
 async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   const fromNum   = call.From || '';
   const toNum     = call.To   || '';
   const duration  = parseInt(call.Duration || '0');
   const startTime = call.StartTime || call.DateCreated || new Date().toISOString();
+  const endTime   = call.EndTime   || null;
+  const status    = call.Status    || 'completed';
   const rawDir    = (call.Direction || '').toLowerCase();
   const direction = rawDir.includes('outbound') ? 'outbound' : 'inbound';
   const callDate  = new Date(startTime).toISOString();
+  const endDate   = endTime ? new Date(endTime).toISOString() : callDate;
   const clientNum = direction === 'outbound' ? toNum : fromNum;
-  const proxyUrl  = buildProxyUrl(callSid);
+  const recordingLink = buildRecordingLink(callSid);
   const mins = Math.floor(duration / 60);
   const secs = duration % 60;
 
   const desc =
-    `📞 Exotel Call Recording\n` +
-    `Direction : ${direction === 'outbound' ? 'Outbound ↑' : 'Inbound ↓'}\n` +
+    `☎ ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call\n\n` +
+    `Agent     : ${agentBx24UserId ? `User #${agentBx24UserId}` : 'Unassigned'}\n` +
     `From      : ${fromNum}\n` +
     `To        : ${toNum}\n` +
-    `Client    : ${clientNum}\n` +
+    `Customer  : ${clientNum}\n` +
+    `Start     : ${callDate}\n` +
+    `End       : ${endDate}\n` +
     `Duration  : ${mins}m ${secs}s\n` +
+    `Status    : ${status}\n` +
     `Call SID  : ${callSid}\n\n` +
-    `▶ Play Recording:\n${proxyUrl}`;
+    `Recording : [URL=${recordingLink}]View Recording[/URL]`;
 
   const entity = await findBx24EntityByPhone(clientNum);
   if (!entity) {
@@ -323,9 +359,9 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   const ownerTypeId   = getOwnerTypeId(entity.entityType);
   const responsibleId = agentBx24UserId || '1';
   const bx24Direction = direction === 'outbound' ? 2 : 1;
-  const subject       = `📞 Call recording — ${clientNum} (${direction})`;
+  const subject       = `📞 ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call — ${clientNum}`;
 
-  // Try TYPE_ID=2 (native phone call activity with ▶ player support)
+  // Try TYPE_ID=2 (native phone call activity)
   try {
     const result = await bx24Call('crm.activity.add', { fields: {
       OWNER_TYPE_ID:    ownerTypeId,
@@ -333,11 +369,11 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
       TYPE_ID:          2,
       SUBJECT:          subject,
       DESCRIPTION:      desc,
-      DESCRIPTION_TYPE: 1,
+      DESCRIPTION_TYPE: 2,   // BBCode — required for [URL=…] to render as a clickable link
       DIRECTION:        bx24Direction,
       DURATION:         duration,
       START_TIME:       callDate,
-      END_TIME:         callDate,
+      END_TIME:         endDate,
       COMPLETED:        'Y',
       RESPONSIBLE_ID:   responsibleId,
       COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }]
@@ -356,9 +392,9 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
       TYPE_ID:          4,
       SUBJECT:          subject,
       DESCRIPTION:      desc,
-      DESCRIPTION_TYPE: 1,
+      DESCRIPTION_TYPE: 2,
       START_TIME:       callDate,
-      END_TIME:         callDate,
+      END_TIME:         endDate,
       COMPLETED:        'Y',
       RESPONSIBLE_ID:   responsibleId
     }});
@@ -397,7 +433,12 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
     if (!callSid) continue;
     if (syncedCallSids.has(callSid)) { results.skipped++; continue; }
 
-    const recordingExists = await fetchRecordingUrl(callSid);
+    // Check recording existence from the already-fetched call object first
+    // (most Exotel list responses include RecordingUrl / PreSignedRecordingUrl).
+    // Only fall back to a per-call API hit if neither field is present.
+    let recordingExists = !!(call.RecordingUrl || call.PreSignedRecordingUrl);
+    if (!recordingExists) recordingExists = !!(await fetchRecordingUrl(callSid));
+
     if (!recordingExists) {
       // Don't permanently skip the hint call — it may just not be ready yet
       if (callSid !== hintSid) syncedCallSids.add(callSid);
@@ -411,23 +452,27 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
     if (bx24CallId && callSid === hintSid) {
       // New call: telephony.externalcall.register was already called → update it
       const rawDir    = (call.Direction || '').toLowerCase();
-      const direction = rawDir.includes('outbound') ? 'outbound' : 'inbound';
+      const dir       = rawDir.includes('outbound') ? 'outbound' : 'inbound';
       const fromNum   = call.From || '';
       const toNum     = call.To   || '';
       const duration  = parseInt(call.Duration || '0');
       const startTime = call.StartTime || call.DateCreated || new Date().toISOString();
-      const clientNum = direction === 'outbound' ? toNum : fromNum;
+      const endTime   = call.EndTime   || null;
+      const status    = call.Status    || 'completed';
+      const clientNum = dir === 'outbound' ? toNum : fromNum;
 
       activityId = await updateBx24CallRecord({
         bx24CallId,
         agentBx24Id: resolvedAgentId,
         callSid,
         duration,
-        direction,
+        direction:  dir,
+        status,
         clientNum,
         fromNum,
         toNum,
-        callDate: new Date(startTime).toISOString()
+        callDate: new Date(startTime).toISOString(),
+        endDate:  endTime ? new Date(endTime).toISOString() : undefined
       });
     } else {
       // Historical call: no prior BX24 registration → create a fresh activity
@@ -487,57 +532,31 @@ function scheduleSync({ clientNum, agentEmail, callSid, bx24CallId, agentBx24Id,
   attempt(RETRY_FIRST_DELAY_MS, 1);
 }
 
-// ── GET /recording/:callSid — audio proxy ────────────────────────────────
-// Streams audio from Exotel directly to the browser, authenticated server-side.
-// Uses Call Details API (GET /Calls/<callSid>.json) to retrieve the recording URL.
-// Prefers PreSignedRecordingUrl (secure accounts) — falls back to RecordingUrl.
-// Bitrix24's audio player loads this URL — no storage needed, never expires.
-function proxyRecordingRoute(app) {
+// ── GET /recording/:callSid — "View Recording" redirect ─────────────────
+// NO AUDIO IS STREAMED OR STORED HERE.
+// On every click, fetches Call Details API fresh and 302-redirects the browser
+// straight to Exotel's RecordingUrl / PreSignedRecordingUrl.
+// Because the URL is fetched at click-time, it can never have expired.
+// We never persist a recording URL anywhere — not in Bitrix24, not in memory.
+function recordingRedirectRoute(app) {
   app.get('/recording/:callSid', async (req, res) => {
     const { callSid } = req.params;
     if (!callSid) return res.status(400).send('callSid required');
 
-    const creds = Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
-
     try {
-      // Step 1: Fetch call details to obtain the recording URL
-      const detailUrl = `${EXOTEL_V1_BASE}/Calls/${callSid}.json`;
-      const detailRes = await fetch(detailUrl, { headers: { Authorization: `Basic ${creds}` } });
-      if (!detailRes.ok) {
-        log(`[Proxy] Call details HTTP ${detailRes.status} for ${callSid}`);
-        return res.status(404).send('Call not found');
-      }
-      const detailBody = await detailRes.json();
-      const call       = detailBody?.TwilioResponse?.Call || detailBody?.Call || {};
-
-      // Prefer PreSignedRecordingUrl (secure/signed-URL accounts), fall back to RecordingUrl
-      const audioUrl = call.PreSignedRecordingUrl || call.RecordingUrl || null;
+      const audioUrl = await fetchRecordingUrl(callSid);
       if (!audioUrl) {
-        log(`[Proxy] No recording URL in call details for ${callSid}`);
+        log(`[Redirect] No recording URL available yet for ${callSid}`);
         return res.status(404).send('No recording available yet');
       }
-      log(`[Proxy] Streaming ${callSid} → ${audioUrl.slice(0, 80)}…`);
+      log(`[Redirect] ${callSid} → ${audioUrl.slice(0, 80)}…`);
 
-      // Step 2: Fetch audio from Exotel and pipe directly to the browser response.
-      // PreSignedRecordingUrl is self-authenticated (no Basic auth header needed).
-      // RecordingUrl requires Basic auth. We send the header in both cases — harmless for signed URLs.
-      const audioRes = await fetch(audioUrl, { headers: { Authorization: `Basic ${creds}` } });
-      if (!audioRes.ok) {
-        log(`[Proxy] Audio fetch HTTP ${audioRes.status} for ${callSid}`);
-        return res.status(audioRes.status).send('Audio fetch failed');
-      }
-
-      res.setHeader('Content-Type', audioRes.headers.get('content-type') || 'audio/mpeg');
-      const contentLength = audioRes.headers.get('content-length');
-      if (contentLength) res.setHeader('Content-Length', contentLength);
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Access-Control-Allow-Origin', '*'); // allow BX24 iframe to load
-      res.setHeader('Cache-Control', 'private, max-age=3600');
-
-      audioRes.body.pipe(res);
+      // 302 temporary redirect — browser goes straight to Exotel.
+      // Nothing is read, stored, or piped through our server.
+      res.redirect(302, audioUrl);
     } catch (e) {
-      log(`[Proxy] Error for ${callSid}: ${e.message}`);
-      if (!res.headersSent) res.status(500).send('Proxy error');
+      log(`[Redirect] Error for ${callSid}: ${e.message}`);
+      if (!res.headersSent) res.status(500).send('Lookup error');
     }
   });
 }
@@ -545,11 +564,11 @@ function proxyRecordingRoute(app) {
 // ── init — registers all routes with the Express app ────────────────────
 // Called once from server.js: recordings.init(app)
 // Registers:
-//   GET  /recording/:callSid   — audio proxy (used by BX24 ▶ player)
+//   GET  /recording/:callSid   — 302 redirect to fresh Exotel recording URL
 //   POST /sync-recordings      — manual sync trigger
 //   GET  /sync-recordings      — manual sync trigger (browser-friendly)
 function init(app) {
-  proxyRecordingRoute(app);
+  recordingRedirectRoute(app);
 
   app.post('/sync-recordings', async (req, res) => {
     const { phoneNumber, agentEmail, direction } = req.body || {};
@@ -565,7 +584,7 @@ function init(app) {
     catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
   });
 
-  log('Routes registered: GET /recording/:callSid, POST /sync-recordings, GET /sync-recordings');
+  log('Routes registered: GET /recording/:callSid (redirect), POST /sync-recordings, GET /sync-recordings');
 }
 
 module.exports = { init, scheduleSync, syncRecordings };
