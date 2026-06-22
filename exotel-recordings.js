@@ -142,21 +142,20 @@ async function getBx24UserId(email) {
 function phoneVariants(phoneNumber) {
   const raw    = (phoneNumber || '').trim();
   const digits = raw.replace(/\D/g, '');
-  // For Indian 10-digit numbers: also try with leading 0 and +91 prefix
-  // Universal: strip country code to get local number, try common prefixes
-const withPlus  = digits ? `+${digits}` : '';
-const withPlus2 = raw.startsWith('+') ? raw : '';   // keep original if already E.164
-// Local number = strip leading country code digits (1–3 digits), min 7 digits remaining
-const local = digits.length > 10 ? digits.slice(digits.length - 10) :
-              digits.length > 7  ? digits : '';
-const with0 = local ? `0${local}` : '';             // trunk prefix used in many countries
-
-const seen = new Set();
-const variants = [];
-for (const v of [raw, withPlus, withPlus2, digits, local, with0]) {
-  if (v && v.length >= 7 && !seen.has(v)) { seen.add(v); variants.push(v); }
+  // Universal: works for any country — no hardcoded country code
+  const withPlus  = digits ? `+${digits}` : '';
+  const withPlus2 = raw.startsWith('+') ? raw : '';   // keep original if already E.164
+  // Local number = strip leading country code (1–3 digits), keep last 7–10 digits
+  const local = digits.length > 10 ? digits.slice(digits.length - 10) :
+                digits.length >= 7  ? digits : '';
+  const with0 = local ? `0${local}` : '';             // trunk prefix used in many countries
+  const seen = new Set();
+  const variants = [];
+  for (const v of [raw, withPlus, withPlus2, digits, local, with0]) {
+    if (v && v.length >= 7 && !seen.has(v)) { seen.add(v); variants.push(v); }
+  }
+  return variants;
 }
-return variants;
 
 // ── Find BX24 CRM entity by phone (Lead → Contact → Deal) ───────────────
 async function findBx24EntityByPhone(phoneNumber) {
