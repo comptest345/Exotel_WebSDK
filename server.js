@@ -911,7 +911,7 @@ app.all('/call-callback', async (req, res) => {
 
     if (clientNum) {
       recordings.scheduleSync({
-        phoneNumber: clientNum,
+        clientNum: clientNum,
         agentEmail:  finishEmail,
         callSid:     sid,
         bx24CallId:  finishBx24Id,
