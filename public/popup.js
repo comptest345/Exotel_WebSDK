@@ -437,6 +437,14 @@ function startSSE() {
   sseSource.addEventListener('outbound_call', async (e) => {
     const d = JSON.parse(e.data);
     clog('SSE outbound_call: ' + d.number);
+    // Guard: if a call is already active/ringing, ignore duplicate SSE push
+    // that arrives after SSE reconnects while a call placed by the first event
+    // is already in progress. Without this, SSE reconnect → second /make-outbound-call
+    // fires while agent's SIP device is busy → Exotel 404 "User device is currently busy".
+    if (callDirection) {
+      clog('SSE outbound_call ignored — callDirection=' + callDirection + ' (call already in progress)');
+      return;
+    }
     const phoneEl = document.getElementById('phone');
     if (phoneEl) phoneEl.value = d.number;
     callDirection = 'outbound';
@@ -446,6 +454,12 @@ function startSSE() {
   sseSource.addEventListener('inbound_call', async (e) => {
     const d = JSON.parse(e.data);
     clog('SSE inbound_call from: ' + d.from + ' sid: ' + d.callSid);
+    // If already on a call (outbound or inbound), ignore — server marks us busy
+    // but SSE events can still arrive during a race. Don't clobber active UI.
+    if (callDirection) {
+      clog('SSE inbound_call ignored — callDirection=' + callDirection + ' (already on a call)');
+      return;
+    }
     // Already dismissed (claimed by us, claimed by another, or rejected) — skip.
     if (d.callSid && dismissedCallSids.has(d.callSid)) {
       clog('SSE inbound_call ignored — already dismissed sid=' + d.callSid);
@@ -501,7 +515,7 @@ async function doPoll() {
     const data = await res.json();
     pollCount++;
     if (pollCount % 12 === 1) clog('poll#' + pollCount + ' email=' + currentUserEmail);
-    if (data.pending && data.type === 'inbound' && callDirection !== 'inbound') {
+    if (data.pending && data.type === 'inbound' && !callDirection) {
       if (data.callSid && dismissedCallSids.has(data.callSid)) {
         clog('Poll inbound ignored — already dismissed sid=' + data.callSid);
         return;
@@ -521,12 +535,20 @@ async function doPoll() {
         setStatus('📞 Answered by another agent');
       }
     } else if (data.pending && data.type === 'outbound' && data.number) {
+      if (callDirection) {
+        clog('Poll outbound ignored — callDirection=' + callDirection + ' (already on a call)');
+        return;
+      }
       clog('Poll fallback caught outbound call: ' + data.number);
       callDirection = 'outbound';
       const phoneEl = document.getElementById('phone');
       if (phoneEl) phoneEl.value = data.number;
       await triggerOutboundCall(data.number);
     } else if (data.pending && data.number) {
+      if (callDirection) {
+        clog('Poll legacy outbound ignored — callDirection=' + callDirection + ' (already on a call)');
+        return;
+      }
       clog('Poll fallback (legacy) caught call: ' + data.number);
       callDirection = 'outbound';
       const phoneEl = document.getElementById('phone');
@@ -539,6 +561,11 @@ async function doPoll() {
 async function triggerOutboundCall(number) {
   if (!sdkReady)        { clog('OutboundCall: not registered'); setStatus('Not registered yet'); return; }
   if (!currentUserEmail){ clog('OutboundCall: email not resolved'); setStatus('⚠️ Email not resolved — reload'); return; }
+  // Guard: prevent double-fire (SSE reconnect, poll race, etc.)
+  if (callDirection && callDirection !== 'outbound') {
+    clog('OutboundCall blocked — already on ' + callDirection + ' call');
+    return;
+  }
   callDirection = 'outbound';
   // Mark busy immediately — no incoming calls should ring this agent while dialling.
   reportStatus('busy');
