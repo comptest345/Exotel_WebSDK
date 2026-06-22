@@ -518,8 +518,7 @@ app.post('/make-outbound-call', async (req, res) => {
         : { user_id: appUserId },
       to: { customer_contact_uri: toNumber },
       virtual_number: VIRTUAL_NUMBER,
-      // NOTE: recording is controlled at app level in Exotel dashboard for WebSDK calls.
-      // Do NOT send recording:true here — it is ignored for WebSDK and causes confusion.
+      recording: true,   // Exotel confirmed: must be true in API call (Ref: support email Jun 21)
       status_callback: [{ url: `${RENDER_URL}/call-callback`, method: 'POST' }]
     };
 
@@ -914,7 +913,8 @@ app.all('/call-callback', async (req, res) => {
         agentEmail:  finishEmail,
         callSid:     sid,
         bx24CallId:  finishBx24Id,
-        agentBx24Id: finishAgentId
+        agentBx24Id: finishAgentId,
+        onSuccess:   () => { if (outbound) delete outboundCallMap[sid]; }
       });
     }
 
