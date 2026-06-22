@@ -26,7 +26,7 @@ let dismissedAt      = 0;   // timestamp of last dismiss; used for native-SIP co
 // Tracks the callSid WE just claimed+accepted. Prevents the poll fallback from
 // seeing "claimed" and calling showDialer() on our own screen while we're live.
 let acceptingCallSid = null;
-let outboundInFlight  = null;
+let outboundInFlight  = false;
 
 function log(msg) { console.log('[Dialer]', msg); }
 function clog(msg, extra) {
@@ -38,15 +38,13 @@ function clog(msg, extra) {
 }
 
 // ── Round robin: report busy/free status to server ────────────
-// Called whenever this agent's call state changes so the server
-// knows whether to ring them for new incoming calls.
 function reportStatus(status) {
   if (!currentUserEmail) return;
   fetch('/agent-status', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ email: currentUserEmail, status })
-  }).catch(() => {}); // best-effort — never block call flow on this
+  }).catch(() => {});
 }
 
 function setStatus(msg) {
@@ -170,10 +168,6 @@ function releaseMic() {
 // ── UI helpers ────────────────────────────────────────────────
 function showIncoming(from, callSid) {
   callDirection = 'inbound';
-  // Only overwrite currentInboundCallSid when a real callSid is supplied.
-  // The native SDK event fires showIncoming(from) with NO callSid — if we
-  // let that clobber the sid set by the SSE push, call_dismissed matching
-  // breaks and other agents' Accept/Reject panels never get dismissed.
   if (callSid) currentInboundCallSid = callSid;
   const el = document.getElementById('callerNum');
   if (el) el.textContent = from || 'Unknown';
@@ -198,14 +192,11 @@ function showActive(num) {
   if (hangupBtn)     hangupBtn.style.display      = 'block';
   if (callBtn)       callBtn.style.display        = 'none';
   startTimer();
-  // Round robin: tell server this agent is now busy on a call (inbound or outbound).
-  // New incoming calls will skip this agent and ring others who are free.
   reportStatus('busy');
 }
 
-// Shows a "ringing" state for outbound calls: the SIP leg to Exotel is up,
-// but the customer hasn't answered yet. Active panel is visible (agent can
-// hang up) but the timer does NOT start until customer actually answers.
+// Shows "ringing" state for outbound: panel visible, hangup available,
+// but timer does NOT start until customer actually answers.
 function showOutboundRinging(num) {
   const el = document.getElementById('activeNum');
   if (el) el.textContent = '🔔 ' + (num || 'Calling...');
@@ -217,21 +208,20 @@ function showOutboundRinging(num) {
   stopTimer();
   const timerEl = document.getElementById('timerEl');
   if (timerEl) timerEl.textContent = 'Ringing...';
-  // Round robin: mark busy while ringing outbound — don't also ring inbound.
   reportStatus('busy');
 }
 
 function showDialer() {
-  callDirection = null;
+  callDirection    = null;
+  outboundInFlight = false;
   currentInboundCallSid = null;
-  acceptingCallSid = null; // clear guard — we're back to idle
+  acceptingCallSid = null;
   document.getElementById('incomingPanel').style.display = 'none';
   document.getElementById('activePanel').style.display   = 'none';
   document.getElementById('dialerPanel').style.display   = 'block';
   document.getElementById('hangupBtn').style.display     = 'none';
   document.getElementById('callBtn').style.display       = 'block';
   stopTimer();
-  // Round robin: agent is back to idle — allow new incoming calls to ring them.
   reportStatus('free');
 }
 
@@ -376,8 +366,6 @@ async function tryInitWithCredentials(accessToken, creds, i) {
         initRetries = 0;
         if (!webPhone) {
           webPhone = {
-            // SDK signature: MakeCall(toNumber, callback(status, data))
-            // Passing null as callback causes "t is not a function" — use no-op instead.
             MakeCall:   (n) => crmWebSDK.MakeCall   ? crmWebSDK.MakeCall(n, () => {}) : Promise.resolve(),
             AcceptCall: ()  => crmWebSDK.AcceptCall  ? crmWebSDK.AcceptCall()           : Promise.resolve(),
             HangupCall: ()  => crmWebSDK.HangupCall  ? crmWebSDK.HangupCall()           : Promise.resolve()
@@ -385,7 +373,6 @@ async function tryInitWithCredentials(accessToken, creds, i) {
         }
         setReg('registered');
         setStatus('✅ Ready — ' + (phone || appUserId));
-        // Report free so server knows this agent is available for incoming calls
         reportStatus('free');
         startPoll();
       } else if (state === 'terminated' || state === 'unregistered') {
@@ -429,22 +416,35 @@ let pollTimer  = null;
 let pollCount  = 0;
 
 // ── Handle click-to-call launched via BX24.openApplication ───
+// background.js fires BX24.openApplication({ bx24_start_call:'1', number:num })
+// which opens this popup. BX24.getOptions() in the popup returns those params.
+// We ALSO get an SSE outbound_call push from the server (/bx24-call-start).
+// The SSE path is the reliable trigger — this function is a fast-path fallback
+// that fires immediately on popup open, before SSE connects.
 function checkOpenApplicationParams() {
   try {
-    const params = BX24.getOptions ? BX24.getOptions() : {};
-    const num = (params && params.number) ? params.number : null;
+    if (typeof BX24 === 'undefined' || !BX24.getOptions) return;
+    const params = BX24.getOptions();
+    const num = (params && params.number) ? String(params.number).trim() : null;
     const isStartCall = params && (params.bx24_start_call === '1' || params.bx24_start_call === 1);
-    if (isStartCall && num) {
-      clog('openApplication click-to-call param detected: ' + num);
-      const phoneEl = document.getElementById('phone');
-      if (phoneEl) phoneEl.value = num;
-      // Small delay to let SDK finish registering
-      setTimeout(async () => {
-        if (!callDirection && !outboundInFlight) {
-          await triggerOutboundCall(num);
-        }
-      }, 800);
-    }
+    if (!isStartCall || !num) return;
+
+    clog('openApplication click-to-call param: ' + num);
+    const phoneEl = document.getElementById('phone');
+    if (phoneEl) phoneEl.value = num;
+
+    // Delay slightly to let SDK finish registering, then call.
+    // Use a longer delay so the SSE outbound_call (which comes from /bx24-call-start)
+    // arrives first. If SSE already triggered the call, triggerOutboundCall's
+    // own guard (outboundInFlight / callDirection) will silently skip this.
+    setTimeout(async () => {
+      if (!callDirection && !outboundInFlight) {
+        clog('openApplication fallback triggering call to: ' + num);
+        await triggerOutboundCall(num);
+      } else {
+        clog('openApplication fallback skipped — call already in progress');
+      }
+    }, 1500);
   } catch(e) { clog('checkOpenApplicationParams error: ' + e.message); }
 }
 
@@ -459,48 +459,39 @@ function startSSE() {
   if (!currentUserEmail) return;
   const sseParams = new URLSearchParams({ email: currentUserEmail });
   if (currentBx24UserId) sseParams.set('bx24_user_id', currentBx24UserId);
-  const url = '/events?' + sseParams.toString();  clog('SSE connecting: ' + url);
+  const url = '/events?' + sseParams.toString();
+  clog('SSE connecting: ' + url);
   sseSource = new EventSource(url);
 
   sseSource.addEventListener('outbound_call', async (e) => {
     const d = JSON.parse(e.data);
     clog('SSE outbound_call: ' + d.number);
-    // Guard: if a call is already active/ringing, ignore duplicate SSE push
-    // that arrives after SSE reconnects while a call placed by the first event
-    // is already in progress. Without this, SSE reconnect → second /make-outbound-call
-    // fires while agent's SIP device is busy → Exotel 404 "User device is currently busy".
-    if (callDirection) {
-      clog('SSE outbound_call ignored — callDirection=' + callDirection + ' (call already in progress)');
+    // Guard: if a call is already active/ringing, ignore duplicate SSE push.
+    if (callDirection || outboundInFlight) {
+      clog('SSE outbound_call ignored — already in progress (dir=' + callDirection + ' inFlight=' + outboundInFlight + ')');
       return;
     }
     const phoneEl = document.getElementById('phone');
     if (phoneEl) phoneEl.value = d.number;
-    callDirection = 'outbound';
+    // Do NOT set callDirection here — let triggerOutboundCall own all state.
     await triggerOutboundCall(d.number);
   });
 
   sseSource.addEventListener('inbound_call', async (e) => {
     const d = JSON.parse(e.data);
     clog('SSE inbound_call from: ' + d.from + ' sid: ' + d.callSid);
-    // If already on a call (outbound or inbound), ignore — server marks us busy
-    // but SSE events can still arrive during a race. Don't clobber active UI.
     if (callDirection) {
-      clog('SSE inbound_call ignored — callDirection=' + callDirection + ' (already on a call)');
+      clog('SSE inbound_call ignored — already on a call');
       return;
     }
-    // Already dismissed (claimed by us, claimed by another, or rejected) — skip.
     if (d.callSid && dismissedCallSids.has(d.callSid)) {
       clog('SSE inbound_call ignored — already dismissed sid=' + d.callSid);
       return;
     }
-    // A genuinely new call — reset the native-SIP cooldown for this callSid.
-    if (d.callSid) {
-      dismissedAt = 0;
-    }
+    if (d.callSid) dismissedAt = 0;
     showIncoming(d.from, d.callSid);
   });
 
-  // Another agent claimed the call, or caller hung up — dismiss our incoming UI.
   sseSource.addEventListener('call_dismissed', (e) => {
     const d = JSON.parse(e.data);
     const sidMatch = (currentInboundCallSid === d.callSid) || (currentInboundCallSid === null);
@@ -514,31 +505,21 @@ function startSSE() {
     }
   });
 
-  // Instant hangup: server pushes this when Exotel terminal webhook arrives
-sseSource.addEventListener('call_ended', (e) => {
-  const d = JSON.parse(e.data);
-  clog('SSE call_ended received — resetting UI instantly. sid=' + d.callSid);
-  if (!callDirection) return; // already reset, ignore
-  callDirection    = null;
-  outboundInFlight = false;
-  acceptingCallSid = null;
-  reportStatus('free');
-  showDialer();
-  setStatus('Call ended');
-});
+  // Server pushes this when Exotel terminal webhook arrives — instant UI reset.
+  sseSource.addEventListener('call_ended', (e) => {
+    const d = JSON.parse(e.data);
+    clog('SSE call_ended — resetting UI. sid=' + d.callSid);
+    if (!callDirection) return;
+    showDialer();
+    setStatus('Call ended');
+  });
 
   sseSource.onopen  = () => clog('SSE connected');
   sseSource.onerror = () => {
     clog('SSE error — reconnecting in 3s');
-    // Close and null out so startSSE() can create a fresh connection.
-    // Without this, the guard `if (sseSource) return` permanently blocks
-    // reconnection after the first drop, leaving agents with no SSE channel
-    // and inbound calls being broadcast to zero clients.
     try { sseSource.close(); } catch (_) {}
     sseSource = null;
-    setTimeout(() => {
-      if (!sseSource) startSSE();
-    }, 3000);
+    setTimeout(() => { if (!sseSource) startSSE(); }, 3000);
   };
 }
 
@@ -557,50 +538,26 @@ async function doPoll() {
     const data = await res.json();
     pollCount++;
     if (pollCount % 12 === 1) clog('poll#' + pollCount + ' email=' + currentUserEmail);
+
     if (data.pending && data.type === 'inbound' && !callDirection) {
-      if (data.callSid && dismissedCallSids.has(data.callSid)) {
-        clog('Poll inbound ignored — already dismissed sid=' + data.callSid);
-        return;
-      }
+      if (data.callSid && dismissedCallSids.has(data.callSid)) return;
       clog('Poll fallback: inbound from ' + data.from + ' sid=' + data.callSid);
       showIncoming(data.from, data.callSid);
+
     } else if (!data.pending && data.type === 'claimed') {
-      // Another agent claimed this call — dismiss OUR incoming panel.
-      // CRITICAL guards — skip dismissal if WE claimed this call:
-      //   1. acceptingCallSid matches (set before AcceptCall, cleared after)
-      //   2. callSid is in dismissedCallSids (we add it during acceptCall claim)
-      //   3. activePanel is already showing (we're live on a call)
-      // Without all three, the poll fires showDialer() on the accepting agent's
-      // screen mid-call because acceptingCallSid was already cleared to null.
-      const weClaimedIt = (data.callSid === acceptingCallSid);
+      const weClaimedIt  = (data.callSid === acceptingCallSid);
       const activePanelEl = document.getElementById('activePanel');
       const isLive = activePanelEl && activePanelEl.style.display === 'block';
       if (callDirection === 'inbound' && !weClaimedIt && !isLive) {
-        clog('Poll: call ' + data.callSid + ' already claimed by ' + data.claimedBy + ' — dismissing');
+        clog('Poll: call ' + data.callSid + ' claimed by ' + data.claimedBy + ' — dismissing');
         if (data.callSid) dismissedCallSids.add(data.callSid);
         dismissedAt = Date.now();
         showDialer();
         setStatus('📞 Answered by another agent');
-      } else if (weClaimedIt || isLive) {
-        clog('Poll claimed ignored — we own this call (sid=' + data.callSid + ')');
       }
-    } else if (data.pending && data.type === 'outbound' && data.number) {
-      if (callDirection) {
-        clog('Poll outbound ignored — callDirection=' + callDirection + ' (already on a call)');
-        return;
-      }
-      clog('Poll fallback caught outbound call: ' + data.number);
-      callDirection = 'outbound';
-      const phoneEl = document.getElementById('phone');
-      if (phoneEl) phoneEl.value = data.number;
-      await triggerOutboundCall(data.number);
-    } else if (data.pending && data.number) {
-      if (callDirection) {
-        clog('Poll legacy outbound ignored — callDirection=' + callDirection + ' (already on a call)');
-        return;
-      }
-      clog('Poll fallback (legacy) caught call: ' + data.number);
-      callDirection = 'outbound';
+
+    } else if (data.pending && (data.type === 'outbound' || data.number) && !callDirection && !outboundInFlight) {
+      clog('Poll fallback: outbound call to ' + data.number);
       const phoneEl = document.getElementById('phone');
       if (phoneEl) phoneEl.value = data.number;
       await triggerOutboundCall(data.number);
@@ -608,26 +565,21 @@ async function doPoll() {
   } catch (_) {}
 }
 
+// ── Core outbound call trigger ────────────────────────────────
 async function triggerOutboundCall(number) {
-  if (!sdkReady)        { clog('OutboundCall: not registered'); setStatus('Not registered yet'); return; }
-  if (!currentUserEmail){ clog('OutboundCall: email not resolved'); setStatus('⚠️ Email not resolved — reload'); return; }
-  // Guard: prevent double-fire (SSE reconnect, poll race, etc.)
+  if (!sdkReady)         { clog('OutboundCall: SDK not ready'); setStatus('Not registered yet'); return; }
+  if (!currentUserEmail) { clog('OutboundCall: email not resolved'); setStatus('⚠️ Email not resolved — reload'); return; }
   if (outboundInFlight || callDirection) {
-    clog('OutboundCall blocked — outboundInFlight=' + outboundInFlight + ' callDirection=' + callDirection);
+    clog('OutboundCall blocked — inFlight=' + outboundInFlight + ' dir=' + callDirection);
     return;
   }
+
   outboundInFlight = true;
-  callDirection = 'outbound';
-  // Mark busy immediately — no incoming calls should ring this agent while dialling.
+  callDirection    = 'outbound';
   reportStatus('busy');
   clog('OutboundCall → ' + number);
+
   try {
-    // POST to our server which calls the Exotel API with record:true.
-    // This is the fix for outbound calls not being recorded — the SDK's own
-    // MakeCall hardcodes record:false, so we bypass it entirely and call
-    // the Exotel V3 API directly from the server side with recording enabled.
-    // The agent's SIP device will still ring via the normal incoming event
-    // and AcceptCall() will connect the audio as usual.
     const res  = await fetch('/make-outbound-call', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -635,93 +587,76 @@ async function triggerOutboundCall(number) {
     });
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Server error');
-    clog('OutboundCall placed via server: ' + JSON.stringify(data));
-    outboundInFlight = false; // placement done — callDirection guards from here
+    clog('OutboundCall placed: ' + JSON.stringify(data));
+    outboundInFlight = false; // HTTP request done; callDirection still 'outbound' guards re-entry
     showOutboundRinging(number);
   } catch (e) {
-    // Failed to place — revert to free so round robin doesn't permanently
-    // exclude this agent from future incoming calls.
     reportStatus('free');
     outboundInFlight = false;
-    callDirection = null;
+    callDirection    = null;
     clog('OutboundCall error: ' + e.message);
     setStatus('Call failed: ' + e.message);
   }
 }
 
-// ── Call event handler ────────────────────────────────────────
+// ── Call event handler (Exotel SDK events) ────────────────────
 function handleCallEvent(event) {
   clog('callEvent: ' + JSON.stringify(event));
   const raw  = JSON.stringify(event || {}).toLowerCase();
   const type = ((event && (event.event || event.EventType || event.type || event.state)) || '').toLowerCase();
 
-  const isIncoming  = type.includes('incoming') || type.includes('ringing') || raw.includes('incoming') || raw.includes('ringing');
-  const isEnded     = type.includes('end')      || type.includes('terminat') || type.includes('bye')      ||
-                      type.includes('complet')   || type.includes('cancel')   || type.includes('failed')   ||
-                      type.includes('reject')    ||
-                      raw.includes('callended')  || raw.includes('call_completed') || raw.includes('call_failed');
-
+  const isIncoming = type.includes('incoming') || type.includes('ringing') || raw.includes('incoming') || raw.includes('ringing');
+  const isEnded    = type.includes('end')      || type.includes('terminat') || type.includes('bye')     ||
+                     type.includes('complet')   || type.includes('cancel')   || type.includes('failed')  ||
+                     type.includes('reject')    ||
+                     raw.includes('callended')  || raw.includes('call_completed') || raw.includes('call_failed');
   const isAcceptEvent = type.includes('accept') || raw.includes('accepted');
-  const isConnected   =
-    type.includes('connect') || type.includes('answer') || type.includes('active') || raw.includes('connected')
-    || (isAcceptEvent && callDirection !== 'outbound');
+  // connected = customer answered. For outbound, also treat 'accepted' as connected
+  // because Exotel fires 'accepted' when the customer picks up the outbound leg.
+  const isConnected =
+    type.includes('connect') || type.includes('answer') || type.includes('active') || raw.includes('connected') ||
+    isAcceptEvent; // covers both inbound accept and outbound customer-answer
 
   if (isIncoming) {
     if (callDirection === 'outbound') {
-      clog('Outbound SIP ring → silent AcceptCall, showing ringing UI');
+      // Agent SIP leg ringing — silently accept so audio connects, show ringing UI.
+      clog('Outbound SIP ring → silent AcceptCall');
       if (webPhone) webPhone.AcceptCall().catch(e => clog('silentAccept err: ' + e.message));
       showOutboundRinging(document.getElementById('phone')?.value || '');
     } else {
-      // Native SIP incoming/ringing event — carries no callSid.
-      // CRITICAL: if we already accepted this call (acceptingCallSid is set),
-      // Exotel fires a NEW Dial-leg webhook which causes another incoming/ringing
-      // event. We must NOT let it re-show the incoming panel and wipe the
-      // "Connecting..." status we set right after AcceptCall().
-      if (acceptingCallSid) {
-        clog('Native incoming event ignored — already accepted sid=' + acceptingCallSid);
-        return;
-      }
-      // If we already called showActive() (activePanel is visible), don't clobber it
-      // back to incoming. Exotel fires a second ringing event for the dial leg after
-      // AcceptCall() which would overwrite the active UI back to incoming panel.
+      // Inbound native SIP ring — guard against duplicate events.
+      if (acceptingCallSid) { clog('Native incoming ignored — already accepted'); return; }
       const activePanelEl = document.getElementById('activePanel');
-      if (activePanelEl && activePanelEl.style.display === 'block') {
-        clog('Native incoming event ignored — activePanel already showing (call is live)');
-        return;
-      }
-      if (currentInboundCallSid && dismissedCallSids.has(currentInboundCallSid)) {
-        clog('Native incoming event ignored — callSid already dismissed: ' + currentInboundCallSid);
-        return;
-      }
-      if (Date.now() - dismissedAt < 8000) {
-        clog('Native incoming event ignored — within dismiss cooldown');
-        return;
-      }
+      if (activePanelEl && activePanelEl.style.display === 'block') { clog('Native incoming ignored — already live'); return; }
+      if (currentInboundCallSid && dismissedCallSids.has(currentInboundCallSid)) { clog('Native incoming ignored — dismissed'); return; }
+      if (Date.now() - dismissedAt < 8000) { clog('Native incoming ignored — cooldown'); return; }
       const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown';
       showIncoming(from);
     }
-  } else if (isConnected || isAcceptEvent) {
+
+  } else if (isConnected) {
+    // For outbound: this fires when customer picks up (timer starts now).
+    // For inbound: this fires after AcceptCall resolves.
+    // Guard: don't start timer if we're not in a call at all.
+    if (!callDirection) { clog('isConnected ignored — no active call'); return; }
     const num = callDirection === 'inbound'
       ? (document.getElementById('callerNum')?.textContent || '')
       : (document.getElementById('phone')?.value || '');
-    acceptingCallSid = null; // clear guard — we're now fully live
+    acceptingCallSid = null;
     showActive(num);
     setStatus('');
+
   } else if (isEnded) {
-    // Only reset UI if we are actually in an active/ringing call state.
-    // The Exotel SDK fires "completed"/"rejected"/"cancel" events for the agent
-    // SIP ring leg when AcceptCall() picks it up — that is NOT the call ending.
-    // Without this guard, the UI resets to dialer within seconds of accepting.
+    // Guard: Exotel SDK fires 'completed'/'cancel' for the SIP ring leg when
+    // AcceptCall picks it up — that is NOT the call ending. Only reset if
+    // we are actually showing an active call.
     const activePanelEl  = document.getElementById('activePanel');
     const isActiveShowing = activePanelEl && activePanelEl.style.display === 'block';
     if (!callDirection && !isActiveShowing) {
-      clog('callEvent isEnded ignored — no active call (type=' + type + ')');
+      clog('isEnded ignored — no active call (type=' + type + ')');
       return;
     }
     clog('Call ended event — resetting UI (type=' + type + ')');
-    callDirection    = null;
-    acceptingCallSid = null;
-    reportStatus('free');
     showDialer();
     setStatus('Call ended');
   }
@@ -733,7 +668,7 @@ async function makeCall() {
   if (!number)    { setStatus('Enter a number'); return; }
   if (!webPhone)  { setStatus('SDK not ready');  return; }
   if (!micGranted){ setStatus('⚠️ Allow microphone first!'); return; }
-  if (!currentUserEmail) { setStatus('⚠️ User identity not resolved. Reload the page.'); return; }
+  if (!currentUserEmail) { setStatus('⚠️ User identity not resolved. Reload.'); return; }
   const btn = document.getElementById('callBtn');
   btn.disabled = true;
   try {
@@ -747,9 +682,6 @@ async function acceptCall() {
   if (!webPhone) { setStatus('SDK not ready'); return; }
   if (!micGranted) { await requestMic(); if (!micGranted) { setStatus('⚠️ Mic required'); return; } }
 
-  // Multi-agent: atomically claim the call on the server before accepting
-  // the SIP leg. If another agent got there first we get { claimed: false }
-  // and just dismiss — no SIP AcceptCall is sent.
   if (currentInboundCallSid) {
     try {
       const claimRes = await fetch('/claim-call', {
@@ -763,37 +695,28 @@ async function acceptCall() {
       });
       const claimData = await claimRes.json();
       if (!claimData.claimed) {
-        clog('Claim failed — already taken by ' + (claimData.claimedBy || 'another agent'));
+        clog('Claim failed — taken by ' + (claimData.claimedBy || 'another agent'));
         if (currentInboundCallSid) dismissedCallSids.add(currentInboundCallSid);
         showDialer();
         setStatus('📞 Already answered by another agent');
         return;
       }
-      clog('Claimed callSid=' + currentInboundCallSid + ' bx24CallId=' + claimData.bx24CallId);
-      // Mark as handled so poll/SSE don't re-show this call on this agent's panel.
+      clog('Claimed callSid=' + currentInboundCallSid);
       if (currentInboundCallSid) dismissedCallSids.add(currentInboundCallSid);
     } catch (e) {
       clog('Claim request failed (proceeding anyway): ' + e.message);
     }
   }
 
-  // Set the guard BEFORE AcceptCall so the poll fallback can't dismiss us
-  // the moment the server responds with "claimed" during the AcceptCall await.
   acceptingCallSid = currentInboundCallSid;
-
   clog('AcceptCall');
   try {
     await webPhone.AcceptCall();
-    // AcceptCall() resolving = SIP leg accepted. The SDK does NOT reliably fire
-    // a separate "connected" event for inbound calls — and acceptingCallSid guard
-    // in handleCallEvent was swallowing any follow-up SDK events. Fix: show active
-    // immediately here so the agent's UI reflects the live call without waiting
-    // for a "connected" event that may never arrive.
     const num = document.getElementById('callerNum')?.textContent || '';
-    acceptingCallSid = null; // clear guard — we're live
+    acceptingCallSid = null;
     showActive(num);
     setStatus('');
-    clog('AcceptCall resolved — call live with ' + num);
+    clog('AcceptCall resolved — live with ' + num);
   } catch (e) {
     acceptingCallSid = null;
     callDirection    = null;
@@ -805,10 +728,7 @@ async function acceptCall() {
 }
 
 async function rejectCall() {
-  clog('rejectCall — informing server, other free agents continue to ring');
-
-  // Tell the server this agent rejected — the call stays alive for others.
-  // The server will NOT re-push this call to this agent on subsequent Exotel pings.
+  clog('rejectCall');
   if (currentInboundCallSid) {
     try {
       await fetch('/reject-call', {
@@ -816,34 +736,28 @@ async function rejectCall() {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ callSid: currentInboundCallSid, email: currentUserEmail })
       });
-    } catch (e) {
-      clog('reject-call request failed (non-fatal): ' + e.message);
-    }
+    } catch (e) { clog('reject-call failed: ' + e.message); }
     dismissedCallSids.add(currentInboundCallSid);
   }
-
   dismissedAt = Date.now();
-  showDialer(); // showDialer() calls reportStatus('free') — agent is available again
+  showDialer();
   setStatus('Call declined');
 }
 
 async function hangUp() {
   if (!webPhone) return;
   const wasDirection = callDirection;
-  callDirection    = null;
-  outboundInFlight = false;
-  acceptingCallSid = null;
-  // Tell Exotel to terminate the call via server (SDK HangupCall alone is not enough)
-  try {
-    fetch('/hangup', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ email: currentUserEmail, direction: wasDirection })
-    }).catch(() => {});
-  } catch (_) {}
+  // Reset state immediately so no race conditions
+  showDialer();
+  setStatus('Call ended');
+  // Tell Exotel to kill the call server-side (SDK hangup alone doesn't terminate it)
+  fetch('/hangup', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ email: currentUserEmail, direction: wasDirection })
+  }).catch(() => {});
+  // Also fire SDK hangup for the SIP leg
   try { await webPhone.HangupCall(); } catch (e) { clog('Hangup err: ' + e.message); }
-  reportStatus('free');
-  showDialer(); setStatus('Call ended');
 }
 
 window.onload = init;
