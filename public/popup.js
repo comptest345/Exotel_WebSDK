@@ -458,8 +458,9 @@ function startPoll() {
 function startSSE() {
   if (sseSource) return;
   if (!currentUserEmail) return;
-  const url = '/events?email=' + encodeURIComponent(currentUserEmail);
-  clog('SSE connecting: ' + url);
+  const sseParams = new URLSearchParams({ email: currentUserEmail });
+  if (currentBx24UserId) sseParams.set('bx24_user_id', currentBx24UserId);
+  const url = '/events?' + sseParams.toString();  clog('SSE connecting: ' + url);
   sseSource = new EventSource(url);
 
   sseSource.addEventListener('outbound_call', async (e) => {
