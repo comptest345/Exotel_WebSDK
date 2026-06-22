@@ -615,8 +615,11 @@ app.post('/bx24-call-start', async (req, res) => {
     }
 
     const key    = email.toLowerCase();
-    const pushed = ssePush(key, 'outbound_call', { number, callId });
-    console.log(`[BX24-CallStart] SSE push to ${key}: ${pushed ? 'SUCCESS' : 'QUEUED (no SSE)'}`);
+    let pushed   = ssePush(key, 'outbound_call', { number, callId });
+if (!pushed && bx24UserId) {
+  pushed = ssePush('bx24_' + bx24UserId, 'outbound_call', { number, callId });
+  console.log(`[BX24-CallStart] Tried bx24_ key fallback: ${pushed ? 'hit' : 'miss'}`);
+}
     if (!pushed) pendingCallMap[key] = { number, callId, ts: Date.now() };
 
     res.json({ status: 'ok', email, pushed });
