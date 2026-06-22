@@ -582,7 +582,6 @@ app.post('/bx24-call-start', async (req, res) => {
     const bx24UserId = String(d.USER_ID || d['data[USER_ID]'] || BX24_USER_ID);
     const number     = (d.PHONE_NUMBER_INTERNATIONAL || d.PHONE_NUMBER || d['data[PHONE_NUMBER]'] || '').trim();
     const callId     = d.CALL_ID || d['data[CALL_ID]'] || ('ext_' + Date.now());
-    const email = await getBx24UserEmail(bx24UserId);
     if (!number) return res.json({ status: 'ignored', reason: 'no_number' });
 
     // Prefer fresh access_token from event auth over static webhook
