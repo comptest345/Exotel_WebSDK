@@ -538,8 +538,12 @@ app.post('/make-outbound-call', async (req, res) => {
       headers: { 'Authorization': appToken, 'Content-Type': 'application/json' },
       body:    JSON.stringify(payload)
     });
-    const callData = await callRes.json();
-    if (!callRes.ok) throw new Error(JSON.stringify(callData));
+    const rawBody  = await callRes.text();
+console.log(`[OutboundCall] Exotel raw response (${callRes.status}): ${rawBody}`);
+let callData;
+try { callData = JSON.parse(rawBody); }
+catch (_) { callData = { raw: rawBody }; }
+if (!callRes.ok) throw new Error(`Exotel ${callRes.status}: ${rawBody}`);
 
     console.log(`[OutboundCall] Placed: ${JSON.stringify(callData)}`);
 
