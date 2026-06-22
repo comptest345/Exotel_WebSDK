@@ -72,6 +72,19 @@ const EXOTEL_V1_BASE  = `https://${EXOTEL_API_HOST}/v1/Accounts/${ACCOUNT_SID}`;
 const RETRY_FIRST_DELAY_MS = (parseInt(process.env.EXOTEL_RECORDING_DELAY_SEC || '30') * 1000);
 const RETRY_MAX_ATTEMPTS   = 4;               // attempts: 30s → 60s → 120s → 240s
 
+// ── Injectable agent resolver ────────────────────────────────────────────
+// server.js calls recordings.setAgentResolver(fn) on startup so the poller
+// can resolve a SIP/virtual number or email → { bx24UserId, email } without
+// needing direct access to the usermapping cache.
+// Falls back to null (Unassigned) if not set.
+let _agentResolver = null;
+function setAgentResolver(fn) { _agentResolver = fn; }
+async function resolveAgent(fromNum) {
+  if (!_agentResolver || !fromNum) return { bx24UserId: null, email: null };
+  try { return (await _agentResolver(fromNum)) || { bx24UserId: null, email: null }; }
+  catch (e) { return { bx24UserId: null, email: null }; }
+}
+
 // ── Dedup — prevents posting the same recording twice ───────────────────
 // Persisted to disk so server restarts don't create duplicate BX24 activities.
 const DEDUP_FILE     = process.env.DEDUP_FILE || '/tmp/synced_call_sids.json';
@@ -391,10 +404,17 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   const mins = Math.floor(duration / 60);
   const secs = duration % 60;
 
+  // Try to resolve agent from the agentPhone field (outbound: From is virtual number)
+  // or fall back to the injected resolver if agentBx24UserId not passed directly.
+  const agentPhone = direction === 'outbound' ? (call.VirtualNumberUsed || fromNum) : (call.To || toNum);
+  const resolved   = agentBx24UserId ? { bx24UserId: agentBx24UserId, email: null } : await resolveAgent(agentPhone);
+  const resolvedId = resolved.bx24UserId || null;
+  const agentLabel = resolved.email || (resolvedId ? `User #${resolvedId}` : call.AgentEmail || 'Unassigned');
+
   const fmtDate = d => { try { return new Date(d).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true}); } catch(_){ return d; } };
   const desc =
     `☎ ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call\n\n` +
-    `Agent     : ${agentBx24UserId ? `User #${agentBx24UserId}` : 'Unassigned'}\n` +
+    `Agent     : ${agentLabel}\n` +
     `From      : ${fromNum}\n` +
     `To        : ${toNum}\n` +
     `Customer  : ${clientNum}\n` +
@@ -412,7 +432,7 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   }
 
   const ownerTypeId   = getOwnerTypeId(entity.entityType);
-  const responsibleId = agentBx24UserId || '1';
+  const responsibleId = resolvedId || '1';
   const bx24Direction = direction === 'outbound' ? 2 : 1;
   const subject       = `📞 ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call — ${clientNum}`;
 
@@ -652,9 +672,15 @@ async function pollOnce() {
       if (!callSid)                    continue;
       if (syncedCallSids.has(callSid)) continue; // already posted
 
-      // Only process calls that already have a recording
-      const hasRec = !!(call.RecordingUrl || call.PreSignedRecordingUrl);
-      if (!hasRec) continue;
+      // Exotel list API often omits RecordingUrl — always fetch per-call detail
+      // to get the definitive RecordingUrl / PreSignedRecordingUrl.
+      let recUrl = call.RecordingUrl || call.PreSignedRecordingUrl || null;
+      if (!recUrl) recUrl = await fetchRecordingUrl(callSid);
+      if (!recUrl) continue; // no recording yet — will be caught next poll cycle
+
+      // Merge the fetched URL into the call object so createBx24CallActivity
+      // can use it directly if needed (buildRecordingLink uses callSid anyway)
+      if (!call.RecordingUrl) call.RecordingUrl = recUrl;
 
       const activityId = await createBx24CallActivity(call, callSid, null);
       if (activityId) {
