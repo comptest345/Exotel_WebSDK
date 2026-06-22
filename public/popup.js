@@ -530,15 +530,24 @@ async function doPoll() {
       showIncoming(data.from, data.callSid);
     } else if (!data.pending && data.type === 'claimed') {
       // Another agent claimed this call — dismiss OUR incoming panel.
-      // CRITICAL: skip if WE are the one who claimed it (acceptingCallSid guard).
-      // Without this check, the poll sees "claimed" and calls showDialer() on
-      // the accepting agent's screen, wiping out their active call UI.
-      if (callDirection === 'inbound' && data.callSid !== acceptingCallSid) {
+      // CRITICAL guards — skip dismissal if WE claimed this call:
+      //   1. acceptingCallSid matches (set before AcceptCall, cleared after)
+      //   2. callSid is in dismissedCallSids (we add it during acceptCall claim)
+      //   3. activePanel is already showing (we're live on a call)
+      // Without all three, the poll fires showDialer() on the accepting agent's
+      // screen mid-call because acceptingCallSid was already cleared to null.
+      const weClaimedIt = (data.callSid === acceptingCallSid) ||
+                          (data.callSid && dismissedCallSids.has(data.callSid));
+      const activePanelEl = document.getElementById('activePanel');
+      const isLive = activePanelEl && activePanelEl.style.display === 'block';
+      if (callDirection === 'inbound' && !weClaimedIt && !isLive) {
         clog('Poll: call ' + data.callSid + ' already claimed by ' + data.claimedBy + ' — dismissing');
         if (data.callSid) dismissedCallSids.add(data.callSid);
         dismissedAt = Date.now();
         showDialer();
         setStatus('📞 Answered by another agent');
+      } else if (weClaimedIt || isLive) {
+        clog('Poll claimed ignored — we own this call (sid=' + data.callSid + ')');
       }
     } else if (data.pending && data.type === 'outbound' && data.number) {
       if (callDirection) {
