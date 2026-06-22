@@ -877,6 +877,51 @@ app.post('/claim-call', async (req, res) => {
   res.json({ claimed: true, bx24CallId });
 });
 
+// ── Agent-initiated hangup → terminate call on Exotel ────────────
+app.post('/hangup', async (req, res) => {
+  const { email, direction } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email required' });
+
+  // Find the active call SID for this agent
+  let callSid = null;
+  // Check outbound map first
+  for (const [sid, d] of Object.entries(outboundCallMap)) {
+    if (d.agentEmail && d.agentEmail.toLowerCase() === email.toLowerCase()) {
+      callSid = sid; break;
+    }
+  }
+  // Then check inbound claim map
+  if (!callSid) {
+    for (const [sid, d] of Object.entries(inboundClaimMap)) {
+      if (d.email && d.email.toLowerCase() === email.toLowerCase()) {
+        callSid = sid; break;
+      }
+    }
+  }
+
+  if (!callSid) {
+    console.log(`[Hangup] No active callSid found for ${email} — SDK HangupCall should suffice`);
+    return res.json({ ok: true, note: 'no_sid_found' });
+  }
+
+  const CCM_CALL_URL = isIndia
+    ? `https://ccm-api.in.exotel.com/v2/accounts/${ACCOUNT_SID}/calls/${callSid}`
+    : `https://ccm-api.exotel.com/v2/accounts/${ACCOUNT_SID}/calls/${callSid}`;
+
+  try {
+    const r = await fetch(CCM_CALL_URL, {
+      method:  'DELETE',
+      headers: { 'Authorization': getCcmBasicAuth() }
+    });
+    const body = await r.text();
+    console.log(`[Hangup] DELETE ${CCM_CALL_URL} → ${r.status}: ${body.slice(0, 200)}`);
+    res.json({ ok: true, callSid, status: r.status });
+  } catch (e) {
+    console.error('[Hangup] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Inbound call reject ───────────────────────────────────────────
 app.post('/reject-call', (req, res) => {
   const { callSid, email } = req.body || {};
