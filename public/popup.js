@@ -26,11 +26,6 @@ let dismissedAt      = 0;   // timestamp of last dismiss; used for native-SIP co
 // Tracks the callSid WE just claimed+accepted. Prevents the poll fallback from
 // seeing "claimed" and calling showDialer() on our own screen while we're live.
 let acceptingCallSid = null;
-let acceptTimeoutId  = null;  // watchdog: reset UI if connected event never fires after Accept
-
-function clearAcceptTimeout() {
-  if (acceptTimeoutId) { clearTimeout(acceptTimeoutId); acceptTimeoutId = null; }
-}
 
 function log(msg) { console.log('[Dialer]', msg); }
 function clog(msg, extra) {
@@ -483,11 +478,7 @@ function startSSE() {
     const sidMatch = (currentInboundCallSid === d.callSid) || (currentInboundCallSid === null);
     if (callDirection === 'inbound' && sidMatch) {
       const reason = d.reason || '';
-      if (reason === 'caller_hung_up') {
-        clog('call_dismissed — caller hung up sid=' + d.callSid);
-      } else {
-        clog('call_dismissed — claimed by ' + d.claimedBy + ' sid=' + d.callSid);
-      }
+      clog('call_dismissed reason=' + reason + ' sid=' + d.callSid);
       if (d.callSid) dismissedCallSids.add(d.callSid);
       dismissedAt = Date.now();
       showDialer();
@@ -653,13 +644,12 @@ function handleCallEvent(event) {
       ? (document.getElementById('callerNum')?.textContent || '')
       : (document.getElementById('phone')?.value || '');
     acceptingCallSid = null; // clear guard — we're now fully live
-    clearAcceptTimeout();   // cancel the accept timeout watchdog
     showActive(num);
     setStatus('');
   } else if (isEnded) {
     clog('Call ended event — resetting UI');
-    clearAcceptTimeout();
-    callDirection = null;   // explicit clear — showDialer() does this too but belt+suspenders
+    callDirection    = null;
+    acceptingCallSid = null;
     reportStatus('free');
     showDialer();
     setStatus('Call ended');
@@ -723,28 +713,21 @@ async function acceptCall() {
   clog('AcceptCall');
   try {
     await webPhone.AcceptCall();
-    // DO NOT call showActive() here. AcceptCall() resolving only means our SIP
-    // leg accepted — the customer is not yet connected. We wait for the SDK to
-    // fire the "connected" event in handleCallEvent, which is when audio is live.
-    // Calling showActive() here was Bug 2: timer started before customer answered.
-    setStatus('Connecting...');
-
-    // Watchdog: if "connected" never fires within 30s (customer hung up before
-    // answering, SIP timeout, etc.), reset the UI so the agent isn't stuck.
-    clearAcceptTimeout();
-    acceptTimeoutId = setTimeout(() => {
-      if (acceptingCallSid) {
-        clog('Accept watchdog fired — connected event never received, resetting UI');
-        acceptingCallSid = null;
-        callDirection    = null;
-        reportStatus('free');
-        showDialer();
-        setStatus('Call not connected');
-      }
-    }, 30000);
+    // AcceptCall() resolving = SIP leg accepted. The SDK does NOT reliably fire
+    // a separate "connected" event for inbound calls — and acceptingCallSid guard
+    // in handleCallEvent was swallowing any follow-up SDK events. Fix: show active
+    // immediately here so the agent's UI reflects the live call without waiting
+    // for a "connected" event that may never arrive.
+    const num = document.getElementById('callerNum')?.textContent || '';
+    acceptingCallSid = null; // clear guard — we're live
+    showActive(num);
+    setStatus('');
+    clog('AcceptCall resolved — call live with ' + num);
   } catch (e) {
-    acceptingCallSid = null; // revert guard on error
-    clearAcceptTimeout();
+    acceptingCallSid = null;
+    callDirection    = null;
+    reportStatus('free');
+    showDialer();
     clog('AcceptCall error: ' + e.message);
     setStatus('Accept failed: ' + e.message);
   }
@@ -775,8 +758,8 @@ async function rejectCall() {
 
 async function hangUp() {
   if (!webPhone) return;
-  clearAcceptTimeout();
   callDirection = null;
+  acceptingCallSid = null;
   try { await webPhone.HangupCall(); } catch (e) { clog('Hangup err: ' + e.message); }
   reportStatus('free');
   showDialer(); setStatus('Call ended');
