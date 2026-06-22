@@ -537,7 +537,8 @@ async function doPoll() {
 }
 
 async function triggerOutboundCall(number) {
-  if (!sdkReady)  { clog('OutboundCall: not registered'); setStatus('Not registered yet'); return; }
+  if (!sdkReady)        { clog('OutboundCall: not registered'); setStatus('Not registered yet'); return; }
+  if (!currentUserEmail){ clog('OutboundCall: email not resolved'); setStatus('⚠️ Email not resolved — reload'); return; }
   callDirection = 'outbound';
   // Mark busy immediately — no incoming calls should ring this agent while dialling.
   reportStatus('busy');
@@ -626,9 +627,14 @@ async function makeCall() {
   if (!number)    { setStatus('Enter a number'); return; }
   if (!webPhone)  { setStatus('SDK not ready');  return; }
   if (!micGranted){ setStatus('⚠️ Allow microphone first!'); return; }
-  document.getElementById('callBtn').disabled = true;
-  await triggerOutboundCall(number);
-  document.getElementById('callBtn').disabled = false;
+  if (!currentUserEmail) { setStatus('⚠️ User identity not resolved. Reload the page.'); return; }
+  const btn = document.getElementById('callBtn');
+  btn.disabled = true;
+  try {
+    await triggerOutboundCall(number);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function acceptCall() {
