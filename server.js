@@ -33,21 +33,13 @@ const isIndia = /mum|in1|india/i.test(DOMAIN);
 const SIP_FB  = isIndia ? 'voip.in1.exotel.com' : 'voip.sgp1.exotel.com';
 
 // ── In-memory state ───────────────────────────────────────────────
-// pendingCallMap: email → { number, callId, ts }
-// Keyed by agent email so each agent only gets their own pending call.
 const pendingCallMap   = {};
-// pendingInboundMap: callSid → { from, to, ts, phoneKey }
-// Holds every ringing inbound call until an agent claims it or it times out.
 const pendingInboundMap = {};
-// inboundClaimMap: callSid → { email, bx24UserId, bx24CallId, ts }
-// Set atomically when an agent claims a call; used by /call-callback to finish it.
 const inboundClaimMap   = {};
 let   pollCount = 0;
 
 // ── SSE client registry ───────────────────────────────────────────
-// sseClients: email → Express Response object (one per agent tab)
-// When a call event arrives we push it instantly instead of waiting for a poll.
-const sseClients = {};  // email → res
+const sseClients = {};
 
 function ssePush(email, event, data) {
   const key = (email || '').toLowerCase();
@@ -133,7 +125,7 @@ async function fetchAllMappedUsers(at) {
 }
 
 // ── usermapping live user map — PRIMARY credential source ────────
-let _mapCache    = null;   // Map<emailLower, usermapping row>
+let _mapCache    = null;
 let _mapCacheExp = 0;
 let _mapInflight = null;
 
@@ -454,11 +446,9 @@ app.all('/install', (req, res) => {
 });
 
 // ── BX24 outbound call trigger ────────────────────────────────────
-const bx24EmailCache = {}; // bx24UserId → email
+const bx24EmailCache = {};
 
-// Resolves agent email → BX24 numeric user ID (reverse of getBx24UserEmail).
-// Used for telephony.externalcall.register on outbound calls.
-const bx24AgentIdCache = {}; // email → bx24UserId
+const bx24AgentIdCache = {};
 async function getBx24UserEmail_toBx24Id(email) {
   if (!email) return null;
   const key = email.toLowerCase();
@@ -503,60 +493,61 @@ async function getBx24UserEmail(bx24UserId) {
 }
 
 // ── Outbound call with recording ──────────────────────────────────
-// popup.js calls this instead of using the SDK's MakeCall (which hardcodes
-// record:false). This endpoint hits the Exotel V3 integrations API directly
-// with record:true so every outbound call is recorded automatically.
-// The agent's SIP device still rings as normal — Exotel dials the agent's
-// SIP URI first, and once they answer it bridges to the customer.
 app.post('/make-outbound-call', async (req, res) => {
   const { toNumber, agentEmail } = req.body || {};
   if (!toNumber || !agentEmail)
     return res.status(400).json({ error: 'toNumber and agentEmail required' });
 
   try {
-    const appToken  = await getAppToken();
-    const mapped    = await getMappedUserMap();
-    const user      = mapped.get(agentEmail.toLowerCase());
+    const mapped = await getMappedUserMap();
+    const user   = mapped.get(agentEmail.toLowerCase());
     if (!user) return res.status(404).json({ error: `No usermapping for ${agentEmail}` });
 
     const appUserId = String(user.AppUserId || '');
-    const sipId     = user.SipId || '';
+    const sipUri    = user.SipId || '';
 
-    // POST to Exotel integrations /call endpoint with record:true
-    // The correct Exotel V3 integrations API path is /call (not /call/outbound_call).
-    // Field names must match the Exotel spec: AppUserId (not user_id), ToNumber (not to).
+    // CCM v2 calls API — correct endpoint for agent+customer outbound calls.
+    // Auth: Basic API_KEY:API_TOKEN (same as the users API).
+    const CCM_CALLS_URL = isIndia
+      ? `https://ccm-api.in.exotel.com/v2/accounts/${ACCOUNT_SID}/calls`
+      : `https://ccm-api.exotel.com/v2/accounts/${ACCOUNT_SID}/calls`;
+
     const payload = {
-      AppUserId:  appUserId,
-      ToNumber:   toNumber,
-      Record:     true,       // force recording on every outbound call
-      CallbackUrl: `${RENDER_URL}/call-callback`
+      from: sipUri
+        ? { user_contact_uri: sipUri }
+        : { user_id: appUserId },
+      to: { customer_contact_uri: toNumber },
+      virtual_number: VIRTUAL_NUMBER,
+      recording: true,
+      status_callback: `${RENDER_URL}/call-callback`
     };
 
     console.log(`[OutboundCall] ${agentEmail} → ${toNumber} record:true`);
-    const callRes = await fetch(`${BASE}/call`, {
+    console.log(`[OutboundCall] POST ${CCM_CALLS_URL} payload:`, JSON.stringify(payload));
+
+    const callRes = await fetch(CCM_CALLS_URL, {
       method:  'POST',
-      headers: { 'Authorization': appToken, 'Content-Type': 'application/json' },
+      headers: { 'Authorization': getCcmBasicAuth(), 'Content-Type': 'application/json' },
       body:    JSON.stringify(payload)
     });
-    const rawBody  = await callRes.text();
-console.log(`[OutboundCall] Exotel raw response (${callRes.status}): ${rawBody}`);
-let callData;
-try { callData = JSON.parse(rawBody); }
-catch (_) { callData = { raw: rawBody }; }
-if (!callRes.ok) throw new Error(`Exotel ${callRes.status}: ${rawBody}`);
+    const rawBody = await callRes.text();
+    console.log(`[OutboundCall] Exotel raw response (${callRes.status}): ${rawBody}`);
+    let callData;
+    try { callData = JSON.parse(rawBody); }
+    catch (_) { callData = { raw: rawBody }; }
+    if (!callRes.ok) throw new Error(`Exotel ${callRes.status}: ${rawBody}`);
 
     console.log(`[OutboundCall] Placed: ${JSON.stringify(callData)}`);
 
-    // Register the outbound call with BX24 telephony API so it appears in the
-    // timeline as a native call entry (with audio player) instead of a plain activity.
-    const exotelCallSid = callData?.Data?.CallSid || callData?.CallSid || null;
+    // CCM v2 response: { response: { call_details: { sid: "..." } } }
+    const exotelCallSid = callData?.response?.call_details?.sid || callData?.Data?.CallSid || callData?.CallSid || null;
     if (BX24_WEBHOOK && exotelCallSid) {
       try {
         const agentBx24Id = await getBx24UserEmail_toBx24Id(agentEmail);
         const r = await bx24Call('telephony.externalcall.register', {
           USER_ID:         agentBx24Id || BX24_USER_ID,
           PHONE_NUMBER:    toNumber,
-          TYPE:            1,  // 1 = outbound
+          TYPE:            1,
           CALL_START_DATE: new Date().toISOString(),
           CRM_CREATE:      true,
           LINE_NUMBER:     VIRTUAL_NUMBER || '',
@@ -624,11 +615,9 @@ app.get('/pending-call', (req, res) => {
     res.json({ pending: true, type: 'outbound', number: entry.number, callId: entry.callId });
   } else {
     if (entry) delete pendingCallMap[key];
-    // Check for unclaimed inbound that this agent hasn't rejected
     const inbound = Object.entries(pendingInboundMap).find(([sid, d]) => {
       if (inboundClaimMap[sid]) return false;
       if ((Date.now() - d.ts) >= 60000) return false;
-      // Don't show to agents who already rejected this call
       const lock = d.phoneKey ? callerLocks.get(d.phoneKey) : null;
       if (lock && lock.rejectedBy.has(email)) return false;
       return true;
@@ -667,7 +656,6 @@ app.get('/events', (req, res) => {
   sseClients[email] = res;
   console.log(`[SSE] Agent connected: ${email} (active: ${Object.keys(sseClients).length})`);
 
-  // Mark agent as free when they connect (they just loaded the dialer)
   setAgentBusy(email, false);
 
   const hb = setInterval(() => {
@@ -681,9 +669,8 @@ app.get('/events', (req, res) => {
     ssePush(email, 'outbound_call', { number: entry.number, callId: entry.callId });
   }
 
-  // Also flush any unclaimed inbound call this agent hasn't rejected.
   for (const [sid, callData] of Object.entries(pendingInboundMap)) {
-    if (inboundClaimMap[sid]) continue;  // already claimed by someone
+    if (inboundClaimMap[sid]) continue;
     const lock = callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
     if (lock && lock.claimedBy) continue;
     if (lock && lock.rejectedBy.has(email)) continue;
@@ -703,37 +690,19 @@ app.get('/events', (req, res) => {
 });
 
 // ── Claimed SIDs registry ─────────────────────────────────────────────────
-// Once an agent claims a call, we record the sid here so that any duplicate
-// Exotel Dial webhooks don't cause a second broadcast to all agents.
 const claimedSids = new Set();
 
 // ── Caller-based call lock ─────────────────────────────────────────────────
-// THE CORE FIX for "still rings everyone including the agent who accepted":
-//
-// Exotel can hit /incoming-call multiple times for one ringing call (once per
-// SIP leg / retry ping) and the CallSid is NOT always the same across pings.
-// The old code used `claimedSids.has(sid)` as the dedup guard — but if Exotel
-// sends a new/missing CallSid on the next ping, `'in_' + Date.now()` generates
-// a brand-new key the guard has never seen, so it re-broadcasts to everyone,
-// including the agent who already accepted.
-//
-// FIX: key the lock on the CALLER'S phone number instead — that stays identical
-// across every ping for the same call. Once any agent claims, `lock.claimedBy`
-// is set and every subsequent ping for this caller is silently dropped.
-const callerLocks = new Map(); // normalizedFromNumber → { sid, claimedBy, rejectedBy:Set, ts }
-const LOCK_TTL_MS  = 90 * 1000; // ringing call older than this is treated as stale
+const callerLocks = new Map();
+const LOCK_TTL_MS  = 90 * 1000;
 
 function normalizePhone(n) {
   const digits = String(n || '').replace(/\D/g, '');
   return digits.slice(-10) || String(n || '').trim().toLowerCase();
 }
 
-// ── Agent presence (round robin: only ring agents who are FREE) ───────────
-// When an agent accepts OR makes a call → mark them BUSY.
-// When a call ends (call-callback) OR they reject → mark them FREE.
-// On new incoming call, we only push SSE to FREE agents first.
-// If everyone is busy (or all rejected), fall back to ringing everyone.
-const agentStatus = new Map(); // emailLower → { status: 'free'|'busy', ts }
+// ── Agent presence ────────────────────────────────────────────────
+const agentStatus = new Map();
 
 function setAgentBusy(email, busy) {
   const key = (email || '').toLowerCase();
@@ -742,8 +711,6 @@ function setAgentBusy(email, busy) {
   console.log(`[Presence] ${key} → ${busy ? 'BUSY' : 'FREE'}`);
 
   if (!busy) {
-    // Agent just freed up — if a call is still ringing unclaimed and this
-    // agent hasn't already declined it, ring them immediately.
     for (const [sid, callData] of Object.entries(pendingInboundMap)) {
       if (claimedSids.has(sid)) continue;
       const lock = callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
@@ -756,7 +723,7 @@ function setAgentBusy(email, busy) {
   }
 }
 
-// ── /agent-status — popup.js reports busy/free for round robin ───
+// ── /agent-status ─────────────────────────────────────────────────
 app.post('/agent-status', (req, res) => {
   const { email, status } = req.body || {};
   if (!email || !['free', 'busy'].includes(status))
@@ -769,17 +736,14 @@ app.post('/agent-status', (req, res) => {
 app.all('/incoming-call', async (req, res) => {
   const p  = Object.assign({}, req.query, req.body);
   console.log('[Incoming]', JSON.stringify(p));
-  const et = (p.EventType || p.Status || p.CallStatus || '').toLowerCase();
-  if (['free','terminal','terminated','completed','busy','noanswer','no-answer','failed'].includes(et)) return res.json({ status: 'ignored' });
+  const et = (p.EventType || p.Status || '').toLowerCase();
+  if (['free','terminal','completed','busy','noanswer','terminated','failed'].includes(et)) return res.json({ status: 'ignored' });
   try {
     const from   = p.From || p.CallFrom || p.caller_id || p.CallerId || p.callerid || 'Unknown';
     const toNum  = p.To || p.DialWhomNumber || p.CallTo || VIRTUAL_NUMBER || 'Unknown';
     const rawSid = p.CallSid || p.call_sid || p.ParentCallSid || p.DialCallSid || null;
     const phoneKey = normalizePhone(from);
 
-    // Collapse every duplicate ping for this caller onto ONE lock/sid.
-    // This is the fix: regardless of what CallSid Exotel sends on each ping,
-    // we use the caller's number as the stable dedup key.
     let lock  = callerLocks.get(phoneKey);
     const stale = lock && (Date.now() - lock.ts > LOCK_TTL_MS) && !lock.claimedBy;
     if (!lock || stale) {
@@ -793,19 +757,13 @@ app.all('/incoming-call', async (req, res) => {
     }
     const sid = lock.sid;
 
-    // If already claimed, silently ignore all subsequent pings for this caller.
     if (lock.claimedBy || claimedSids.has(sid)) {
       console.log(`[Incoming] SKIP broadcast — ${sid} (from ${from}) already claimed by ${lock.claimedBy}`);
       return res.json({ status: 'already_claimed' });
     }
 
-    // Store the call data (used by /claim-call for BX24 registration).
     pendingInboundMap[sid] = { from, to: toNum, ts: Date.now(), phoneKey };
 
-    // Round robin: ring only FREE agents first.
-    // Skip agents who are busy AND agents who already rejected this specific call.
-    // If everyone is busy or has rejected, fall back to ringing all non-rejectors.
-    // If literally everyone rejected, ring everyone (so the call isn't silently dropped).
     const allAgents = Object.keys(sseClients);
     let targets = allAgents.filter(e =>
       (agentStatus.get(e)?.status !== 'busy') && !lock.rejectedBy.has(e)
@@ -815,23 +773,17 @@ app.all('/incoming-call', async (req, res) => {
 
     const pushed = targets.reduce((n, agentEmail) =>
       n + (ssePush(agentEmail, 'inbound_call', { from, callSid: sid }) ? 1 : 0), 0);
-    console.log(`[Incoming] sid=${sid} from=${from} → broadcast to ${pushed}/${allAgents.length} agent(s) (free targets: ${targets.length})`);
+    console.log(`[Incoming] sid=${sid} from=${from} → broadcast to ${pushed}/${allAgents.length} agent(s)`);
 
     res.json({ status: 'received' });
   } catch (e) { console.error('[Incoming]', e.message); res.json({ status: 'error', message: e.message }); }
 });
 
 // ── Inbound call claim ────────────────────────────────────────────
-// Called by the FIRST agent to click "Accept".
-// Atomically claims the call, marks that agent busy (round robin),
-// closes the caller-lock so duplicate Exotel webhook pings are dropped,
-// registers the call in BX24 under that agent, and tells every OTHER
-// agent to dismiss their incoming UI.
 app.post('/claim-call', async (req, res) => {
   const { callSid, email, bx24UserId } = req.body;
   if (!callSid || !email) return res.status(400).json({ error: 'callSid and email required' });
 
-  // JS is single-threaded — this check+set is atomic; no race condition.
   if (inboundClaimMap[callSid]) {
     const c = inboundClaimMap[callSid];
     console.log(`[Claim] REJECTED — ${callSid} already claimed by ${c.email}`);
@@ -842,18 +794,14 @@ app.post('/claim-call', async (req, res) => {
   claimedSids.add(callSid);
   console.log(`[Claim] ${email} claimed ${callSid}`);
 
-  // Close the caller-lock — this stops every subsequent duplicate Exotel webhook
-  // ping (even with a different/missing CallSid) from re-broadcasting to anyone.
   const callData = pendingInboundMap[callSid];
   if (callData && callData.phoneKey) {
     const lock = callerLocks.get(callData.phoneKey);
     if (lock) lock.claimedBy = email.toLowerCase();
   }
 
-  // Round robin: mark this agent busy so new calls skip them.
   setAgentBusy(email, true);
 
-  // Register the call in BX24 under the claiming agent's user ID.
   let bx24CallId = callSid;
   if (BX24_WEBHOOK && callData) {
     try {
@@ -861,7 +809,7 @@ app.post('/claim-call', async (req, res) => {
       const r = await bx24Call('telephony.externalcall.register', {
         USER_ID:         agentBx24Id,
         PHONE_NUMBER:    callData.from,
-        TYPE:            2,  // inbound
+        TYPE:            2,
         CALL_START_DATE: new Date().toISOString(),
         CRM_CREATE:      true,
         LINE_NUMBER:     callData.to || VIRTUAL_NUMBER || '',
@@ -875,7 +823,6 @@ app.post('/claim-call', async (req, res) => {
     }
   }
 
-  // Tell every OTHER agent to dismiss their incoming UI.
   const claimerKey = email.toLowerCase();
   Object.keys(sseClients).forEach(agentEmail => {
     if (agentEmail !== claimerKey) {
@@ -886,54 +833,38 @@ app.post('/claim-call', async (req, res) => {
   res.json({ claimed: true, bx24CallId });
 });
 
-// ── Inbound call reject ────────────────────────────────────────────
-// Called when an agent clicks "Reject". This does NOT claim the call —
-// the call keeps ringing for every other free agent who hasn't rejected it.
-// We record the rejection so this agent's screen doesn't keep popping up
-// for the same call on every subsequent Exotel webhook ping.
-// If an agent rejects, they are set back to FREE (round robin: don't penalize
-// them for one rejection — a future different call should still ring them).
+// ── Inbound call reject ───────────────────────────────────────────
 app.post('/reject-call', (req, res) => {
   const { callSid, email } = req.body || {};
   if (!callSid || !email) return res.status(400).json({ error: 'callSid and email required' });
   const callData = pendingInboundMap[callSid];
   const lock = callData && callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
   if (lock) lock.rejectedBy.add(email.toLowerCase());
-  // Set agent back to free — rejecting doesn't make them busy
   setAgentBusy(email, false);
   console.log(`[Reject] ${email} declined ${callSid} — still ringing for other free agents`);
   res.json({ ok: true });
 });
 
 // ── Call ended (Exotel webhook) ───────────────────────────────────
-// Exotel fires this webhook multiple times during a call's lifecycle:
-//   - CallState=active  + CallDetail=answered  → call just connected (NOT ended)
-//   - CallState=terminal + CallStatus=completed → call truly ended
-// We MUST ignore mid-call pings, otherwise telephony.externalcall.finish fires
-// while the call is still live, corrupting the BX24 timeline entry.
 app.all('/call-callback', async (req, res) => {
   const p = Object.assign({}, req.query, req.body);
   console.log('[Callback]', JSON.stringify(p));
   try {
-    const sid       = p.CallSid || p.call_sid || '';
-    const callState = (p.CallState || p.call_state || '').toLowerCase();
-    const callDetail= (p.CallDetail || p.call_detail || '').toLowerCase();
-    const duration  = parseInt(p.Duration || p.duration || '0');
-    const status    = p.Status  || p.status  || 'completed';
+    const sid        = p.CallSid || p.call_sid || '';
+    const callState  = (p.CallState || p.call_state || '').toLowerCase();
+    const callDetail = (p.CallDetail || p.call_detail || '').toLowerCase();
+    const duration   = parseInt(p.Duration || p.duration || '0');
+    const status     = p.Status  || p.status  || 'completed';
 
-    // Ignore mid-call webhooks (answered, active, ringing, etc.)
-    // Only process when the call is definitively over.
     const isTerminal = callState === 'terminal' || callState === 'terminated' ||
-                       status === 'completed'   || status === 'terminated'   ||
-                       callDetail === 'terminal'|| callDetail === 'completed' ||
+                       status === 'completed' || status === 'terminated' || status === 'failed' ||
+                       callDetail === 'terminal' || callDetail === 'completed' ||
                        (p.EndTime && String(p.EndTime).trim() !== '');
     if (!isTerminal) {
       console.log(`[Callback] SKIP mid-call webhook — CallState=${callState} CallDetail=${callDetail} sid=${sid}`);
       return res.json({ status: 'ignored_mid_call' });
     }
 
-    // Dedup guard: if we already processed the terminal callback for this sid, ignore.
-    // Exotel sometimes fires the terminal webhook twice.
     if (sid && claimedSids.has('cb_done_' + sid)) {
       console.log(`[Callback] SKIP duplicate terminal webhook for sid=${sid}`);
       return res.json({ status: 'ignored_duplicate' });
@@ -943,30 +874,19 @@ app.all('/call-callback', async (req, res) => {
     const claim    = inboundClaimMap[sid];
     const bx24Id   = claim ? claim.bx24CallId : sid;
     const agentId  = claim ? (claim.bx24UserId || BX24_USER_ID) : BX24_USER_ID;
-
-    // Check if this is an outbound call we registered with BX24
     const outbound = outboundCallMap[sid];
 
-    // Round robin: free up the agent who was on this call
-    if (claim) {
-      setAgentBusy(claim.email, false);
-      delete inboundClaimMap[sid];
-    }
-    if (outbound) {
-      setAgentBusy(outbound.agentEmail, false);
-    }
+    if (claim)   { setAgentBusy(claim.email, false); delete inboundClaimMap[sid]; }
+    if (outbound) { setAgentBusy(outbound.agentEmail, false); }
 
-    // Release the caller-lock so a future call from the same number works normally
     const callData = pendingInboundMap[sid];
     if (callData && callData.phoneKey) callerLocks.delete(callData.phoneKey);
     if (pendingInboundMap[sid]) delete pendingInboundMap[sid];
     claimedSids.delete(sid);
 
-    // Finish the BX24 telephony call — for inbound uses claim data,
-    // for outbound uses outboundCallMap data.
-    const finishBx24Id    = outbound ? outbound.bx24CallId    : bx24Id;
-    const finishAgentId   = outbound ? outbound.agentBx24UserId : agentId;
-    const finishEmail     = outbound ? outbound.agentEmail     : (claim ? claim.email : null);
+    const finishBx24Id  = outbound ? outbound.bx24CallId      : bx24Id;
+    const finishAgentId = outbound ? outbound.agentBx24UserId  : agentId;
+    const finishEmail   = outbound ? outbound.agentEmail        : (claim ? claim.email : null);
 
     if (BX24_WEBHOOK && finishBx24Id) {
       try {
@@ -975,7 +895,6 @@ app.all('/call-callback', async (req, res) => {
           USER_ID:     finishAgentId,
           DURATION:    duration,
           STATUS_CODE: status === 'completed' ? 200 : 304
-          // RECORD_URL added below once recording is ready (2-5 min delay)
         });
         console.log(`[Callback] BX24 finish: CALL_ID=${finishBx24Id}`);
       } catch (e) {
@@ -983,23 +902,20 @@ app.all('/call-callback', async (req, res) => {
       }
     }
 
-    const callFrom   = (p.From || p.CallFrom || p.caller_id || p.FromNumber || '').trim();
-    const agentEmail = claim ? claim.email : null;
-    // Outbound: FromNumber is the SIP URI (sip:arjunb23aca3e4), ToNumber is the client.
-    // Inbound:  From is the client number.
-    const clientNum  = (p.Direction || '').toLowerCase().includes('outbound')
+    const callFrom  = (p.From || p.CallFrom || p.caller_id || p.FromNumber || '').trim();
+    const clientNum = (p.Direction || '').toLowerCase().includes('outbound')
       ? (p.ToNumber || p.To || callFrom).trim()
       : callFrom;
 
-    // Schedule recording sync with automatic retry — all retry logic lives in exotel-recordings.js
-    recordings.scheduleSync({
-      clientNum,
-      agentEmail:  finishEmail,
-      callSid:     sid,
-      bx24CallId:  finishBx24Id,
-      agentBx24Id: finishAgentId,
-      onSuccess:   outbound ? () => { delete outboundCallMap[sid]; } : null
-    });
+    if (clientNum) {
+      recordings.scheduleSync({
+        phoneNumber: clientNum,
+        agentEmail:  finishEmail,
+        callSid:     sid,
+        bx24CallId:  finishBx24Id,
+        agentBx24Id: finishAgentId
+      });
+    }
 
     res.json({ status: 'received' });
   } catch (e) { console.error('[Callback]', e.message); res.json({ status: 'error', message: e.message }); }
@@ -1110,7 +1026,7 @@ app.delete('/delete-user/:appUserId', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── /token — THE critical endpoint ───────────────────────────────
+// ── /token ────────────────────────────────────────────────────────
 app.get('/token', async (req, res) => {
   try {
     const { user_id, bx24_user_id } = req.query;
