@@ -660,7 +660,17 @@ function handleCallEvent(event) {
     showActive(num);
     setStatus('');
   } else if (isEnded) {
-    clog('Call ended event — resetting UI');
+    // Only reset UI if we are actually in an active/ringing call state.
+    // The Exotel SDK fires "completed"/"rejected"/"cancel" events for the agent
+    // SIP ring leg when AcceptCall() picks it up — that is NOT the call ending.
+    // Without this guard, the UI resets to dialer within seconds of accepting.
+    const activePanelEl  = document.getElementById('activePanel');
+    const isActiveShowing = activePanelEl && activePanelEl.style.display === 'block';
+    if (!callDirection && !isActiveShowing) {
+      clog('callEvent isEnded ignored — no active call (type=' + type + ')');
+      return;
+    }
+    clog('Call ended event — resetting UI (type=' + type + ')');
     callDirection    = null;
     acceptingCallSid = null;
     reportStatus('free');
