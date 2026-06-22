@@ -636,6 +636,7 @@ async function triggerOutboundCall(number) {
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Server error');
     clog('OutboundCall placed via server: ' + JSON.stringify(data));
+    outboundInFlight = false; // placement done — callDirection guards from here
     showOutboundRinging(number);
   } catch (e) {
     // Failed to place — revert to free so round robin doesn't permanently
@@ -699,7 +700,7 @@ function handleCallEvent(event) {
       const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown';
       showIncoming(from);
     }
-  } else if (isConnected) {
+  } else if (isConnected || (isAcceptEvent && callDirection === 'outbound')) {
     const num = callDirection === 'inbound'
       ? (document.getElementById('callerNum')?.textContent || '')
       : (document.getElementById('phone')?.value || '');
@@ -828,8 +829,18 @@ async function rejectCall() {
 
 async function hangUp() {
   if (!webPhone) return;
-  callDirection = null;
+  const wasDirection = callDirection;
+  callDirection    = null;
+  outboundInFlight = false;
   acceptingCallSid = null;
+  // Tell Exotel to terminate the call via server (SDK HangupCall alone is not enough)
+  try {
+    fetch('/hangup', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ email: currentUserEmail, direction: wasDirection })
+    }).catch(() => {});
+  } catch (_) {}
   try { await webPhone.HangupCall(); } catch (e) { clog('Hangup err: ' + e.message); }
   reportStatus('free');
   showDialer(); setStatus('Call ended');
