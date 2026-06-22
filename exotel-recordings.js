@@ -143,17 +143,20 @@ function phoneVariants(phoneNumber) {
   const raw    = (phoneNumber || '').trim();
   const digits = raw.replace(/\D/g, '');
   // For Indian 10-digit numbers: also try with leading 0 and +91 prefix
-  const last10  = digits.length > 10 ? digits.slice(-10) : digits;
-  const withPlus = digits ? `+${digits}` : '';
-  const with91   = last10.length === 10 ? `+91${last10}` : '';
-  const with0    = last10.length === 10 ? `0${last10}`   : '';
-  const seen = new Set();
-  const variants = [];
-  for (const v of [raw, withPlus, with91, digits, last10, with0]) {
-    if (v && v.length >= 7 && !seen.has(v)) { seen.add(v); variants.push(v); }
-  }
-  return variants;
+  // Universal: strip country code to get local number, try common prefixes
+const withPlus  = digits ? `+${digits}` : '';
+const withPlus2 = raw.startsWith('+') ? raw : '';   // keep original if already E.164
+// Local number = strip leading country code digits (1–3 digits), min 7 digits remaining
+const local = digits.length > 10 ? digits.slice(digits.length - 10) :
+              digits.length > 7  ? digits : '';
+const with0 = local ? `0${local}` : '';             // trunk prefix used in many countries
+
+const seen = new Set();
+const variants = [];
+for (const v of [raw, withPlus, withPlus2, digits, local, with0]) {
+  if (v && v.length >= 7 && !seen.has(v)) { seen.add(v); variants.push(v); }
 }
+return variants;
 
 // ── Find BX24 CRM entity by phone (Lead → Contact → Deal) ───────────────
 async function findBx24EntityByPhone(phoneNumber) {
@@ -204,8 +207,28 @@ async function findBx24EntityByPhone(phoneNumber) {
     return { entityType: 'CONTACT', entityId: contactId };
   }
 
-  log(`No BX24 Lead/Contact/Deal found for ${phoneNumber}`);
-  return null;
+  // No existing entity — auto-create a Lead so the call appears in the timeline.
+  // Set EXOTEL_AUTO_CREATE_LEAD=false in env to disable this behaviour.
+  if (process.env.EXOTEL_AUTO_CREATE_LEAD === 'false') {
+    log(`No BX24 entity found for ${phoneNumber} — auto-create disabled`);
+    return null;
+  }
+  try {
+    const newLead = await bx24Call('crm.lead.add', {
+      fields: {
+        TITLE:  `Exotel Call — ${phoneNumber}`,
+        PHONE:  [{ VALUE: phoneNumber, VALUE_TYPE: 'WORK' }],
+        STATUS_ID: 'NEW',
+        SOURCE_ID: 'CALL'
+      }
+    });
+    const leadId = String(newLead);
+    log(`Auto-created LEAD ID=${leadId} for unknown number ${phoneNumber}`);
+    return { entityType: 'LEAD', entityId: leadId };
+  } catch (e) {
+    log(`Auto-create Lead failed for ${phoneNumber}: ${e.message}`);
+    return null;
+  }
 }
 
 // ── Fetch Exotel calls for a specific number ─────────────────────────────
@@ -301,14 +324,15 @@ async function updateBx24CallRecord({
   // Always also create a metadata activity card so agents see all fields.
   const mins = Math.floor((duration || 0) / 60);
   const secs = (duration || 0) % 60;
+  const fmtDate = d => { try { return new Date(d).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true}); } catch(_){ return d; } };
   const desc =
     `☎ ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call\n\n` +
     `Agent     : ${agentEmail || (agentBx24Id ? `User #${agentBx24Id}` : 'Unassigned')}\n` +
     `From      : ${fromNum}\n` +
     `To        : ${toNum}\n` +
     `Customer  : ${clientNum}\n` +
-    `Start     : ${callDate}\n` +
-    `End       : ${endDate || callDate}\n` +
+    `Start     : ${fmtDate(callDate)}\n` +
+    `End       : ${fmtDate(endDate || callDate)}\n` +
     `Duration  : ${mins}m ${secs}s\n` +
     `Status    : ${status || 'Completed'}\n` +
     `Call SID  : ${callSid}\n\n` +
@@ -316,7 +340,7 @@ async function updateBx24CallRecord({
 
   const entity = await findBx24EntityByPhone(clientNum);
   if (!entity) {
-    log(`No BX24 entity found for ${clientNum} — skipping metadata activity`);
+    log(`⚠️  No BX24 entity for ${clientNum} and auto-create is off — activity NOT posted to timeline`);
     return bx24CallId;
   }
 
@@ -364,14 +388,15 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   const mins = Math.floor(duration / 60);
   const secs = duration % 60;
 
+  const fmtDate = d => { try { return new Date(d).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true}); } catch(_){ return d; } };
   const desc =
     `☎ ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call\n\n` +
     `Agent     : ${agentBx24UserId ? `User #${agentBx24UserId}` : 'Unassigned'}\n` +
     `From      : ${fromNum}\n` +
     `To        : ${toNum}\n` +
     `Customer  : ${clientNum}\n` +
-    `Start     : ${callDate}\n` +
-    `End       : ${endDate}\n` +
+    `Start     : ${fmtDate(callDate)}\n` +
+    `End       : ${fmtDate(endDate)}\n` +
     `Duration  : ${mins}m ${secs}s\n` +
     `Status    : ${status}\n` +
     `Call SID  : ${callSid}\n\n` +
@@ -379,7 +404,7 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
 
   const entity = await findBx24EntityByPhone(clientNum);
   if (!entity) {
-    log(`No BX24 entity found for ${clientNum} (CallSid=${callSid}) — skipping`);
+    log(`⚠️  No BX24 entity for ${clientNum} (CallSid=${callSid}) and auto-create is off — activity NOT posted to timeline`);
     return null;
   }
 
