@@ -26,6 +26,7 @@ let dismissedAt      = 0;   // timestamp of last dismiss; used for native-SIP co
 // Tracks the callSid WE just claimed+accepted. Prevents the poll fallback from
 // seeing "claimed" and calling showDialer() on our own screen while we're live.
 let acceptingCallSid = null;
+let outboundInFlight  = null;
 
 function log(msg) { console.log('[Dialer]', msg); }
 function clog(msg, extra) {
@@ -580,7 +581,7 @@ async function triggerOutboundCall(number) {
     clog('OutboundCall blocked — outboundInFlight=' + outboundInFlight + ' callDirection=' + callDirection);
     return;
   }
-  outboundInFlight = true;
+  outboundInFlight = false;
   callDirection = 'outbound';
   // Mark busy immediately — no incoming calls should ring this agent while dialling.
   reportStatus('busy');
