@@ -700,7 +700,7 @@ function handleCallEvent(event) {
       const from = (event && (event.from || event.FromNumber || event.callerNumber || event.CallFrom)) || 'Unknown';
       showIncoming(from);
     }
-  } else if (isConnected || (isAcceptEvent && callDirection === 'outbound')) {
+  } else if (isConnected || isAcceptEvent) {
     const num = callDirection === 'inbound'
       ? (document.getElementById('callerNum')?.textContent || '')
       : (document.getElementById('phone')?.value || '');
