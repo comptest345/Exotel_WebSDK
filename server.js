@@ -562,6 +562,14 @@ app.post('/make-outbound-call', async (req, res) => {
           ts: Date.now()
         };
         console.log(`[OutboundCall] BX24 registered: CALL_ID=${bx24CallId} for exotel sid=${exotelCallSid}`);
+        // Register with recording poller so it knows the bx24CallId without a phone lookup
+        recordings.registerCall(exotelCallSid, {
+          bx24CallId,
+          agentBx24Id: agentBx24Id || BX24_USER_ID,
+          agentEmail,
+          phone:     toNumber,
+          direction: 'outbound'
+        });
       } catch (e) {
         console.warn('[OutboundCall] BX24 register failed (non-fatal):', e.message);
       }
@@ -939,6 +947,14 @@ app.post('/claim-call', async (req, res) => {
       bx24CallId = (r && r.CALL_ID) || callSid;
       inboundClaimMap[callSid].bx24CallId = bx24CallId;
       console.log(`[Claim] BX24 registered: CALL_ID=${bx24CallId} USER_ID=${agentBx24Id}`);
+      // Register with recording poller
+      recordings.registerCall(callSid, {
+        bx24CallId,
+        agentBx24Id,
+        agentEmail:  email,
+        phone:       callData.from,
+        direction:   'inbound'
+      });
     } catch (e) {
       console.warn('[Claim] BX24 register failed (non-fatal):', e.message);
     }
