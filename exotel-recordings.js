@@ -17,6 +17,10 @@ const RENDER_URL   = process.env.RENDER_URL          || 'https://exotel-websdk.o
 const isIndia         = /mum|in1|india/i.test(DOMAIN);
 const EXOTEL_API_HOST = process.env.EXOTEL_API_HOST || (isIndia ? 'api.in.exotel.com' : 'api.exotel.com');
 const EXOTEL_V1_BASE  = `https://${EXOTEL_API_HOST}/v1/Accounts/${ACCOUNT_SID}`;
+// v2 CCM API — this is what actually places calls, and where recordings live
+const EXOTEL_V2_BASE  = process.env.EXOTEL_V2_HOST
+  ? `https://${process.env.EXOTEL_V2_HOST}/v2/accounts/${ACCOUNT_SID}`
+  : `https://ccm-api.exotel.com/v2/accounts/${ACCOUNT_SID}`;
 
 const RETRY_FIRST_DELAY_MS = (parseInt(process.env.EXOTEL_RECORDING_DELAY_SEC || '30') * 1000);
 const RETRY_MAX_ATTEMPTS   = 4;
@@ -33,12 +37,26 @@ log(`  BX24_WEBHOOK_URL   : ${BX24_WEBHOOK ? '✅ set'      : '⚠️  NOT SET'}
 log(`  EXOTEL_DOMAIN      : ${DOMAIN}`);
 log(`  EXOTEL_API_HOST    : ${EXOTEL_API_HOST}`);
 log(`  EXOTEL_V1_BASE     : ${EXOTEL_V1_BASE}`);
+log(`  EXOTEL_V2_BASE     : ${EXOTEL_V2_BASE}`);
 log(`  RENDER_URL         : ${RENDER_URL}`);
 log(`  RETRY first delay  : ${RETRY_FIRST_DELAY_MS / 1000}s, max attempts: ${RETRY_MAX_ATTEMPTS}`);
 log(`  POLL interval      : ${Math.max(5, parseInt(process.env.EXOTEL_RECORDING_POLL_SEC || '10'))}s`);
 log(`  POLL disabled      : ${process.env.EXOTEL_RECORDING_POLL_DISABLED || 'false'}`);
 log(`  AUTO_CREATE_LEAD   : ${process.env.EXOTEL_AUTO_CREATE_LEAD || 'true (default)'}`);
 log('════════════════════════════════════════════════');
+
+// ── Call registry — server.js calls registerCall() when a call is placed ──
+// Maps exotelSid → { bx24CallId, agentEmail, agentBx24Id, phone, direction, ts }
+const callRegistry = new Map();
+
+function registerCall(exotelSid, data) {
+  if (!exotelSid) return;
+  callRegistry.set(exotelSid, { ...data, ts: Date.now(), recordingSynced: false });
+  log(`[Registry] Registered SID=${exotelSid} bx24CallId=${data.bx24CallId} phone=${data.phone} agent=${data.agentEmail}`);
+  // Cleanup entries older than 24h
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [sid, d] of callRegistry) { if (d.ts < cutoff) { callRegistry.delete(sid); } }
+}
 
 // ── Injectable agent resolver ─────────────────────────────────────────────
 let _agentResolver = null;
@@ -94,6 +112,31 @@ async function exotelGet(path, params) {
     return parsed;
   } catch (e) {
     log(`[ExotelAPI] ❌ JSON parse failed for ${path}: ${e.message} | raw: ${body.slice(0, 200)}`);
+    throw e;
+  }
+}
+
+// ── Exotel v2 CCM API helper ──────────────────────────────────────────────
+// Calls are PLACED via v2 — recordings also live in v2 response.
+async function exotelV2Get(path) {
+  if (!ACCOUNT_SID || !API_KEY || !API_TOKEN)
+    throw new Error('EXOTEL credentials not set');
+  const creds = Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
+  const url   = `${EXOTEL_V2_BASE}${path}`;
+  log(`[ExotelV2] → GET ${url}`);
+  const res  = await fetch(url, { headers: { Authorization: `Basic ${creds}` } });
+  const body = await res.text();
+  log(`[ExotelV2] ← HTTP ${res.status} (body: ${body.length} chars)`);
+  if (!res.ok) {
+    log(`[ExotelV2] ❌ Error: ${body.slice(0, 300)}`);
+    throw new Error(`Exotel v2 ${path} → HTTP ${res.status}: ${body.slice(0, 200)}`);
+  }
+  try {
+    const parsed = JSON.parse(body);
+    log(`[ExotelV2] ✅ Parsed OK`);
+    return parsed;
+  } catch (e) {
+    log(`[ExotelV2] ❌ JSON parse failed: ${e.message} | raw: ${body.slice(0, 200)}`);
     throw e;
   }
 }
@@ -286,30 +329,51 @@ async function fetchRecentExotelCalls(direction, fromDate, toDate) {
 
 // ── Fetch recording URL for a single call SID ─────────────────────────────
 async function fetchRecordingUrl(callSid) {
-  log(`[RecordingURL] Fetching call detail for SID=${callSid}`);
+  log(`[RecordingURL] Fetching for SID=${callSid} — trying v2 CCM API first (calls are placed via v2)`);
+
+  // ── Try v2 first (ccm-api.exotel.com) ──
+  try {
+    const data = await exotelV2Get(`/calls/${callSid}`);
+    // v2 response: { response: { data: { recordings: [{ url, duration, ... }] } } }
+    const callData   = data?.response?.data || data?.data || {};
+    const recordings = callData?.recordings;
+    log(`[RecordingURL][v2] call_state=${callData.call_state} recordings=${JSON.stringify(recordings)?.slice(0,200)}`);
+
+    if (Array.isArray(recordings) && recordings.length > 0) {
+      const url = recordings[0].url || recordings[0].recording_url || recordings[0].Uri || null;
+      if (url) {
+        log(`[RecordingURL][v2] ✅ Found recording: ${url.slice(0, 120)}…`);
+        return url;
+      }
+    }
+    if (recordings === null || recordings === undefined) {
+      log(`[RecordingURL][v2] recordings field is ${recordings} — not ready yet`);
+    } else {
+      log(`[RecordingURL][v2] recordings array empty — no recording for this call`);
+    }
+  } catch (e) {
+    log(`[RecordingURL][v2] ⚠️  v2 fetch failed: ${e.message} — falling back to v1`);
+  }
+
+  // ── Fallback to v1 (TwilioResponse format) ──
+  log(`[RecordingURL][v1] Trying v1 fallback for SID=${callSid}`);
   try {
     const data = await exotelGet(`/Calls/${callSid}.json`);
     const call = data?.TwilioResponse?.Call || data?.Call || {};
-
-    log(`[RecordingURL] Fields present in call object: [${Object.keys(call).join(', ')}]`);
-
+    log(`[RecordingURL][v1] Fields: [${Object.keys(call).join(', ')}]`);
     const preSignedUrl = call.PreSignedRecordingUrl || null;
     const recordingUrl = call.RecordingUrl          || null;
-
-    log(`[RecordingURL] SID=${callSid} → PreSignedRecordingUrl : ${preSignedUrl ? '✅ ' + preSignedUrl.slice(0, 100) + '…' : '❌ absent'}`);
-    log(`[RecordingURL] SID=${callSid} → RecordingUrl          : ${recordingUrl ? '✅ ' + recordingUrl.slice(0, 100) + '…' : '❌ absent'}`);
-
+    log(`[RecordingURL][v1] PreSignedRecordingUrl=${preSignedUrl ? '✅' : '❌'} RecordingUrl=${recordingUrl ? '✅' : '❌'}`);
     const url = preSignedUrl || recordingUrl || null;
-    if (!url) log(`[RecordingURL] ⚠️  No recording URL found for SID=${callSid} — not ready yet or call not recorded`);
-    else      log(`[RecordingURL] ✅ Using URL: ${url.slice(0, 100)}…`);
+    if (url) log(`[RecordingURL][v1] ✅ Found via v1: ${url.slice(0, 100)}…`);
+    else     log(`[RecordingURL] ⚠️  No recording URL on either v1 or v2 for SID=${callSid}`);
     return url;
   } catch (e) {
-    if (e.message.includes('404')) log(`[RecordingURL] ⚠️  404 for SID=${callSid} — call not found on Exotel`);
-    else                           log(`[RecordingURL] ❌ Error fetching SID=${callSid}: ${e.message}`);
+    if (e.message.includes('404')) log(`[RecordingURL] ⚠️  404 (v1) for SID=${callSid}`);
+    else                           log(`[RecordingURL] ❌ v1 error for SID=${callSid}: ${e.message}`);
     return null;
   }
 }
-
 // ── Build recording link ──────────────────────────────────────────────────
 function buildRecordingLink(callSid) {
   const link = `${RENDER_URL}/recording/${callSid}`;
@@ -731,10 +795,40 @@ async function pollOnce() {
       if (!call.RecordingUrl) call.RecordingUrl = recUrl;
 
       log(`[Poll] Pushing SID=${callSid} to BX24...`);
-      const activityId = await createBx24CallActivity(call, callSid, null);
+
+      // ── Use callRegistry if available (gives us bx24CallId directly) ──
+      const regEntry = callRegistry.get(callSid);
+      let activityId = null;
+
+      if (regEntry && regEntry.bx24CallId) {
+        log(`[Poll] Found registry entry for SID=${callSid} → using updateBx24CallRecord (bx24CallId=${regEntry.bx24CallId})`);
+        const rawDir   = (call.Direction || '').toLowerCase();
+        const dir      = rawDir.includes('outbound') ? 'outbound' : 'inbound';
+        const fromNum  = call.From || '';
+        const toNum    = call.To   || '';
+        activityId = await updateBx24CallRecord({
+          bx24CallId:  regEntry.bx24CallId,
+          agentBx24Id: regEntry.agentBx24Id || null,
+          agentEmail:  regEntry.agentEmail  || null,
+          callSid,
+          duration:   parseInt(call.Duration || '0'),
+          direction:  dir,
+          status:     call.Status || 'completed',
+          clientNum:  regEntry.phone || (dir === 'outbound' ? toNum : fromNum),
+          fromNum,
+          toNum,
+          callDate:  new Date(call.StartTime || call.DateCreated || Date.now()).toISOString(),
+          endDate:   call.EndTime ? new Date(call.EndTime).toISOString() : undefined
+        });
+      } else {
+        log(`[Poll] No registry entry for SID=${callSid} — using createBx24CallActivity (phone lookup)`);
+        activityId = await createBx24CallActivity(call, callSid, null);
+      }
+
       if (activityId) {
         posted++;
         syncedCallSids.add(callSid);
+        if (regEntry) regEntry.recordingSynced = true;
         persistDedupSids();
         log(`[Poll] ✅ SID=${callSid} → BX24 activityId=${activityId}`);
       } else {
@@ -783,4 +877,4 @@ function init(app) {
   startPolling();
 }
 
-module.exports = { init, scheduleSync, syncRecordings, startPolling, pollOnce, setAgentResolver };
+module.exports = { init, scheduleSync, syncRecordings, startPolling, pollOnce, setAgentResolver, registerCall };
