@@ -748,7 +748,7 @@ async function pollOnce() {
   try {
     // Only look at calls from the last 24 hours to avoid burning quota on old calls
     const sinceDate = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const since = sinceDate.toISOString().replace('T', ' ').slice(0, 19);
+    const since = sinceDate.toISOString().slice(0, 10); // e.g. "2026-06-22"
     log(`[Poll] Fetching calls since ${since}`);
     const [inbound, outbound] = await Promise.all([
       fetchRecentExotelCalls('inbound',      since, null).catch(e => { log(`[Poll] ❌ inbound fetch error: ${e.message}`); return []; }),
