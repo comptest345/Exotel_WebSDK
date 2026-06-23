@@ -1,60 +1,12 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // exotel-recordings.js  ← EDIT ONLY THIS FILE for anything recording-related
 // ═══════════════════════════════════════════════════════════════════════════
-//
-// IMPORTANT — NO AUDIO STREAMING INSIDE BITRIX24.
-// Bitrix24 only ever shows METADATA (call type, caller, agent, start/end time,
-// duration, status, Exotel Call SID, and a "View Recording" link). The
-// recording itself is NEVER stored, proxied, or streamed through our server —
-// clicking "View Recording" redirects the browser straight to a freshly
-// fetched Exotel URL, so it can never expire and we never host any audio.
-//
-// Architecture:
-//   Exotel records call
-//     ↓ server.js /call-callback fires → calls recordings.scheduleSync(...)
-//     ↓ scheduleSync() retries with exponential backoff (2 min → 4 min → 8 min)
-//     ↓ syncRecordings() confirms recording exists — checks RecordingUrl /
-//         PreSignedRecordingUrl already on the call object first (no extra
-//         API call needed), falls back to fetchRecordingUrl() only if absent
-//     ↓ buildRecordingLink() builds a permanent link on OUR server:
-//         GET /recording/:callSid  ← stored in Bitrix24, never the raw Exotel URL
-//     ↓ updateBx24CallRecord() / createBx24CallActivity() write ONLY
-//         metadata + Call SID + the permanent link into Bitrix24
-//     ↓ Bitrix24 timeline card shows: Direction, From, To, Agent, Start,
-//         End, Duration, Status, Call SID, and a clickable "View Recording"
-//     ↓ Agent clicks "View Recording" → GET /recording/:callSid on our server
-//     ↓ recordingRedirectRoute() calls Exotel Call Details API right then,
-//         reads PreSignedRecordingUrl || RecordingUrl, 302-redirects browser.
-//         Nothing is stored or piped through us.
-//
-// Recording URL resolution (official Exotel approach):
-//   GET /Calls/<CallSid>.json
-//   Response: { "Call": { "RecordingUrl": "...", "PreSignedRecordingUrl": "..." } }
-//   PreSignedRecordingUrl is preferred (secure-recording accounts).
-//   Because the URL is fetched fresh on every click, expiring signed URLs
-//   are a non-issue — we never persist a recording URL anywhere.
-//
-// For historical calls (POST/GET /sync-recordings):
-//     ↓ fetchExotelCallsForNumber() or fetchRecentExotelCalls(direction?)
-//         direction filter: 'inbound' | 'outbound-api' | 'inbound,outbound-api,outbound-dial'
-//     ↓ For each call with a recording:
-//         bx24CallId known → updateBx24CallRecord  (update existing timeline entry)
-//         bx24CallId unknown → createBx24CallActivity (create new timeline entry)
-//
-// ── What server.js does for recordings (the ONLY surface you never touch) ──
-//   • require('./exotel-recordings')
-//   • recordings.init(app)              ← registers /recording/:callSid + /sync-recordings
-//   • recordings.scheduleSync({...})    ← called from /call-callback after each call ends
-//
-// Everything else — retry logic, Exotel API calls, BX24 updates, redirect —
-// lives here. Edit only this file.
-// ═══════════════════════════════════════════════════════════════════════════
 
 'use strict';
 
 const fetch = require('node-fetch');
 
-// ── Config (all from env vars — same ones server.js uses) ────────────────
+// ── Config ────────────────────────────────────────────────────────────────
 const ACCOUNT_SID  = process.env.EXOTEL_ACCOUNT_SID || '';
 const API_KEY      = process.env.EXOTEL_API_KEY      || '';
 const API_TOKEN    = process.env.EXOTEL_API_TOKEN    || '';
@@ -66,17 +18,29 @@ const isIndia         = /mum|in1|india/i.test(DOMAIN);
 const EXOTEL_API_HOST = process.env.EXOTEL_API_HOST || (isIndia ? 'api.in.exotel.com' : 'api.exotel.com');
 const EXOTEL_V1_BASE  = `https://${EXOTEL_API_HOST}/v1/Accounts/${ACCOUNT_SID}`;
 
-// ── Retry config — change these to tune how long we wait for Exotel ──────
-// First retry delay: default 30 s (fast feedback in dev/test).
-// Set EXOTEL_RECORDING_DELAY_SEC=120 in env to restore the 2-min production delay.
 const RETRY_FIRST_DELAY_MS = (parseInt(process.env.EXOTEL_RECORDING_DELAY_SEC || '30') * 1000);
-const RETRY_MAX_ATTEMPTS   = 4;               // attempts: 30s → 60s → 120s → 240s
+const RETRY_MAX_ATTEMPTS   = 4;
 
-// ── Injectable agent resolver ────────────────────────────────────────────
-// server.js calls recordings.setAgentResolver(fn) on startup so the poller
-// can resolve a SIP/virtual number or email → { bx24UserId, email } without
-// needing direct access to the usermapping cache.
-// Falls back to null (Unassigned) if not set.
+// ── Logger ────────────────────────────────────────────────────────────────
+function log(msg) { console.log(`[Recordings] [${new Date().toISOString()}] ${msg}`); }
+
+// ── Startup config dump ───────────────────────────────────────────────────
+log('════════════════ STARTUP CONFIG ════════════════');
+log(`  EXOTEL_ACCOUNT_SID : ${ACCOUNT_SID  ? ACCOUNT_SID  : '⚠️  NOT SET'}`);
+log(`  EXOTEL_API_KEY     : ${API_KEY      ? '✅ set'      : '⚠️  NOT SET'}`);
+log(`  EXOTEL_API_TOKEN   : ${API_TOKEN    ? '✅ set'      : '⚠️  NOT SET'}`);
+log(`  BX24_WEBHOOK_URL   : ${BX24_WEBHOOK ? '✅ set'      : '⚠️  NOT SET'}`);
+log(`  EXOTEL_DOMAIN      : ${DOMAIN}`);
+log(`  EXOTEL_API_HOST    : ${EXOTEL_API_HOST}`);
+log(`  EXOTEL_V1_BASE     : ${EXOTEL_V1_BASE}`);
+log(`  RENDER_URL         : ${RENDER_URL}`);
+log(`  RETRY first delay  : ${RETRY_FIRST_DELAY_MS / 1000}s, max attempts: ${RETRY_MAX_ATTEMPTS}`);
+log(`  POLL interval      : ${Math.max(5, parseInt(process.env.EXOTEL_RECORDING_POLL_SEC || '10'))}s`);
+log(`  POLL disabled      : ${process.env.EXOTEL_RECORDING_POLL_DISABLED || 'false'}`);
+log(`  AUTO_CREATE_LEAD   : ${process.env.EXOTEL_AUTO_CREATE_LEAD || 'true (default)'}`);
+log('════════════════════════════════════════════════');
+
+// ── Injectable agent resolver ─────────────────────────────────────────────
 let _agentResolver = null;
 function setAgentResolver(fn) { _agentResolver = fn; }
 async function resolveAgent(fromNum) {
@@ -85,166 +49,198 @@ async function resolveAgent(fromNum) {
   catch (e) { return { bx24UserId: null, email: null }; }
 }
 
-// ── Dedup — prevents posting the same recording twice ───────────────────
-// Persisted to disk so server restarts don't create duplicate BX24 activities.
-const DEDUP_FILE     = process.env.DEDUP_FILE || '/tmp/synced_call_sids.json';
-const syncedCallSids = new Set();
+// ── Dedup ─────────────────────────────────────────────────────────────────
+const DEDUP_FILE      = process.env.DEDUP_FILE || '/tmp/synced_call_sids.json';
+const syncedCallSids  = new Set();
 const bx24UserIdCache = {};
 
-// Load persisted sids on startup (non-fatal if file doesn't exist)
 try {
   const fs   = require('fs');
   const data = JSON.parse(fs.readFileSync(DEDUP_FILE, 'utf8'));
   if (Array.isArray(data)) data.forEach(s => syncedCallSids.add(s));
-  log(`Loaded ${syncedCallSids.size} dedup SIDs from ${DEDUP_FILE}`);
-} catch (_) { /* file doesn't exist yet — that's fine */ }
+  log(`Dedup: loaded ${syncedCallSids.size} already-synced SIDs from ${DEDUP_FILE}`);
+} catch (_) { log('Dedup: no existing file — starting fresh'); }
 
-// Save dedup state after each new SID is added
 function persistDedupSids() {
   try {
     const fs = require('fs');
     fs.writeFileSync(DEDUP_FILE, JSON.stringify([...syncedCallSids]), 'utf8');
-  } catch (e) { log(`Dedup persist failed (non-fatal): ${e.message}`); }
+    log(`Dedup: persisted ${syncedCallSids.size} SIDs to disk`);
+  } catch (e) { log(`Dedup: persist failed (non-fatal): ${e.message}`); }
 }
 
-function log(msg) { console.log('[Recordings]', msg); }
-
-// ── Exotel V1 REST helper ────────────────────────────────────────────────
+// ── Exotel REST helper ────────────────────────────────────────────────────
 async function exotelGet(path, params) {
   if (!ACCOUNT_SID || !API_KEY || !API_TOKEN)
     throw new Error('EXOTEL_ACCOUNT_SID / EXOTEL_API_KEY / EXOTEL_API_TOKEN not set');
+
   const creds = Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
   const qs    = params ? '?' + new URLSearchParams(params).toString() : '';
   const url   = `${EXOTEL_V1_BASE}${path}${qs}`;
-  log(`GET ${url}`);
+
+  log(`[ExotelAPI] → GET ${url}`);
   const res  = await fetch(url, { headers: { Authorization: `Basic ${creds}` } });
   const body = await res.text();
-  if (!res.ok) throw new Error(`Exotel ${path} → HTTP ${res.status}: ${body.slice(0, 300)}`);
-  return JSON.parse(body);
+  log(`[ExotelAPI] ← HTTP ${res.status} for ${path} (body length: ${body.length} chars)`);
+
+  if (!res.ok) {
+    log(`[ExotelAPI] ❌ Error body: ${body.slice(0, 500)}`);
+    throw new Error(`Exotel ${path} → HTTP ${res.status}: ${body.slice(0, 300)}`);
+  }
+
+  try {
+    const parsed = JSON.parse(body);
+    log(`[ExotelAPI] ✅ Parsed JSON OK for ${path}`);
+    return parsed;
+  } catch (e) {
+    log(`[ExotelAPI] ❌ JSON parse failed for ${path}: ${e.message} | raw: ${body.slice(0, 200)}`);
+    throw e;
+  }
 }
 
-// ── Bitrix24 REST helper ─────────────────────────────────────────────────
+// ── Bitrix24 REST helper ──────────────────────────────────────────────────
 async function bx24Call(method, params) {
   if (!BX24_WEBHOOK) throw new Error('BX24_WEBHOOK_URL not set');
+
   const url = `${BX24_WEBHOOK}${method}.json`;
+  log(`[BX24] → POST ${method} | params: ${JSON.stringify(params).slice(0, 300)}`);
+
   const res  = await fetch(url, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify(params)
   });
   const data = await res.json();
-  if (data.error) throw new Error(`BX24 ${method}: ${data.error} — ${data.error_description || ''}`);
+
+  if (data.error) {
+    log(`[BX24] ❌ ${method} failed: error="${data.error}" desc="${data.error_description || ''}"`);
+    throw new Error(`BX24 ${method}: ${data.error} — ${data.error_description || ''}`);
+  }
+
+  log(`[BX24] ✅ ${method} OK | result: ${JSON.stringify(data.result).slice(0, 300)}`);
   return data.result;
 }
 
-// ── BX24 user ID lookup ──────────────────────────────────────────────────
+// ── BX24 user lookup ──────────────────────────────────────────────────────
 async function getBx24UserId(email) {
   if (!email) return null;
   const key = email.toLowerCase();
-  if (bx24UserIdCache[key]) return bx24UserIdCache[key];
+  if (bx24UserIdCache[key]) {
+    log(`[UserLookup] Cache hit: ${email} → ID ${bx24UserIdCache[key]}`);
+    return bx24UserIdCache[key];
+  }
+  log(`[UserLookup] Looking up BX24 user by email: ${email}`);
   try {
     const result = await bx24Call('user.get', { filter: { EMAIL: email } });
     const user   = Array.isArray(result) ? result[0] : result;
     const id     = user && String(user.ID);
-    if (id) { bx24UserIdCache[key] = id; log(`BX24 user ${email} → ID ${id}`); }
+    if (id) {
+      bx24UserIdCache[key] = id;
+      log(`[UserLookup] ✅ ${email} → BX24 ID ${id}`);
+    } else {
+      log(`[UserLookup] ⚠️  No user found in BX24 for email: ${email}`);
+    }
     return id || null;
-  } catch (e) { log(`BX24 user lookup failed for ${email}: ${e.message}`); return null; }
+  } catch (e) {
+    log(`[UserLookup] ❌ Lookup failed for ${email}: ${e.message}`);
+    return null;
+  }
 }
 
-// ── Phone number variants (handles +91, 0, raw digits) ──────────────────
+// ── Phone variants ────────────────────────────────────────────────────────
 function phoneVariants(phoneNumber) {
   const raw    = (phoneNumber || '').trim();
   const digits = raw.replace(/\D/g, '');
-  // Universal: works for any country — no hardcoded country code
   const withPlus  = digits ? `+${digits}` : '';
-  const withPlus2 = raw.startsWith('+') ? raw : '';   // keep original if already E.164
-  // Local number = strip leading country code (1–3 digits), keep last 7–10 digits
+  const withPlus2 = raw.startsWith('+') ? raw : '';
   const local = digits.length > 10 ? digits.slice(digits.length - 10) :
                 digits.length >= 7  ? digits : '';
-  const with0 = local ? `0${local}` : '';             // trunk prefix used in many countries
+  const with0 = local ? `0${local}` : '';
   const seen = new Set();
   const variants = [];
   for (const v of [raw, withPlus, withPlus2, digits, local, with0]) {
     if (v && v.length >= 7 && !seen.has(v)) { seen.add(v); variants.push(v); }
   }
+  log(`[PhoneVariants] "${raw}" → [${variants.join(' | ')}]`);
   return variants;
 }
 
-// ── Find BX24 CRM entity by phone (Lead → Contact → Deal) ───────────────
+// ── Find BX24 entity by phone ─────────────────────────────────────────────
 async function findBx24EntityByPhone(phoneNumber) {
-  if (!phoneNumber) return null;
+  if (!phoneNumber) { log('[EntitySearch] ⚠️  phoneNumber is empty — returning null'); return null; }
   const variants = phoneVariants(phoneNumber);
+  log(`[EntitySearch] Searching for "${phoneNumber}" with ${variants.length} variants`);
 
+  // 1) Try leads
   for (const num of variants) {
     try {
-      const result = await bx24Call('crm.lead.list', {
-        filter: { PHONE: num }, select: ['ID', 'TITLE', 'PHONE']
-      });
-      const items = Array.isArray(result) ? result : [];
+      const result = await bx24Call('crm.lead.list', { filter: { PHONE: num }, select: ['ID', 'TITLE', 'PHONE'] });
+      const items  = Array.isArray(result) ? result : [];
+      log(`[EntitySearch] crm.lead.list variant="${num}" → ${items.length} result(s)`);
       if (items.length > 0) {
-        log(`Found LEAD ID=${items[0].ID} for ${num}`);
+        log(`[EntitySearch] ✅ Matched LEAD ID=${items[0].ID} for variant "${num}"`);
         return { entityType: 'LEAD', entityId: String(items[0].ID) };
       }
-    } catch (e) { log(`crm.lead.list failed for ${num}: ${e.message}`); }
+    } catch (e) { log(`[EntitySearch] crm.lead.list error for "${num}": ${e.message}`); }
   }
 
+  // 2) Try contacts
   let contactId = null;
   for (const num of variants) {
     try {
-      const result = await bx24Call('crm.contact.list', {
-        filter: { PHONE: num }, select: ['ID', 'NAME', 'PHONE']
-      });
-      const items = Array.isArray(result) ? result : [];
+      const result = await bx24Call('crm.contact.list', { filter: { PHONE: num }, select: ['ID', 'NAME', 'PHONE'] });
+      const items  = Array.isArray(result) ? result : [];
+      log(`[EntitySearch] crm.contact.list variant="${num}" → ${items.length} result(s)`);
       if (items.length > 0) {
         contactId = String(items[0].ID);
-        log(`Found CONTACT ID=${contactId} for ${num}`);
+        log(`[EntitySearch] ✅ Matched CONTACT ID=${contactId} for variant "${num}"`);
         break;
       }
-    } catch (e) { log(`crm.contact.list failed for ${num}: ${e.message}`); }
+    } catch (e) { log(`[EntitySearch] crm.contact.list error for "${num}": ${e.message}`); }
   }
 
+  // 3) Contact found — try to escalate to open deal
   if (contactId) {
     try {
-      const deals = await bx24Call('crm.deal.list', {
-        filter: { CONTACT_ID: contactId, CLOSED: 'N' },
-        select: ['ID', 'TITLE'],
-        order:  { DATE_MODIFY: 'DESC' }
-      });
+      const deals    = await bx24Call('crm.deal.list', { filter: { CONTACT_ID: contactId, CLOSED: 'N' }, select: ['ID', 'TITLE'], order: { DATE_MODIFY: 'DESC' } });
       const dealList = Array.isArray(deals) ? deals : [];
+      log(`[EntitySearch] crm.deal.list for CONTACT ${contactId} → ${dealList.length} open deal(s)`);
       if (dealList.length > 0) {
-        log(`Found DEAL ID=${dealList[0].ID} (linked to CONTACT ${contactId})`);
+        log(`[EntitySearch] ✅ Escalating to DEAL ID=${dealList[0].ID}`);
         return { entityType: 'DEAL', entityId: String(dealList[0].ID) };
       }
-    } catch (e) { log(`crm.deal.list failed for CONTACT ${contactId}: ${e.message}`); }
+    } catch (e) { log(`[EntitySearch] crm.deal.list error for CONTACT ${contactId}: ${e.message}`); }
+    log(`[EntitySearch] ✅ Using CONTACT ID=${contactId} (no open deal)`);
     return { entityType: 'CONTACT', entityId: contactId };
   }
 
-  // No existing entity — auto-create a Lead so the call appears in the timeline.
-  // Set EXOTEL_AUTO_CREATE_LEAD=false in env to disable this behaviour.
+  // 4) Nothing found — auto-create lead?
+  log(`[EntitySearch] ⚠️  No lead/contact/deal found for "${phoneNumber}" across all variants`);
   if (process.env.EXOTEL_AUTO_CREATE_LEAD === 'false') {
-    log(`No BX24 entity found for ${phoneNumber} — auto-create disabled`);
+    log(`[EntitySearch] Auto-create disabled — returning null`);
     return null;
   }
   try {
+    log(`[EntitySearch] Auto-creating LEAD for ${phoneNumber}...`);
     const newLead = await bx24Call('crm.lead.add', {
       fields: {
-        TITLE:  `Exotel Call — ${phoneNumber}`,
-        PHONE:  [{ VALUE: phoneNumber, VALUE_TYPE: 'WORK' }],
+        TITLE:     `Exotel Call — ${phoneNumber}`,
+        PHONE:     [{ VALUE: phoneNumber, VALUE_TYPE: 'WORK' }],
         STATUS_ID: 'NEW',
         SOURCE_ID: 'CALL'
       }
     });
-    const leadId = String(newLead);
-    log(`Auto-created LEAD ID=${leadId} for unknown number ${phoneNumber}`);
-    return { entityType: 'LEAD', entityId: leadId };
+    log(`[EntitySearch] ✅ Auto-created LEAD ID=${String(newLead)} for ${phoneNumber}`);
+    return { entityType: 'LEAD', entityId: String(newLead) };
   } catch (e) {
-    log(`Auto-create Lead failed for ${phoneNumber}: ${e.message}`);
+    log(`[EntitySearch] ❌ Auto-create failed for ${phoneNumber}: ${e.message}`);
     return null;
   }
 }
 
-// ── Fetch Exotel calls for a specific number ─────────────────────────────
+// ── Fetch Exotel calls for a specific number ──────────────────────────────
 async function fetchExotelCallsForNumber(phoneNumber) {
+  log(`[FetchCalls] Fetching all calls for number: ${phoneNumber}`);
   const calls = new Map();
   for (const field of ['From', 'To']) {
     try {
@@ -252,65 +248,80 @@ async function fetchExotelCallsForNumber(phoneNumber) {
       const list = (data?.TwilioResponse?.Calls?.Call) || [];
       const arr  = Array.isArray(list) ? list : [list];
       arr.forEach(c => { if (c && c.Sid) calls.set(c.Sid, c); });
-      log(`Exotel /Calls?${field}=${phoneNumber} → ${arr.length} result(s)`);
-    } catch (e) { log(`Exotel calls fetch (${field}=${phoneNumber}) failed: ${e.message}`); }
+      log(`[FetchCalls] ${field}=${phoneNumber} → ${arr.length} call(s)`);
+      arr.forEach(c => {
+        if (c && c.Sid)
+          log(`[FetchCalls]   SID=${c.Sid} Dir=${c.Direction} Status=${c.Status} Dur=${c.Duration}s | RecordingUrl=${c.RecordingUrl ? '✅' : '❌'} PreSigned=${c.PreSignedRecordingUrl ? '✅' : '❌'}`);
+      });
+    } catch (e) { log(`[FetchCalls] ❌ ${field}=${phoneNumber} fetch failed: ${e.message}`); }
   }
+  log(`[FetchCalls] Total unique calls for ${phoneNumber}: ${calls.size}`);
   return Array.from(calls.values());
 }
 
-// Fetch recent calls, optionally filtered by direction.
-// direction may be a single string or comma-separated list, e.g.:
-//   'inbound'  |  'outbound-api'  |  'inbound,outbound-api,outbound-dial'
+// ── Fetch recent calls by direction ──────────────────────────────────────
 async function fetchRecentExotelCalls(direction, fromDate, toDate) {
+  log(`[FetchCalls] Fetching recent calls | direction=${direction || 'all'} from=${fromDate || '-'} to=${toDate || '-'}`);
   try {
     const params = { PageSize: 200 };
     if (direction) params.Direction = direction;
-    // Date format Exotel expects: YYYY-MM-DD HH:MM:SS (URL-encoded)
-    if (fromDate) params.DateCreated = fromDate;   // e.g. '2026-06-01'
-    if (toDate)   params.DateUpdated = toDate;
+    if (fromDate)  params.DateCreated = fromDate;
+    if (toDate)    params.DateUpdated = toDate;
     const data = await exotelGet('/Calls.json', params);
     const list = (data?.TwilioResponse?.Calls?.Call) || [];
     const arr  = Array.isArray(list) ? list : [list];
-    log(`Exotel /Calls (direction=${direction || 'all'} from=${fromDate || '-'} to=${toDate || '-'}) → ${arr.length} result(s)`);
+    log(`[FetchCalls] direction=${direction || 'all'} → ${arr.length} call(s) total`);
+    // Show recording presence for first 10
+    arr.slice(0, 10).forEach(c => {
+      if (c && c.Sid)
+        log(`[FetchCalls]   SID=${c.Sid} Dir=${c.Direction} Status=${c.Status} Dur=${c.Duration}s | RecordingUrl=${c.RecordingUrl ? '✅' : '❌'} PreSigned=${c.PreSignedRecordingUrl ? '✅' : '❌'}`);
+    });
+    if (arr.length > 10) log(`[FetchCalls]   ... and ${arr.length - 10} more`);
     return arr;
-  } catch (e) { log(`Exotel all-calls fetch failed: ${e.message}`); return []; }
+  } catch (e) {
+    log(`[FetchCalls] ❌ Fetch failed for direction=${direction || 'all'}: ${e.message}`);
+    return [];
+  }
 }
 
-// ── Fetch recording URL from Exotel (via Call Details API) ───────────────
-// Uses GET /Calls/<CallSid>.json — the official way to retrieve recordings.
-// Prefers PreSignedRecordingUrl (secure accounts) over RecordingUrl.
-// Returns null if the call has no recording yet.
+// ── Fetch recording URL for a single call SID ─────────────────────────────
 async function fetchRecordingUrl(callSid) {
+  log(`[RecordingURL] Fetching call detail for SID=${callSid}`);
   try {
     const data = await exotelGet(`/Calls/${callSid}.json`);
     const call = data?.TwilioResponse?.Call || data?.Call || {};
-    const url  = call.PreSignedRecordingUrl || call.RecordingUrl || null;
-    if (url) log(`Recording URL for ${callSid}: ${url.slice(0, 80)}…`);
-    return url || null;
+
+    log(`[RecordingURL] Fields present in call object: [${Object.keys(call).join(', ')}]`);
+
+    const preSignedUrl = call.PreSignedRecordingUrl || null;
+    const recordingUrl = call.RecordingUrl          || null;
+
+    log(`[RecordingURL] SID=${callSid} → PreSignedRecordingUrl : ${preSignedUrl ? '✅ ' + preSignedUrl.slice(0, 100) + '…' : '❌ absent'}`);
+    log(`[RecordingURL] SID=${callSid} → RecordingUrl          : ${recordingUrl ? '✅ ' + recordingUrl.slice(0, 100) + '…' : '❌ absent'}`);
+
+    const url = preSignedUrl || recordingUrl || null;
+    if (!url) log(`[RecordingURL] ⚠️  No recording URL found for SID=${callSid} — not ready yet or call not recorded`);
+    else      log(`[RecordingURL] ✅ Using URL: ${url.slice(0, 100)}…`);
+    return url;
   } catch (e) {
-    if (!e.message.includes('404')) log(`Recording fetch failed for ${callSid}: ${e.message}`);
+    if (e.message.includes('404')) log(`[RecordingURL] ⚠️  404 for SID=${callSid} — call not found on Exotel`);
+    else                           log(`[RecordingURL] ❌ Error fetching SID=${callSid}: ${e.message}`);
     return null;
   }
 }
 
-// ── Build permanent "View Recording" link ────────────────────────────────
-// Points to our own GET /recording/:callSid.
-// This is what gets stored in Bitrix24 — NEVER the raw Exotel URL.
-// Clicking it does a 302-redirect to a freshly fetched Exotel URL on demand.
+// ── Build recording link ──────────────────────────────────────────────────
 function buildRecordingLink(callSid) {
-  return `${RENDER_URL}/recording/${callSid}`;
+  const link = `${RENDER_URL}/recording/${callSid}`;
+  log(`[RecordingLink] Built permanent link: ${link}`);
+  return link;
 }
 
 function getOwnerTypeId(entityType) {
   return { LEAD: 1, DEAL: 2, CONTACT: 3 }[entityType] || 3;
 }
 
-// ── Update existing BX24 telephony call record ───────────────────────────
-// Used for new calls where telephony.externalcall.register was already called.
-// Attaches the permanent "View Recording" link via telephony.externalcall.hide,
-// then (always) creates a metadata activity card on the CRM entity so agents
-// can see all fields: Direction, From, To, Agent, Start, End, Duration, Status,
-// Call SID, and a clickable View Recording link.
+// ── Update existing BX24 telephony record ─────────────────────────────────
 async function updateBx24CallRecord({
   bx24CallId, agentBx24Id, agentEmail, callSid,
   duration, direction, status,
@@ -318,12 +329,14 @@ async function updateBx24CallRecord({
   callDate, endDate
 }) {
   const recordingLink = buildRecordingLink(callSid);
-  log(`Updating BX24 call CALL_ID=${bx24CallId} — recording link: ${recordingLink}`);
+  log(`[UpdateBX24] ── updateBx24CallRecord START ──`);
+  log(`[UpdateBX24] CALL_ID=${bx24CallId} | SID=${callSid} | direction=${direction}`);
+  log(`[UpdateBX24] agent BX24 ID=${agentBx24Id || 'N/A'} | email=${agentEmail || 'N/A'}`);
+  log(`[UpdateBX24] from=${fromNum} | to=${toNum} | clientNum=${clientNum} | duration=${duration}s`);
+  log(`[UpdateBX24] recordingLink=${recordingLink}`);
 
-  // Attach recording link by calling telephony.externalcall.finish again with RECORD_URL.
-  // telephony.externalcall.hide is a no-op once finish has already been called (which
-  // server.js does immediately on call end). Calling finish a second time with RECORD_URL
-  // is the correct Bitrix24 way to retrofit the recording link onto a closed telephony entry.
+  // Step 1: retrofit recording link onto the closed telephony entry
+  log(`[UpdateBX24] Step 1: calling telephony.externalcall.finish with RECORD_URL...`);
   try {
     await bx24Call('telephony.externalcall.finish', {
       CALL_ID:     bx24CallId,
@@ -332,12 +345,13 @@ async function updateBx24CallRecord({
       STATUS_CODE: 200,
       RECORD_URL:  recordingLink
     });
-    log(`BX24 telephony.externalcall.finish (with RECORD_URL) OK — CALL_ID=${bx24CallId}`);
+    log(`[UpdateBX24] ✅ telephony.externalcall.finish with RECORD_URL succeeded`);
   } catch (e) {
-    log(`telephony.externalcall.finish (RECORD_URL update) failed (${e.message}) — continuing to activity card`);
+    log(`[UpdateBX24] ⚠️  telephony.externalcall.finish failed: ${e.message} — continuing to activity card`);
   }
 
-  // Always also create a metadata activity card so agents see all fields.
+  // Step 2: create metadata activity card
+  log(`[UpdateBX24] Step 2: creating metadata activity card for clientNum=${clientNum}...`);
   const mins = Math.floor((duration || 0) / 60);
   const secs = (duration || 0) % 60;
   const fmtDate = d => { try { return new Date(d).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true}); } catch(_){ return d; } };
@@ -356,9 +370,10 @@ async function updateBx24CallRecord({
 
   const entity = await findBx24EntityByPhone(clientNum);
   if (!entity) {
-    log(`⚠️  No BX24 entity for ${clientNum} and auto-create is off — activity NOT posted to timeline`);
+    log(`[UpdateBX24] ❌ No BX24 entity for clientNum=${clientNum} — activity NOT posted`);
     return bx24CallId;
   }
+  log(`[UpdateBX24] Entity resolved: ${entity.entityType} ID=${entity.entityId}`);
 
   try {
     const result = await bx24Call('crm.activity.add', { fields: {
@@ -367,7 +382,7 @@ async function updateBx24CallRecord({
       TYPE_ID:          2,
       SUBJECT:          `📞 ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call — ${clientNum}`,
       DESCRIPTION:      desc,
-      DESCRIPTION_TYPE: 3,   // HTML — renders <a href> as clickable link in modern BX24
+      DESCRIPTION_TYPE: 3,
       DIRECTION:        direction === 'outbound' ? 2 : 1,
       DURATION:         duration || 0,
       START_TIME:       callDate,
@@ -376,18 +391,15 @@ async function updateBx24CallRecord({
       RESPONSIBLE_ID:   agentBx24Id || '1',
       COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }]
     }});
-    log(`BX24 metadata activity created: ID=${result} on ${entity.entityType}=${entity.entityId}`);
+    log(`[UpdateBX24] ✅ crm.activity.add OK — activityId=${result} on ${entity.entityType}=${entity.entityId}`);
     return result;
   } catch (e) {
-    log(`BX24 crm.activity.add (update path) failed: ${e.message}`);
+    log(`[UpdateBX24] ❌ crm.activity.add failed: ${e.message}`);
   }
   return bx24CallId;
 }
 
-// ── Create new BX24 call activity (historical / unregistered calls) ──────
-// Used when telephony.externalcall.register was never called for this call.
-// Stores ONLY metadata + the permanent "View Recording" link — never the raw
-// Exotel URL. The activity description is BBCode so the link is clickable.
+// ── Create new BX24 call activity (historical / unregistered calls) ────────
 async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   const fromNum   = call.From || '';
   const toNum     = call.To   || '';
@@ -404,12 +416,19 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   const mins = Math.floor(duration / 60);
   const secs = duration % 60;
 
-  // Try to resolve agent from the agentPhone field (outbound: From is virtual number)
-  // or fall back to the injected resolver if agentBx24UserId not passed directly.
+  log(`[CreateActivity] ── createBx24CallActivity START ──`);
+  log(`[CreateActivity] SID=${callSid} | direction=${direction} | clientNum=${clientNum}`);
+  log(`[CreateActivity] from=${fromNum} | to=${toNum} | duration=${duration}s | status=${status}`);
+  log(`[CreateActivity] callDate=${callDate} | endDate=${endDate}`);
+  log(`[CreateActivity] recordingLink=${recordingLink}`);
+  log(`[CreateActivity] agentBx24UserId passed in: ${agentBx24UserId || 'null — will try resolver'}`);
+
   const agentPhone = direction === 'outbound' ? (call.VirtualNumberUsed || fromNum) : (call.To || toNum);
+  log(`[CreateActivity] agentPhone for resolver: ${agentPhone}`);
   const resolved   = agentBx24UserId ? { bx24UserId: agentBx24UserId, email: null } : await resolveAgent(agentPhone);
   const resolvedId = resolved.bx24UserId || null;
   const agentLabel = resolved.email || (resolvedId ? `User #${resolvedId}` : call.AgentEmail || 'Unassigned');
+  log(`[CreateActivity] resolvedId=${resolvedId || 'null'} | agentLabel="${agentLabel}"`);
 
   const fmtDate = d => { try { return new Date(d).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true}); } catch(_){ return d; } };
   const desc =
@@ -425,18 +444,21 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
     `Call SID  : ${callSid}\n\n` +
     `Recording : <a href="${recordingLink}">▶ View Recording</a>`;
 
+  log(`[CreateActivity] Looking up BX24 entity for clientNum=${clientNum}...`);
   const entity = await findBx24EntityByPhone(clientNum);
   if (!entity) {
-    log(`⚠️  No BX24 entity for ${clientNum} (CallSid=${callSid}) and auto-create is off — activity NOT posted to timeline`);
+    log(`[CreateActivity] ❌ No BX24 entity for ${clientNum} (SID=${callSid}) — activity NOT posted`);
     return null;
   }
+  log(`[CreateActivity] Entity resolved: ${entity.entityType} ID=${entity.entityId}`);
 
   const ownerTypeId   = getOwnerTypeId(entity.entityType);
   const responsibleId = resolvedId || '1';
   const bx24Direction = direction === 'outbound' ? 2 : 1;
   const subject       = `📞 ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call — ${clientNum}`;
 
-  // Try TYPE_ID=2 (native phone call activity)
+  // Attempt TYPE_ID=2 (native phone call)
+  log(`[CreateActivity] Attempting crm.activity.add with TYPE_ID=2...`);
   try {
     const result = await bx24Call('crm.activity.add', { fields: {
       OWNER_TYPE_ID:    ownerTypeId,
@@ -444,7 +466,7 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
       TYPE_ID:          2,
       SUBJECT:          subject,
       DESCRIPTION:      desc,
-      DESCRIPTION_TYPE: 3,   // HTML — renders <a href> as clickable link in modern BX24
+      DESCRIPTION_TYPE: 3,
       DIRECTION:        bx24Direction,
       DURATION:         duration,
       START_TIME:       callDate,
@@ -453,13 +475,14 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
       RESPONSIBLE_ID:   responsibleId,
       COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }]
     }});
-    log(`BX24 activity (TYPE_ID=2, ${direction}) created: ID=${result} on ${entity.entityType}=${entity.entityId}`);
+    log(`[CreateActivity] ✅ TYPE_ID=2 succeeded — activityId=${result} on ${entity.entityType}=${entity.entityId}`);
     return result;
   } catch (e) {
-    log(`TYPE_ID=2 rejected (${e.message}) — falling back to TYPE_ID=4`);
+    log(`[CreateActivity] ⚠️  TYPE_ID=2 rejected: ${e.message} — falling back to TYPE_ID=4`);
   }
 
-  // Fallback: TYPE_ID=4 (custom activity — always accepted by BX24)
+  // Fallback TYPE_ID=4
+  log(`[CreateActivity] Attempting crm.activity.add with TYPE_ID=4 (fallback)...`);
   try {
     const result = await bx24Call('crm.activity.add', { fields: {
       OWNER_TYPE_ID:    ownerTypeId,
@@ -473,59 +496,76 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
       COMPLETED:        'Y',
       RESPONSIBLE_ID:   responsibleId
     }});
-    log(`BX24 activity (TYPE_ID=4 fallback, ${direction}) created: ID=${result}`);
+    log(`[CreateActivity] ✅ TYPE_ID=4 fallback succeeded — activityId=${result}`);
     return result;
   } catch (e) {
-    log(`BX24 crm.activity.add failed entirely for ${callSid}: ${e.message}`);
+    log(`[CreateActivity] ❌ Both TYPE_ID=2 and TYPE_ID=4 failed for SID=${callSid}: ${e.message}`);
     return null;
   }
 }
 
-// ── syncRecordings ───────────────────────────────────────────────────────
-// Called by scheduleSync() for new calls, and directly by /sync-recordings for historical ones.
-// Parameters:
-//   phoneNumber  — client phone number (fetch calls from Exotel + find CRM entity)
-//   agentEmail   — agent email (BX24 user ID lookup)
-//   callSid      — specific Exotel CallSid we're retrying (hint: don't permanently skip)
-//   bx24CallId   — BX24 CALL_ID if telephony.externalcall.register was already called
-//   agentBx24Id  — BX24 numeric user ID (skips lookup when already known)
-//   direction    — optional direction filter for bulk fetch: 'inbound', 'outbound-api',
-//                  or comma-separated e.g. 'inbound,outbound-api,outbound-dial'
+// ── syncRecordings ────────────────────────────────────────────────────────
 async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24CallId, agentBx24Id, direction, fromDate, toDate } = {}) {
+  log(`[Sync] ════════════════ syncRecordings START ════════════════`);
+  log(`[Sync] phoneNumber=${phoneNumber || '(all)'} | agentEmail=${agentEmail || 'N/A'}`);
+  log(`[Sync] hintSid=${hintSid || 'N/A'} | bx24CallId=${bx24CallId || 'N/A'} | agentBx24Id=${agentBx24Id || 'N/A'}`);
+  log(`[Sync] direction=${direction || '(all)'} | fromDate=${fromDate || '-'} | toDate=${toDate || '-'}`);
+
   const results = { processed: 0, recorded: 0, posted: 0, skipped: 0, errors: [] };
 
   const resolvedAgentId = agentBx24Id || (agentEmail ? await getBx24UserId(agentEmail) : null);
+  log(`[Sync] resolvedAgentId=${resolvedAgentId || 'null'}`);
 
   const calls = phoneNumber
     ? await fetchExotelCallsForNumber(phoneNumber)
     : await fetchRecentExotelCalls(direction, fromDate, toDate);
 
   results.processed = calls.length;
-  log(`Processing ${calls.length} call(s)` + (phoneNumber ? ` for ${phoneNumber}` : ' (all recent)'));
+  log(`[Sync] Total calls to process: ${calls.length}`);
 
   for (const call of calls) {
     const callSid = call.Sid || '';
-    if (!callSid) continue;
-    if (syncedCallSids.has(callSid)) { results.skipped++; continue; }
+    if (!callSid) { log(`[Sync] ⚠️  Skipping call with no Sid`); continue; }
 
-    // Check recording existence from the already-fetched call object first
-    // (most Exotel list responses include RecordingUrl / PreSignedRecordingUrl).
-    // Only fall back to a per-call API hit if neither field is present.
-    let recordingExists = !!(call.RecordingUrl || call.PreSignedRecordingUrl);
-    if (!recordingExists) recordingExists = !!(await fetchRecordingUrl(callSid));
-
-    if (!recordingExists) {
-      // Don't permanently skip the hint call — it may just not be ready yet
-      if (callSid !== hintSid) syncedCallSids.add(callSid);
+    if (syncedCallSids.has(callSid)) {
+      log(`[Sync] ⏭️  SID=${callSid} already in dedup set — skipping`);
       results.skipped++;
       continue;
     }
+
+    log(`[Sync] ── Checking SID=${callSid} (Dir=${call.Direction} Status=${call.Status} Dur=${call.Duration}s) ──`);
+
+    // Check if recording exists — prefer fields already in the list response
+    let recordingExists = !!(call.RecordingUrl || call.PreSignedRecordingUrl);
+    if (recordingExists) {
+      log(`[Sync] Recording URL already in list response for SID=${callSid} ✅ — skipping per-call fetch`);
+    } else {
+      log(`[Sync] No recording URL in list response for SID=${callSid} — calling per-call API...`);
+      const fetched = await fetchRecordingUrl(callSid);
+      recordingExists = !!fetched;
+      log(`[Sync] Per-call fetch for SID=${callSid}: ${recordingExists ? '✅ recording exists' : '❌ no recording yet'}`);
+    }
+
+    if (!recordingExists) {
+      if (callSid !== hintSid) {
+        log(`[Sync] SID=${callSid} has no recording — adding to dedup so we don't re-check`);
+        syncedCallSids.add(callSid);
+      } else {
+        log(`[Sync] SID=${callSid} is the hint call — NOT adding to dedup so next attempt can retry`);
+      }
+      results.skipped++;
+      continue;
+    }
+
     results.recorded++;
+    log(`[Sync] ✅ Recording confirmed for SID=${callSid}`);
+
+    const isRegisteredCall = bx24CallId && callSid === hintSid;
+    log(`[Sync] Path: ${isRegisteredCall ? 'UPDATE (telephony already registered)' : 'CREATE (historical/unregistered)'}`);
 
     let activityId = null;
 
-    if (bx24CallId && callSid === hintSid) {
-      // New call: telephony.externalcall.register was already called → update it
+    if (isRegisteredCall) {
       const rawDir    = (call.Direction || '').toLowerCase();
       const dir       = rawDir.includes('outbound') ? 'outbound' : 'inbound';
       const fromNum   = call.From || '';
@@ -551,57 +591,60 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
         endDate:  endTime ? new Date(endTime).toISOString() : undefined
       });
     } else {
-      // Historical call: no prior BX24 registration → create a fresh activity
       activityId = await createBx24CallActivity(call, callSid, resolvedAgentId);
     }
+
+    log(`[Sync] activityId returned for SID=${callSid}: ${activityId !== null && activityId !== undefined ? activityId : '❌ null/undefined — post FAILED'}`);
 
     if (activityId) {
       results.posted++;
       syncedCallSids.add(callSid);
       persistDedupSids();
+      log(`[Sync] ✅ SID=${callSid} posted to BX24 and added to dedup`);
     } else {
-      results.errors.push({ callSid, reason: 'BX24 update/create failed' });
+      log(`[Sync] ❌ Failed to push SID=${callSid} to BX24`);
+      results.errors.push({ callSid, reason: 'BX24 update/create returned null' });
     }
   }
 
-  log(`Sync complete: ${JSON.stringify(results)}`);
+  log(`[Sync] ════════ DONE: processed=${results.processed} recorded=${results.recorded} posted=${results.posted} skipped=${results.skipped} errors=${results.errors.length} ════════`);
+  if (results.errors.length > 0) log(`[Sync] Errors: ${JSON.stringify(results.errors)}`);
   return results;
 }
 
-// ── scheduleSync ─────────────────────────────────────────────────────────
-// Called from server.js /call-callback after every call ends.
-// Handles the entire retry loop with exponential backoff internally —
-// server.js never needs to know about retries or timing.
-//
-// Usage in server.js:
-//   recordings.scheduleSync({ clientNum, agentEmail: finishEmail, callSid: sid,
-//                             bx24CallId: finishBx24Id, agentBx24Id: finishAgentId,
-//                             onSuccess: () => delete outboundCallMap[sid] });
+// ── scheduleSync ──────────────────────────────────────────────────────────
 function scheduleSync({ clientNum, agentEmail, callSid, bx24CallId, agentBx24Id, onSuccess } = {}) {
-  if (!clientNum) return;
+  if (!clientNum) {
+    log(`[ScheduleSync] ⚠️  clientNum missing — aborting`);
+    return;
+  }
+  log(`[ScheduleSync] Scheduled for clientNum=${clientNum} | SID=${callSid || 'N/A'} | bx24CallId=${bx24CallId || 'N/A'}`);
+  log(`[ScheduleSync] First attempt in ${RETRY_FIRST_DELAY_MS / 1000}s, max ${RETRY_MAX_ATTEMPTS} attempts`);
 
   function attempt(delayMs, attemptNum) {
     setTimeout(async () => {
+      log(`[ScheduleSync] ── Attempt ${attemptNum}/${RETRY_MAX_ATTEMPTS} for ${clientNum} (waited ${delayMs / 1000}s) ──`);
       try {
-        log(`Recording sync attempt ${attemptNum} for ${clientNum} (delay ${delayMs / 1000}s)`);
-        const result = await syncRecordings({
-          phoneNumber: clientNum,
-          agentEmail,
-          callSid,
-          bx24CallId,
-          agentBx24Id
-        });
+        const result = await syncRecordings({ phoneNumber: clientNum, agentEmail, callSid, bx24CallId, agentBx24Id });
+        log(`[ScheduleSync] Attempt ${attemptNum} → processed=${result.processed} posted=${result.posted} skipped=${result.skipped} errors=${result.errors.length}`);
         if (result && result.posted > 0) {
-          log(`Recording synced on attempt ${attemptNum}: ${JSON.stringify(result)}`);
+          log(`[ScheduleSync] ✅ Success on attempt ${attemptNum} for ${clientNum}`);
           if (onSuccess) onSuccess();
         } else if (attemptNum < RETRY_MAX_ATTEMPTS) {
-          attempt(delayMs * 2, attemptNum + 1); // exponential: 2min → 4min → 8min
+          const nextDelay = delayMs * 2;
+          log(`[ScheduleSync] ⏳ Not posted — scheduling attempt ${attemptNum + 1} in ${nextDelay / 1000}s`);
+          attempt(nextDelay, attemptNum + 1);
         } else {
-          log(`Recording not found after ${attemptNum} attempts for ${clientNum}`);
+          log(`[ScheduleSync] ❌ Gave up after ${attemptNum} attempts for ${clientNum} — recording may not exist`);
           if (onSuccess) onSuccess();
         }
       } catch (e) {
-        log(`Recording sync attempt ${attemptNum} failed: ${e.message}`);
+        log(`[ScheduleSync] ❌ Attempt ${attemptNum} threw: ${e.message}`);
+        if (attemptNum < RETRY_MAX_ATTEMPTS) {
+          const nextDelay = delayMs * 2;
+          log(`[ScheduleSync] Scheduling retry ${attemptNum + 1} in ${nextDelay / 1000}s`);
+          attempt(nextDelay, attemptNum + 1);
+        }
       }
     }, delayMs);
   }
@@ -609,91 +652,89 @@ function scheduleSync({ clientNum, agentEmail, callSid, bx24CallId, agentBx24Id,
   attempt(RETRY_FIRST_DELAY_MS, 1);
 }
 
-// ── GET /recording/:callSid — "View Recording" redirect ─────────────────
-// NO AUDIO IS STREAMED OR STORED HERE.
-// On every click, fetches Call Details API fresh and 302-redirects the browser
-// straight to Exotel's RecordingUrl / PreSignedRecordingUrl.
-// Because the URL is fetched at click-time, it can never have expired.
-// We never persist a recording URL anywhere — not in Bitrix24, not in memory.
+// ── GET /recording/:callSid ───────────────────────────────────────────────
 function recordingRedirectRoute(app) {
   app.get('/recording/:callSid', async (req, res) => {
     const { callSid } = req.params;
+    log(`[Redirect] ── /recording/${callSid} hit ──`);
     if (!callSid) return res.status(400).send('callSid required');
 
     try {
+      log(`[Redirect] Fetching fresh recording URL from Exotel for SID=${callSid}...`);
       const audioUrl = await fetchRecordingUrl(callSid);
       if (!audioUrl) {
-        log(`[Redirect] No recording URL available yet for ${callSid}`);
+        log(`[Redirect] ❌ No recording URL for SID=${callSid} — returning 404`);
         return res.status(404).send('No recording available yet');
       }
-      log(`[Redirect] ${callSid} → ${audioUrl.slice(0, 80)}…`);
-
-      // 302 temporary redirect — browser goes straight to Exotel.
-      // Nothing is read, stored, or piped through our server.
+      log(`[Redirect] ✅ 302 → ${audioUrl.slice(0, 100)}…`);
       res.redirect(302, audioUrl);
     } catch (e) {
-      log(`[Redirect] Error for ${callSid}: ${e.message}`);
+      log(`[Redirect] ❌ Error for SID=${callSid}: ${e.message}`);
       if (!res.headersSent) res.status(500).send('Lookup error');
     }
   });
 }
 
-// ── Continuous recording poller ──────────────────────────────────────────
-// Runs every POLL_INTERVAL_MS (default 10 s). Fetches the last 50 calls from
-// Exotel (both inbound and outbound) and immediately posts any call that has a
-// recording and hasn't been synced yet to Bitrix24 — no webhook dependency,
-// no exponential backoff, no waiting.
-//
-// Set EXOTEL_RECORDING_POLL_SEC=10 in env to control interval (min 5 s).
-// Set EXOTEL_RECORDING_POLL_DISABLED=true to disable if you only want manual sync.
+// ── Continuous recording poller ───────────────────────────────────────────
 const POLL_INTERVAL_MS = Math.max(5, parseInt(process.env.EXOTEL_RECORDING_POLL_SEC || '10')) * 1000;
 let   _pollActive = false;
 
 async function pollOnce() {
-  if (_pollActive) return; // skip if previous run still in progress
+  if (_pollActive) { log(`[Poll] Skipping — previous poll still in progress`); return; }
   _pollActive = true;
+  log(`[Poll] ── Poll cycle START ──`);
   try {
-    // Fetch last 50 calls of each direction — covers both Incoming and Outgoing
     const [inbound, outbound] = await Promise.all([
-      fetchRecentExotelCalls('inbound',      null, null).catch(() => []),
-      fetchRecentExotelCalls('outbound-api', null, null).catch(() => [])
+      fetchRecentExotelCalls('inbound',      null, null).catch(e => { log(`[Poll] ❌ inbound fetch error: ${e.message}`); return []; }),
+      fetchRecentExotelCalls('outbound-api', null, null).catch(e => { log(`[Poll] ❌ outbound fetch error: ${e.message}`); return []; })
     ]);
+    log(`[Poll] Fetched: inbound=${inbound.length} outbound=${outbound.length}`);
 
-    // Deduplicate by Sid
     const seen = new Set();
     const calls = [];
     for (const c of [...inbound, ...outbound]) {
       if (c && c.Sid && !seen.has(c.Sid)) { seen.add(c.Sid); calls.push(c); }
     }
+    log(`[Poll] Unique calls after merge+dedup: ${calls.length}`);
 
-    let posted = 0;
+    let alreadySynced = 0, noRecording = 0, posted = 0, failed = 0;
+
     for (const call of calls) {
       const callSid = call.Sid;
-      if (!callSid)                    continue;
-      if (syncedCallSids.has(callSid)) continue; // already posted
+      if (!callSid) continue;
 
-      // Exotel list API often omits RecordingUrl — always fetch per-call detail
-      // to get the definitive RecordingUrl / PreSignedRecordingUrl.
+      if (syncedCallSids.has(callSid)) { alreadySynced++; continue; }
+
+      log(`[Poll] Checking SID=${callSid} (Dir=${call.Direction} Status=${call.Status} Dur=${call.Duration}s)`);
+
       let recUrl = call.RecordingUrl || call.PreSignedRecordingUrl || null;
-      if (!recUrl) recUrl = await fetchRecordingUrl(callSid);
-      if (!recUrl) continue; // no recording yet — will be caught next poll cycle
+      if (recUrl) {
+        log(`[Poll] Recording URL from list response: ✅ ${recUrl.slice(0, 80)}…`);
+      } else {
+        log(`[Poll] No URL in list response — fetching per-call detail for SID=${callSid}...`);
+        recUrl = await fetchRecordingUrl(callSid);
+        if (recUrl) log(`[Poll] Per-call fetch: ✅ ${recUrl.slice(0, 80)}…`);
+        else        { log(`[Poll] Per-call fetch: ❌ no recording yet for SID=${callSid}`); noRecording++; continue; }
+      }
 
-      // Merge the fetched URL into the call object so createBx24CallActivity
-      // can use it directly if needed (buildRecordingLink uses callSid anyway)
       if (!call.RecordingUrl) call.RecordingUrl = recUrl;
 
+      log(`[Poll] Pushing SID=${callSid} to BX24...`);
       const activityId = await createBx24CallActivity(call, callSid, null);
       if (activityId) {
         posted++;
         syncedCallSids.add(callSid);
         persistDedupSids();
-        log(`[Poll] Posted recording for ${callSid} -> BX24 activity ${activityId}`);
+        log(`[Poll] ✅ SID=${callSid} → BX24 activityId=${activityId}`);
+      } else {
+        failed++;
+        log(`[Poll] ❌ Failed to push SID=${callSid} to BX24`);
       }
     }
 
-    if (posted > 0) log(`[Poll] Cycle done — posted ${posted} new recording(s)`);
+    log(`[Poll] ── Cycle DONE: total=${calls.length} alreadySynced=${alreadySynced} noRecording=${noRecording} posted=${posted} failed=${failed} ──`);
   } catch (e) {
-    log(`[Poll] Error: ${e.message}`);
+    log(`[Poll] ❌ Unexpected error: ${e.message}\n${e.stack}`);
   } finally {
     _pollActive = false;
   }
@@ -701,7 +742,7 @@ async function pollOnce() {
 
 function startPolling() {
   if (process.env.EXOTEL_RECORDING_POLL_DISABLED === 'true') {
-    log('Recording poller disabled (EXOTEL_RECORDING_POLL_DISABLED=true)');
+    log('Recording poller DISABLED (EXOTEL_RECORDING_POLL_DISABLED=true)');
     return;
   }
   log(`Recording poller started — interval ${POLL_INTERVAL_MS / 1000}s`);
@@ -709,33 +750,25 @@ function startPolling() {
   setInterval(pollOnce, POLL_INTERVAL_MS);
 }
 
-// ── init — registers all routes with the Express app ────────────────────
-// Called once from server.js: recordings.init(app)
-// Registers:
-//   GET  /recording/:callSid   — 302 redirect to fresh Exotel recording URL
-//   POST /sync-recordings      — manual sync trigger
-//   GET  /sync-recordings      — manual sync trigger (browser-friendly)
-// Also starts the continuous recording poller automatically.
+// ── init ──────────────────────────────────────────────────────────────────
 function init(app) {
   recordingRedirectRoute(app);
 
   app.post('/sync-recordings', async (req, res) => {
     const { phoneNumber, agentEmail, direction, fromDate, toDate } = req.body || {};
-    log(`POST /sync-recordings — phoneNumber=${phoneNumber || '(all)'} direction=${direction || '(all)'} from=${fromDate || '-'} to=${toDate || '-'}`);
+    log(`[Route] POST /sync-recordings | phoneNumber=${phoneNumber || '(all)'} direction=${direction || '(all)'} from=${fromDate || '-'} to=${toDate || '-'}`);
     try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail, direction, fromDate, toDate }) }); }
-    catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
+    catch (e) { log(`[Route] POST /sync-recordings threw: ${e.message}`); res.status(500).json({ status: 'error', message: e.message }); }
   });
 
   app.get('/sync-recordings', async (req, res) => {
     const { phoneNumber, agentEmail, direction, fromDate, toDate } = req.query;
-    log(`GET /sync-recordings — phoneNumber=${phoneNumber || '(all)'} direction=${direction || '(all)'} from=${fromDate || '-'} to=${toDate || '-'}`);
+    log(`[Route] GET /sync-recordings | phoneNumber=${phoneNumber || '(all)'} direction=${direction || '(all)'} from=${fromDate || '-'} to=${toDate || '-'}`);
     try { res.json({ status: 'ok', ...await syncRecordings({ phoneNumber, agentEmail, direction, fromDate, toDate }) }); }
-    catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
+    catch (e) { log(`[Route] GET /sync-recordings threw: ${e.message}`); res.status(500).json({ status: 'error', message: e.message }); }
   });
 
-  log('Routes registered: GET /recording/:callSid (redirect), POST /sync-recordings, GET /sync-recordings');
-
-  // Start continuous poller — picks up recordings as soon as Exotel has them
+  log('Routes registered: GET /recording/:callSid | POST /sync-recordings | GET /sync-recordings');
   startPolling();
 }
 
