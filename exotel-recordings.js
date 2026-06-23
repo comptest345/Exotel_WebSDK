@@ -307,7 +307,7 @@ async function fetchExotelCallsForNumber(phoneNumber) {
 async function fetchRecentExotelCalls(direction) {
   log(`[FetchCalls] Fetching recent calls | direction=${direction || 'all'}`);
   try {
-    const params = { PageSize: 200 };
+    const params = { PageSize: 100 };
     if (direction) params.Direction = direction;
     const data = await exotelGet('/Calls.json', params);
     const list = (data?.TwilioResponse?.Calls?.Call) || [];
