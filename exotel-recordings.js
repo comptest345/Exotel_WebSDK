@@ -237,46 +237,71 @@ function phoneVariants(phoneNumber) {
 }
 
 // ── Find BX24 entity by phone ─────────────────────────────────────────────
-// Simple: try lead then contact with the raw number only.
-// If not found → return null. No variants, no auto-create, no retries.
-// Agent may have deleted the contact — that's fine, just skip.
+// Tries 6 phone variants (with/without country code, +, 0, local).
+// If not found in CRM → returns null. Never auto-creates leads.
+function phoneVariants(phoneNumber) {
+  const raw    = (phoneNumber || '').trim();
+  const digits = raw.replace(/\D/g, '');
+  const withPlus  = digits ? `+${digits}` : '';
+  const withPlus2 = raw.startsWith('+') ? raw : '';
+  const local = digits.length > 10 ? digits.slice(digits.length - 10) :
+                digits.length >= 7  ? digits : '';
+  const with0 = local ? `0${local}` : '';
+  const seen = new Set();
+  const variants = [];
+  for (const v of [raw, withPlus, withPlus2, digits, local, with0]) {
+    if (v && v.length >= 7 && !seen.has(v)) { seen.add(v); variants.push(v); }
+  }
+  log(`[PhoneVariants] ${raw} → [${variants.join(' | ')}]`);
+  return variants;
+}
+
 async function findBx24EntityByPhone(phoneNumber) {
   if (!phoneNumber) { log('[EntitySearch] phoneNumber empty — skip'); return null; }
-  const num = phoneNumber.trim();
-  log(`[EntitySearch] Searching CRM for ${num}`);
+  const variants = phoneVariants(phoneNumber);
+  log(`[EntitySearch] Searching CRM for ${phoneNumber} with ${variants.length} variants`);
 
-  // 1) Lead
-  try {
-    const result = await bx24Call('crm.lead.list', { filter: { PHONE: num }, select: ['ID'] });
-    const items  = Array.isArray(result) ? result : [];
-    if (items.length > 0) {
-      log(`[EntitySearch] ✅ LEAD ID=${items[0].ID}`);
-      return { entityType: 'LEAD', entityId: String(items[0].ID) };
-    }
-  } catch (e) { log(`[EntitySearch] lead search error: ${e.message}`); }
+  // 1) Try leads across all variants
+  for (const num of variants) {
+    try {
+      const result = await bx24Call('crm.lead.list', { filter: { PHONE: num }, select: ['ID'] });
+      const items  = Array.isArray(result) ? result : [];
+      if (items.length > 0) {
+        log(`[EntitySearch] ✅ LEAD ID=${items[0].ID} (variant ${num})`);
+        return { entityType: 'LEAD', entityId: String(items[0].ID) };
+      }
+    } catch (e) { log(`[EntitySearch] lead search error for ${num}: ${e.message}`); }
+  }
 
-  // 2) Contact
-  try {
-    const result = await bx24Call('crm.contact.list', { filter: { PHONE: num }, select: ['ID'] });
-    const items  = Array.isArray(result) ? result : [];
-    if (items.length > 0) {
-      const cid = String(items[0].ID);
-      // Check for open deal on this contact
-      try {
-        const deals = await bx24Call('crm.deal.list', { filter: { CONTACT_ID: cid, CLOSED: 'N' }, select: ['ID'], order: { DATE_MODIFY: 'DESC' } });
-        const dl = Array.isArray(deals) ? deals : [];
-        if (dl.length > 0) {
-          log(`[EntitySearch] ✅ DEAL ID=${dl[0].ID} (via CONTACT ${cid})`);
-          return { entityType: 'DEAL', entityId: String(dl[0].ID) };
-        }
-      } catch (_) {}
-      log(`[EntitySearch] ✅ CONTACT ID=${cid}`);
-      return { entityType: 'CONTACT', entityId: cid };
-    }
-  } catch (e) { log(`[EntitySearch] contact search error: ${e.message}`); }
+  // 2) Try contacts across all variants
+  let contactId = null;
+  for (const num of variants) {
+    try {
+      const result = await bx24Call('crm.contact.list', { filter: { PHONE: num }, select: ['ID'] });
+      const items  = Array.isArray(result) ? result : [];
+      if (items.length > 0) {
+        contactId = String(items[0].ID);
+        log(`[EntitySearch] ✅ CONTACT ID=${contactId} (variant ${num})`);
+        break;
+      }
+    } catch (e) { log(`[EntitySearch] contact search error for ${num}: ${e.message}`); }
+  }
 
-  // Not found — skip, don't create
-  log(`[EntitySearch] ⚠️  ${num} not in CRM — skipping (number may have been deleted)`);
+  if (contactId) {
+    try {
+      const deals = await bx24Call('crm.deal.list', { filter: { CONTACT_ID: contactId, CLOSED: 'N' }, select: ['ID'], order: { DATE_MODIFY: 'DESC' } });
+      const dl = Array.isArray(deals) ? deals : [];
+      if (dl.length > 0) {
+        log(`[EntitySearch] ✅ DEAL ID=${dl[0].ID} (via CONTACT ${contactId})`);
+        return { entityType: 'DEAL', entityId: String(dl[0].ID) };
+      }
+    } catch (_) {}
+    log(`[EntitySearch] ✅ Using CONTACT ID=${contactId}`);
+    return { entityType: 'CONTACT', entityId: contactId };
+  }
+
+  // Not found — skip, never create
+  log(`[EntitySearch] ⚠️  ${phoneNumber} not found in CRM across all variants — skipping`);
   return null;
 }
 
