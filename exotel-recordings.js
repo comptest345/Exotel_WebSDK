@@ -342,10 +342,16 @@ async function fetchRecentExotelCalls(direction) {
 }
 
 // ── Fetch recording URL for a single call SID ─────────────────────────────
-async function fetchRecordingUrl(callSid) {
-  log(`[RecordingURL] Fetching for SID=${callSid} — trying v2 CCM API first`);
+async function fetchRecordingUrl(callSid, direction) {
+  // v2 CCM API only supports outbound calls — inbound returns 404 "Unsupported call direction"
+  const isOutbound = direction ? direction.toLowerCase().includes('outbound') : true; // default try v2
+  if (!isOutbound) {
+    log(`[RecordingURL] SID=${callSid} is inbound — skipping v2, going straight to v1`);
+  } else {
+    log(`[RecordingURL] Fetching for SID=${callSid} — trying v2 CCM API first`);
+  }
 
-  try {
+  if (isOutbound) try {
     const data = await exotelV2Get(`/calls/${callSid}`);
     const callData   = data?.response?.data || data?.data || {};
     const recordings = callData?.recordings;
@@ -612,7 +618,7 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
     if (recordingExists) {
       log(`[Sync] Recording URL already in list response ✅`);
     } else {
-      const fetched = await fetchRecordingUrl(callSid);
+      const fetched = await fetchRecordingUrl(callSid, call.Direction);
       recordingExists = !!fetched;
       log(`[Sync] Per-call fetch for SID=${callSid}: ${recordingExists ? '✅' : '❌ no recording yet'}`);
     }
@@ -711,7 +717,7 @@ function recordingRedirectRoute(app) {
     log(`[Redirect] ── /recording/${callSid} hit ──`);
     if (!callSid) return res.status(400).send('callSid required');
     try {
-      const audioUrl = await fetchRecordingUrl(callSid);
+      const audioUrl = await fetchRecordingUrl(callSid, null); // direction unknown at redirect time
       if (!audioUrl) {
         log(`[Redirect] ❌ No recording URL for SID=${callSid}`);
         return res.status(404).send('No recording available yet');
@@ -781,7 +787,7 @@ async function pollOnce() {
         log(`[Poll] SID=${callSid} recording in list ✅`);
       } else {
         log(`[Poll] SID=${callSid} no URL in list — fetching per-call...`);
-        recUrl = await fetchRecordingUrl(callSid);
+        recUrl = await fetchRecordingUrl(callSid, call.Direction);
         if (recUrl) log(`[Poll] SID=${callSid} per-call fetch ✅`);
         else { log(`[Poll] SID=${callSid} ❌ no recording yet`); noRecording++; continue; }
       }
@@ -823,7 +829,9 @@ async function pollOnce() {
         log(`[Poll] ✅ SID=${callSid} → BX24 activityId=${activityId}`);
       } else {
         failed++;
-        log(`[Poll] ❌ SID=${callSid} push to BX24 FAILED`);
+        const dir2     = (call.Direction || '').toLowerCase().includes('outbound') ? 'outbound' : 'inbound';
+        const clientN2 = regEntry?.phone || (dir2 === 'outbound' ? call.To : call.From) || '(unknown)';
+        log(`[Poll] ❌ SID=${callSid} push to BX24 FAILED | clientNum="${clientN2}" from="${call.From}" to="${call.To}" dir="${call.Direction}"`);
       }
     }
 
@@ -881,7 +889,7 @@ async function backfillOldRecordings() {
 
     let recUrl = call.RecordingUrl || call.PreSignedRecordingUrl || null;
     if (!recUrl) {
-      recUrl = await fetchRecordingUrl(callSid);
+      recUrl = await fetchRecordingUrl(callSid, call.Direction);
     }
     if (!recUrl) {
       log(`[Backfill] SID=${callSid} no recording — skipping`);
