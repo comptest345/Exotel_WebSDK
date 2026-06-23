@@ -673,13 +673,14 @@ app.get('/events', (req, res) => {
   const email = (req.query.email || '').toLowerCase();
   const bx24UserId = req.query.bx24_user_id || '';
 if (email) {
+    // Tear down the OLD connection for this email (if any) before registering the new one
     if (sseClients[email]) {
-      clearInterval(sseClients[email].hb);
-      try { sseClients[email].res.end(); } catch(_) {}
+      clearInterval(sseClients[email]._hb);          // clear old heartbeat
+      try { sseClients[email].end(); } catch(_) {}   // close old socket
     }
     sseClients[email] = res;
   }
-   // ALSO register under bx24_ key so /bx24-call-start can find it before email resolves
+  // ALSO register under bx24_ key so /bx24-call-start can find it before email resolves
   if (bx24UserId) {
     const bx24Key = 'bx24_' + bx24UserId;
     sseClients[bx24Key] = res; // same res object, two keys
@@ -692,10 +693,9 @@ if (email) {
   });
   res.flushHeaders();
 
-  if (sseClients[email]) {
-    try { sseClients[email].end(); } catch (_) {}
-  }
-  sseClients[email] = res;
+  // ── BUG FIX: removed the duplicate sseClients[email].end() block that was
+  //    killing every new SSE connection immediately after flushHeaders(). ──
+
   console.log(`[SSE] Agent connected: ${email} (active: ${Object.keys(sseClients).length})`);
 
   setAgentBusy(email, false);
@@ -703,6 +703,7 @@ if (email) {
   const hb = setInterval(() => {
     try { res.write(': heartbeat\n\n'); } catch (_) { clearInterval(hb); }
   }, 20000);
+  res._hb = hb; // store so it can be cleared if this agent reconnects
 
   const entry = pendingCallMap[email];
   if (entry && (Date.now() - entry.ts) < 60000) {
@@ -1091,11 +1092,19 @@ app.all('/call-callback', async (req, res) => {
     }
 
     const callFrom  = (p.From || p.CallFrom || p.caller_id || p.FromNumber || '').trim();
-    const clientNum = (p.Direction || '').toLowerCase().includes('outbound')
-      ? (p.ToNumber || p.To || callFrom).trim()
+    const direction = (p.Direction || '').toLowerCase();
+    const clientNum = direction.includes('outbound')
+      ? (p.To || p.ToNumber || callFrom).trim()   // p.To is the standard Exotel field
       : callFrom;
 
+    console.log(`[Callback-Recording] Direction="${p.Direction}" From="${p.From}" To="${p.To}" CallFrom="${p.CallFrom}" FromNumber="${p.FromNumber}" ToNumber="${p.ToNumber}" → callFrom="${callFrom}" clientNum="${clientNum}" sid="${sid}"`);
+
+    if (!clientNum) {
+      console.warn(`[Callback-Recording] ⚠️  clientNum is EMPTY — recording sync will be skipped. Full payload: ${JSON.stringify(p)}`);
+    }
+
     if (clientNum) {
+      console.log(`[Callback-Recording] ✅ Calling scheduleSync for clientNum="${clientNum}" sid="${sid}"`);
       recordings.scheduleSync({
         phoneNumber: clientNum,
         clientNum: clientNum,
