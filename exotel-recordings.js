@@ -380,7 +380,7 @@ async function fetchRecordingUrl(callSid, direction) {
     log(`[RecordingURL][v1] Fields: [${Object.keys(call).join(', ')}]`);
     const preSignedUrl = call.PreSignedRecordingUrl || null;
     const recordingUrl = call.RecordingUrl          || null;
-    log(`[RecordingURL][v1] PreSignedRecordingUrl=${preSignedUrl ? '✅' : '❌'} RecordingUrl=${recordingUrl ? '✅' : '❌'}`);
+    log(`[RecordingURL][v1] raw RecordingUrl=${call.RecordingUrl} | raw PreSigned=${call.PreSignedRecordingUrl}`);
     const url = preSignedUrl || recordingUrl || null;
     if (url) log(`[RecordingURL][v1] ✅ Found via v1: ${url.slice(0, 100)}…`);
     else     log(`[RecordingURL] ⚠️  No recording URL on either v1 or v2 for SID=${callSid}`);
