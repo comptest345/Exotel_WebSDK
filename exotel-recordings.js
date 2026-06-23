@@ -303,13 +303,12 @@ async function fetchExotelCallsForNumber(phoneNumber) {
 }
 
 // ── Fetch recent calls by direction ──────────────────────────────────────
-async function fetchRecentExotelCalls(direction, fromDate, toDate) {
-  log(`[FetchCalls] Fetching recent calls | direction=${direction || 'all'} from=${fromDate || '-'} to=${toDate || '-'}`);
+// NEW
+async function fetchRecentExotelCalls(direction) {
+  log(`[FetchCalls] Fetching recent calls | direction=${direction || 'all'}`);
   try {
     const params = { PageSize: 200 };
     if (direction) params.Direction = direction;
-    if (fromDate)  params.DateCreated = fromDate;
-    if (toDate)    params.DateUpdated = toDate;
     const data = await exotelGet('/Calls.json', params);
     const list = (data?.TwilioResponse?.Calls?.Call) || [];
     const arr  = Array.isArray(list) ? list : [list];
@@ -748,13 +747,23 @@ async function pollOnce() {
   try {
     // Only look at calls from the last 24 hours to avoid burning quota on old calls
     const sinceDate = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const since = sinceDate.toISOString().slice(0, 10); // e.g. "2026-06-22"
-    log(`[Poll] Fetching calls since ${since}`);
+    // NEW
+    const sinceMs = Date.now() - 24 * 60 * 60 * 1000;
+    log(`[Poll] Fetching calls (last 24h, filtered in-memory)`);
     const [inbound, outbound] = await Promise.all([
-      fetchRecentExotelCalls('inbound',      since, null).catch(e => { log(`[Poll] ❌ inbound fetch error: ${e.message}`); return []; }),
-      fetchRecentExotelCalls('outbound-api', since, null).catch(e => { log(`[Poll] ❌ outbound fetch error: ${e.message}`); return []; })
+      fetchRecentExotelCalls('inbound').catch(e => { log(`[Poll] ❌ inbound fetch error: ${e.message}`); return []; }),
+      fetchRecentExotelCalls('outbound-api').catch(e => { log(`[Poll] ❌ outbound fetch error: ${e.message}`); return []; })
     ]);
-    log(`[Poll] Fetched: inbound=${inbound.length} outbound=${outbound.length}`);
+
+    // Filter to last 24h in-memory (DateCreated param is rejected by Exotel v1 API)
+    const cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
+    const filterRecent = arr => arr.filter(c => {
+      const t = c.StartTime || c.DateCreated;
+      return !t || new Date(t).getTime() >= cutoffMs;
+    });
+    const inboundFiltered  = filterRecent(inbound);
+    const outboundFiltered = filterRecent(outbound);
+    log(`[Poll] Fetched: inbound=${inboundFiltered.length} outbound=${outboundFiltered.length} (raw: ${inbound.length}+${outbound.length})`);
 
     const seen = new Set();
     const calls = [];
