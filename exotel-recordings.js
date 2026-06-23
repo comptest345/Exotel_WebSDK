@@ -26,7 +26,7 @@ const RETRY_MAX_ATTEMPTS   = 4;
 
 // How many of the most-recent calls (across inbound + outbound combined,
 // sorted by actual call time) the poller evaluates every cycle.
-const POLL_FETCH_LIMIT = Math.max(1, parseInt(process.env.EXOTEL_RECORDING_POLL_LIMIT || '5'));
+const POLL_FETCH_LIMIT = Math.max(1, parseInt(process.env.EXOTEL_RECORDING_POLL_LIMIT || '15'));
 
 // ── Logger ────────────────────────────────────────────────────────────────
 function log(msg) { console.log(`[Recordings] [${new Date().toISOString()}] ${msg}`); }
@@ -813,9 +813,12 @@ async function pollOnce() {
       const callStatus   = (call.Status || '').toLowerCase();
       log(`[Poll] Evaluating SID=${callSid} Dir=${call.Direction} Status=${call.Status} Dur=${callDuration}s`);
 
-      if (callDuration < 5 && ['no-answer','busy','failed','canceled'].includes(callStatus)) {
-        log(`[Poll] SID=${callSid} unanswered — deduping`);
+      // Failed/busy/no-answer/canceled calls never have recordings regardless of duration.
+      // Dedupe them immediately so they stop blocking the poll window every cycle.
+      if (['no-answer','busy','failed','canceled'].includes(callStatus)) {
+        log(`[Poll] SID=${callSid} status=${callStatus} — no recording possible, deduping permanently`);
         syncedCallSids.add(callSid);
+        persistDedupSids();
         alreadySynced++;
         continue;
       }
@@ -939,8 +942,8 @@ async function backfillOldRecordings() {
     const callDuration = parseInt(call.Duration || '0');
     const callStatus   = (call.Status || '').toLowerCase();
 
-    if (callDuration < 5 && ['no-answer','busy','failed','canceled'].includes(callStatus)) {
-      log(`[Backfill] SID=${callSid} unanswered — skipping`);
+    if (['no-answer','busy','failed','canceled'].includes(callStatus)) {
+      log(`[Backfill] SID=${callSid} status=${callStatus} — no recording possible, skipping`);
       skipped++;
       continue;
     }
