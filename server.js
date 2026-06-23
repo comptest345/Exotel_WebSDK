@@ -542,6 +542,16 @@ app.post('/make-outbound-call', async (req, res) => {
     // CCM v2 response: { response: { data: { call_sid: "..." } } }
     const exotelCallSid = callData?.response?.data?.call_sid || callData?.response?.call_details?.sid || callData?.Data?.CallSid || callData?.CallSid || null;
     if (BX24_WEBHOOK && exotelCallSid) {
+      // Dedup: check if we already registered a BX24 call for this agent+number combo
+      const dupKey = agentEmail.toLowerCase() + '|' + toNumber;
+      const recentDup = Object.values(outboundCallMap).find(
+        v => (v.agentEmail || '').toLowerCase() + '|' + v.toNumber === dupKey && (Date.now() - v.ts) < 30000
+      );
+      if (recentDup) {
+        console.log(`[OutboundCall] SKIP BX24 register — duplicate for ${dupKey} within 30s`);
+        res.json({ ok: true, data: callData });
+        return;
+      }
       try {
         const agentBx24Id = await getBx24UserEmail_toBx24Id(agentEmail);
         const r = await bx24Call('telephony.externalcall.register', {
@@ -754,13 +764,6 @@ function normalizePhone(n) {
   return digits.slice(-10) || String(n || '').trim().toLowerCase();
 }
 
-// ── Round-robin state ────────────────────────────────────────────
-// rrPointer: index into connected agents list, advances after each inbound call
-let rrPointer = 0;
-// ringTimers: callSid → { timer, agentList, currentIdx }
-const ringTimers = {};
-const RING_TIMEOUT_MS = 15000; // 15 s per agent before moving to next
-
 // ── Agent presence ────────────────────────────────────────────────
 const agentStatus = new Map();
 
@@ -769,74 +772,75 @@ function setAgentBusy(email, busy) {
   if (!key) return;
   agentStatus.set(key, { status: busy ? 'busy' : 'free', ts: Date.now() });
   console.log(`[Presence] ${key} → ${busy ? 'BUSY' : 'FREE'}`);
-
-  if (!busy) {
-    for (const [sid, callData] of Object.entries(pendingInboundMap)) {
-      if (claimedSids.has(sid)) continue;
-      const lock = callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
-      if (lock && lock.claimedBy) continue;
-      if (lock && lock.rejectedBy.has(key)) continue;
-      if (ssePush(key, 'inbound_call', { from: callData.from, callSid: sid })) {
-        console.log(`[Presence] Redirected ringing call ${sid} to newly-free agent ${key}`);
-      }
-    }
-  }
+  // Note: no automatic re-notification on free — Exotel handles ringing.
 }
 
-// ── /agent-status ─────────────────────────────────────────────────
-// ── Round-robin: ring next available agent ───────────────────────
-function ringNextAgent(callSid) {
-  const state = ringTimers[callSid];
-  if (!state) return;
 
-  const { agentList, currentIdx } = state;
-  const nextIdx = currentIdx + 1;
-  const callData = pendingInboundMap[callSid];
-
-  if (!callData || nextIdx >= agentList.length) {
-    delete ringTimers[callSid];
-    console.log(`[RR] All agents tried for ${callSid} — no answer`);
-    return;
-  }
-
-  state.currentIdx = nextIdx;
-  const prevAgent  = agentList[currentIdx];
-  const nextAgent  = agentList[nextIdx];
-
-  // Mark previous agent as rejected so they won't be re-notified
-  const lock = callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
-  if (lock) lock.rejectedBy.add(prevAgent);
-
-  // Dismiss previous agent's UI
-  ssePush(prevAgent, 'call_dismissed', { callSid, reason: 'no_answer_timeout' });
-
-  console.log(`[RR] Timeout — ${callSid}: ${prevAgent} → ${nextAgent}`);
-  ssePush(nextAgent, 'inbound_call', { from: callData.from, callSid });
-
-  if (state.timer) clearTimeout(state.timer);
-  state.timer = setTimeout(() => ringNextAgent(callSid), RING_TIMEOUT_MS);
-}
-
-app.post('/agent-status', (req, res) => {
-  const { email, status } = req.body || {};
-  if (!email || !['free', 'busy'].includes(status))
-    return res.status(400).json({ error: 'email and status ("free"|"busy") required' });
-  setAgentBusy(email, status === 'busy');
-  res.json({ ok: true });
-});
 
 // ── Incoming call (Exotel webhook) ────────────────────────────────
+// ── BX24 lead deduplication helper ──────────────────────────────
+// Checks if a lead with this phone already exists; creates one only if not.
+// Uses crm.duplicate.findbycomm which searches across all CRM entities.
+async function ensureBx24Lead(phone) {
+  if (!BX24_WEBHOOK || !phone || phone === 'Unknown') return null;
+  const normalized = phone.replace(/\D/g, '').slice(-10);
+  try {
+    // Search for existing contacts/leads with this phone
+    const searchRes = await fetch(`${BX24_WEBHOOK}crm.duplicate.findbycomm.json`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ type: 'PHONE', values: [phone, normalized], entity_type: 'LEAD' })
+    });
+    const searchData = await searchRes.json();
+    const existingIds = searchData.result && searchData.result.LEAD;
+    if (existingIds && existingIds.length > 0) {
+      console.log(`[Lead] Phone ${phone} already has lead(s): ${existingIds.join(',')} — skipping create`);
+      return { existing: true, ids: existingIds };
+    }
+    // Also check CONTACT
+    const contactRes = await fetch(`${BX24_WEBHOOK}crm.duplicate.findbycomm.json`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ type: 'PHONE', values: [phone, normalized], entity_type: 'CONTACT' })
+    });
+    const contactData = await contactRes.json();
+    const contactIds  = contactData.result && contactData.result.CONTACT;
+    if (contactIds && contactIds.length > 0) {
+      console.log(`[Lead] Phone ${phone} already linked to contact(s): ${contactIds.join(',')} — skipping lead create`);
+      return { existing: true, entity: 'CONTACT', ids: contactIds };
+    }
+
+    // No existing record — create a lead
+    const r = await bx24Call('crm.lead.add', {
+      fields: {
+        TITLE:       `Incoming call — ${phone}`,
+        PHONE:       [{ VALUE: phone, VALUE_TYPE: 'WORK' }],
+        SOURCE_ID:   'CALL',
+        SOURCE_DESCRIPTION: 'Inbound call via Exotel WebSDK',
+        STATUS_ID:   'NEW'
+      }
+    });
+    const leadId = r && r.result ? r.result : r;
+    console.log(`[Lead] Created new lead ${leadId} for phone ${phone}`);
+    return { created: true, leadId };
+  } catch (e) {
+    console.warn(`[Lead] ensureBx24Lead(${phone}) error:`, e.message);
+    return null;
+  }
+}
+
 app.all('/incoming-call', async (req, res) => {
   const p  = Object.assign({}, req.query, req.body);
   console.log('[Incoming]', JSON.stringify(p));
   const et = (p.EventType || p.Status || '').toLowerCase();
   if (['free','terminal','completed','busy','noanswer','terminated','failed'].includes(et)) return res.json({ status: 'ignored' });
   try {
-    const from   = p.From || p.CallFrom || p.caller_id || p.CallerId || p.callerid || 'Unknown';
-    const toNum  = p.To || p.DialWhomNumber || p.CallTo || VIRTUAL_NUMBER || 'Unknown';
-    const rawSid = p.CallSid || p.call_sid || p.ParentCallSid || p.DialCallSid || null;
+    const from     = p.From || p.CallFrom || p.caller_id || p.CallerId || p.callerid || 'Unknown';
+    const toNum    = p.To || p.DialWhomNumber || p.CallTo || VIRTUAL_NUMBER || 'Unknown';
+    const rawSid   = p.CallSid || p.call_sid || p.ParentCallSid || p.DialCallSid || null;
     const phoneKey = normalizePhone(from);
 
+    // Dedup: if this caller already has an active non-stale lock, skip re-broadcast
     let lock  = callerLocks.get(phoneKey);
     const stale = lock && (Date.now() - lock.ts > LOCK_TTL_MS) && !lock.claimedBy;
     if (!lock || stale) {
@@ -857,46 +861,24 @@ app.all('/incoming-call', async (req, res) => {
 
     pendingInboundMap[sid] = { from, to: toNum, ts: Date.now(), phoneKey };
 
-    // ── Round-robin agent selection ──────────────────────────────────
-    // Build ordered list: all SSE-connected agents, starting from rrPointer,
-    // skipping busy agents first. If all are busy, include them anyway.
+    // Create BX24 lead immediately on inbound (deduped by phone number)
+    if (BX24_WEBHOOK) {
+      ensureBx24Lead(from).catch(e => console.warn('[Incoming] lead create (non-fatal):', e.message));
+    }
+
+    // Broadcast to ALL connected agents — Exotel decides who gets audio,
+    // first agent to click Accept wins via /claim-call race.
     const allConnected = Object.keys(sseClients).filter(e => !e.startsWith('bx24_'));
     if (allConnected.length === 0) {
       console.log(`[Incoming] sid=${sid} from=${from} — no agents connected`);
       return res.json({ status: 'no_agents' });
     }
 
-    // Build ordered list starting from current rrPointer (strict round robin)
-    const ordered = [];
-    for (let i = 0; i < allConnected.length; i++) {
-      ordered.push(allConnected[(rrPointer + i) % allConnected.length]);
+    let notified = 0;
+    for (const agentEmail of allConnected) {
+      if (ssePush(agentEmail, 'inbound_call', { from, callSid: sid })) notified++;
     }
-    // Advance pointer for next call
-    rrPointer = (rrPointer + 1) % allConnected.length;
-
-    // Filter: skip agents who already rejected this call
-    const eligible = ordered.filter(e => !lock.rejectedBy.has(e));
-    // Prefer free agents; fall back to busy if everyone is busy
-    let freeEligible = eligible.filter(e => agentStatus.get(e)?.status !== 'busy');
-    const agentList  = freeEligible.length > 0 ? freeEligible : eligible;
-
-    if (agentList.length === 0) {
-      console.log(`[Incoming] sid=${sid} — all agents busy or rejected, queuing`);
-      return res.json({ status: 'queued' });
-    }
-
-    // Ring the first agent in the round-robin order
-    const firstAgent = agentList[0];
-    ssePush(firstAgent, 'inbound_call', { from, callSid: sid });
-    console.log(`[Incoming] sid=${sid} from=${from} → ringing ${firstAgent} (RR idx ${rrPointer-1}/${allConnected.length})`);
-
-    // Start ring timeout — if no answer in RING_TIMEOUT_MS, move to next agent
-    if (ringTimers[sid]) clearTimeout(ringTimers[sid].timer);
-    ringTimers[sid] = {
-      timer:      setTimeout(() => ringNextAgent(sid), RING_TIMEOUT_MS),
-      agentList,
-      currentIdx: 0
-    };
+    console.log(`[Incoming] sid=${sid} from=${from} → broadcast to ${notified}/${allConnected.length} agents`);
 
     res.json({ status: 'received' });
   } catch (e) { console.error('[Incoming]', e.message); res.json({ status: 'error', message: e.message }); }
@@ -916,12 +898,6 @@ app.post('/claim-call', async (req, res) => {
   inboundClaimMap[callSid] = { email, bx24UserId: bx24UserId || null, bx24CallId: null, ts: Date.now() };
   claimedSids.add(callSid);
   console.log(`[Claim] ${email} claimed ${callSid}`);
-
-  // Cancel any pending ring-timeout timer for this call
-  if (ringTimers[callSid]) {
-    clearTimeout(ringTimers[callSid].timer);
-    delete ringTimers[callSid];
-  }
 
   const callData = pendingInboundMap[callSid];
   if (callData && callData.phoneKey) {
@@ -1023,20 +999,8 @@ app.post('/reject-call', (req, res) => {
   const lock = callData && callData.phoneKey ? callerLocks.get(callData.phoneKey) : null;
   if (lock) lock.rejectedBy.add(email.toLowerCase());
   setAgentBusy(email, false);
-  console.log(`[Reject] ${email} declined ${callSid} — advancing round-robin`);
-
-  // Immediately advance to next agent in the round-robin sequence
-  const state = ringTimers[callSid];
-  if (state) {
-    clearTimeout(state.timer);
-    // Mark current agent as rejected in the agentList so ringNextAgent skips them
-    // (lock.rejectedBy already updated above)
-    // Find this agent's position and advance from there
-    const agentIdx = state.agentList.indexOf(email.toLowerCase());
-    if (agentIdx !== -1) state.currentIdx = agentIdx;
-    ringNextAgent(callSid);
-  }
-
+  console.log(`[Reject] ${email} declined ${callSid}`);
+  // Exotel handles re-ringing other agents; no server-side round-robin needed.
   res.json({ ok: true });
 });
 
@@ -1078,9 +1042,6 @@ app.all('/call-callback', async (req, res) => {
 
     if (claim)   { setAgentBusy(claim.email, false); delete inboundClaimMap[sid]; }
     if (outbound) { setAgentBusy(outbound.agentEmail, false); }
-
-    // Cancel any pending ring timer (call is now terminal)
-    if (ringTimers[sid]) { clearTimeout(ringTimers[sid].timer); delete ringTimers[sid]; }
 
     // Push call_ended SSE to agent popup immediately
     if (finishEmail) {
