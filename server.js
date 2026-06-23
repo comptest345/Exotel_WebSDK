@@ -302,11 +302,65 @@ async function autoRegisterUser(email, name, appToken) {
 }
 
 async function syncUsers() {
-  console.log('[Sync] Refreshing usermapping cache (read-only)...');
+  // Full sync: fetch CCM co-workers, add any missing ones to usermapping, refresh cache.
+  // Safe: only ADDs new users, never removes existing ones (removal is manual via /delete-user).
+  console.log('[Sync] Starting co-worker sync (CCM → usermapping)...');
   try {
+    let ccmUsers;
+    try {
+      ccmUsers = await fetchAllCcmUsers();
+    } catch (e) {
+      // CCM unreachable — still refresh cache from usermapping so existing users work
+      console.warn('[Sync] CCM fetch failed, falling back to cache refresh:', e.message);
+      const map = await getMappedUserMap(true);
+      return { refreshed: true, ccm_error: e.message, total_mapped: map.size };
+    }
+
+    if (ccmUsers.length === 0) {
+      console.warn('[Sync] CCM returned 0 users — skipping add to protect usermapping');
+      const map = await getMappedUserMap(true);
+      return { skipped: true, reason: 'ccm_empty', total_mapped: map.size };
+    }
+
+    const at        = await getAppToken();
+    const allMapped = await fetchAllMappedUsers(at);
+    const mapByEmail = {};
+    allMapped.forEach(u => { if (u.Email) mapByEmail[u.Email.toLowerCase()] = u; });
+
+    function correctAppUserId(ccmUser) {
+      const creds = extractSipCredentials(ccmUser);
+      if (creds.length > 0) return creds[0].sip_id.replace(/^sip:/i, '');
+      return ccmUser.id;
+    }
+
+    // Add new co-workers not yet in usermapping
+    const toAdd = ccmUsers.filter(u => u.email && !mapByEmail[u.email.toLowerCase()]);
+    if (toAdd.length > 0) {
+      console.log(`[Sync] Adding ${toAdd.length} new co-worker(s): ${toAdd.map(u => u.email).join(', ')}`);
+      const payload = toAdd.map(u => ({
+        AppUserId:        correctAppUserId(u),
+        AppUsername:      [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email,
+        Email:            u.email,
+        ExotelAccountSid: ACCOUNT_SID,
+        ExotelUserName:   [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email,
+        AgentNumber:      '',
+        VirtualNumber:    VIRTUAL_NUMBER
+      }));
+      const addRes  = await fetch(`${BASE}/usermapping`, {
+        method:  'POST',
+        headers: { 'Authorization': at, 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload)
+      });
+      const addData = await addRes.json();
+      console.log('[Sync] Add result:', JSON.stringify(addData).slice(0, 300));
+    } else {
+      console.log(`[Sync] No new co-workers to add (CCM=${ccmUsers.length} mapped=${allMapped.length})`);
+    }
+
+    // Always refresh cache after potential adds
     const map = await getMappedUserMap(true);
-    console.log(`[Sync] Cache refreshed: ${map.size} user(s) in usermapping`);
-    return { refreshed: true, total_mapped: map.size };
+    console.log(`[Sync] Done. CCM=${ccmUsers.length} mapped=${map.size} added=${toAdd.length}`);
+    return { added: toAdd.length, total_ccm: ccmUsers.length, total_mapped: map.size };
   } catch (e) {
     console.error('[Sync] Error:', e.message);
     return { error: e.message };
@@ -1319,5 +1373,5 @@ app.listen(PORT, async () => {
   console.log(`✅ Exotel WebSDK server on port ${PORT} | SIP: ${SIP_FB} | India: ${isIndia}`);
   const result = await syncUsers();
   console.log('[Startup] Sync:', JSON.stringify(result));
-  setInterval(syncUsers, 5 * 60 * 1000);
+  setInterval(syncUsers, 60 * 1000); // Every 60s — catches new co-workers quickly
 });
