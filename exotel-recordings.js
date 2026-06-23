@@ -446,7 +446,7 @@ async function updateBx24CallRecord({
     `Duration  : ${mins}m ${secs}s\n` +
     `Status    : ${status || 'Completed'}\n` +
     `Call SID  : ${callSid}\n\n` +
-    `Recording : <a href="${recordingLink}">▶ View Recording</a>`;
+    `🔗 Recording: ${recordingLink}`;
 
   const entity = await findBx24EntityByPhone(clientNum);
   if (!entity) {
@@ -469,7 +469,8 @@ async function updateBx24CallRecord({
       END_TIME:         endDate || callDate,
       COMPLETED:        'Y',
       RESPONSIBLE_ID:   agentBx24Id || '1',
-      COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }]
+      COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }],
+      WEBDAV_INFOS:     [{ NAME: '▶ Call Recording', LINK: recordingLink, ICON: 'audio' }]
     }});
     log(`[BX24Push] ✅ Step 2 OK — activityId=${result} on ${entity.entityType} ID=${entity.entityId}`);
     log(`[BX24Push] ══════════════ updateBx24CallRecord DONE ✅ ══════════════`);
@@ -483,7 +484,9 @@ async function updateBx24CallRecord({
 // ── Create new BX24 call activity (historical / unregistered calls) ────────
 async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   const fromNum   = call.From || '';
-  const toNum     = call.To   || '';
+  const rawToNum  = call.To   || '';
+  // Strip SIP URI — Exotel puts sip:username in To for inbound calls routed to agents
+  const toNum     = rawToNum.startsWith('sip:') ? (rawToNum.split('@')[0].replace(/^sip:/i,'')) : rawToNum;
   const duration  = parseInt(call.Duration || '0');
   const startTime = call.StartTime || call.DateCreated || new Date().toISOString();
   const endTime   = call.EndTime   || null;
@@ -492,7 +495,8 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   const direction = rawDir.includes('outbound') ? 'outbound' : 'inbound';
   const callDate  = new Date(startTime).toISOString();
   const endDate   = endTime ? new Date(endTime).toISOString() : callDate;
-  const clientNum = direction === 'outbound' ? toNum : fromNum;
+  // For inbound: customer = caller (From). For outbound: customer = called party (raw To number).
+  const clientNum = direction === 'outbound' ? rawToNum : fromNum;
   const recordingLink = buildRecordingLink(callSid);
   const mins = Math.floor(duration / 60);
   const secs = duration % 60;
@@ -521,7 +525,7 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
     `Duration  : ${mins}m ${secs}s\n` +
     `Status    : ${status}\n` +
     `Call SID  : ${callSid}\n\n` +
-    `Recording : <a href="${recordingLink}">▶ View Recording</a>`;
+    `🔗 Recording: ${recordingLink}`;
 
   log(`[BX24Push] Looking up BX24 entity for clientNum=${clientNum}...`);
   const entity = await findBx24EntityByPhone(clientNum);
@@ -551,7 +555,8 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
       END_TIME:         endDate,
       COMPLETED:        'Y',
       RESPONSIBLE_ID:   responsibleId,
-      COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }]
+      COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }],
+      WEBDAV_INFOS:     [{ NAME: '▶ Call Recording', LINK: recordingLink, ICON: 'audio' }]
     }});
     log(`[BX24Push] ✅ TYPE_ID=2 OK — activityId=${result} on ${entity.entityType} ID=${entity.entityId}`);
     log(`[BX24Push] ══════════════ createBx24CallActivity DONE ✅ ══════════════`);
