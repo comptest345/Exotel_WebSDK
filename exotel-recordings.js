@@ -157,7 +157,7 @@ async function exotelGet(path, params) {
 // ── Exotel v2 CCM API helper ──────────────────────────────────────────────
 async function exotelV2Get(path) {
   if (!ACCOUNT_SID || !API_KEY || !API_TOKEN)
-    throw new Error('EXOTEL credentials not set');
+    throw new Error('Exotel credentials not set');
   const creds = Buffer.from(`${API_KEY}:${API_TOKEN}`).toString('base64');
   const url   = `${EXOTEL_V2_BASE}${path}`;
   log(`[ExotelV2] → GET ${url}`);
@@ -415,6 +415,8 @@ async function updateBx24CallRecord({
   log(`[BX24Push] from=${fromNum} | to=${toNum} | clientNum=${clientNum} | duration=${duration}s`);
   log(`[BX24Push] recordingLink=${recordingLink}`);
 
+  // Step 1 — finish the telephony session with the recording URL
+  // This attaches the URL to the native "Outbound call ended" card in BX24.
   log(`[BX24Push] Step 1 — telephony.externalcall.finish with RECORD_URL...`);
   try {
     await bx24Call('telephony.externalcall.finish', {
@@ -429,6 +431,8 @@ async function updateBx24CallRecord({
     log(`[BX24Push] ⚠️  Step 1 FAILED: ${e.message} — continuing to activity card`);
   }
 
+  // Step 2 — also add a CRM activity card so the recording link is visible
+  // directly on the lead/contact/deal timeline regardless of telephony state.
   log(`[BX24Push] Step 2 — crm.activity.add for clientNum=${clientNum}...`);
   const mins = Math.floor((duration || 0) / 60);
   const secs = (duration || 0) % 60;
@@ -455,6 +459,9 @@ async function updateBx24CallRecord({
   const entity = await findBx24EntityByPhone(clientNum);
   if (!entity) {
     log(`[BX24Push] ❌ Step 2 SKIPPED — no BX24 entity for clientNum=${clientNum}`);
+    // Still return a truthy value so the caller knows Step 1 ran (telephony.finish succeeded)
+    // rather than returning NOT_FOUND and deduping prematurely.
+    // We'll return the sentinel but callers treat this as "done" for registered calls.
     return 'NOT_FOUND';
   }
   log(`[BX24Push] Step 2 entity resolved: ${entity.entityType} ID=${entity.entityId}`);
@@ -758,7 +765,7 @@ function recordingRedirectRoute(app) {
 
 // ── Continuous recording poller ───────────────────────────────────────────
 // Polls every second and only ever evaluates the most recent POLL_FETCH_LIMIT
-// calls (across inbound + outbound combined, sorted by actual call time).
+// calls (across inbound + outbound-api + outbound-dial combined, sorted by actual call time).
 const POLL_INTERVAL_MS = Math.max(1, parseInt(process.env.EXOTEL_RECORDING_POLL_SEC || '1')) * 1000;
 let   _pollActive = false;
 
@@ -773,23 +780,26 @@ async function pollOnce() {
   _pollActive = true;
   log(`[Poll] ── Poll cycle START ──`);
   try {
-    // Fetch a small buffer per direction (more than POLL_FETCH_LIMIT) so that
-    // after merging inbound+outbound and sorting by real call time, we can
-    // reliably pick the true latest POLL_FETCH_LIMIT calls overall.
+    // FIX: fetch all three directions Exotel uses:
+    //   - inbound       → calls received on the virtual number
+    //   - outbound-api  → calls initiated via Exotel's Outbound Call API
+    //   - outbound-dial → calls made by agents via the softphone / SIP client
+    // Previously only inbound + outbound-api were fetched, so softphone calls were invisible.
     const fetchSize = Math.max(POLL_FETCH_LIMIT * 2, 10);
-    const [inbound, outbound] = await Promise.all([
-      fetchRecentExotelCalls('inbound', fetchSize).catch(e => { log(`[Poll] ❌ inbound fetch error: ${e.message}`); return []; }),
-      fetchRecentExotelCalls('outbound-api', fetchSize).catch(e => { log(`[Poll] ❌ outbound fetch error: ${e.message}`); return []; })
+    const [inbound, outboundApi, outboundDial] = await Promise.all([
+      fetchRecentExotelCalls('inbound',       fetchSize).catch(e => { log(`[Poll] ❌ inbound fetch error: ${e.message}`);        return []; }),
+      fetchRecentExotelCalls('outbound-api',  fetchSize).catch(e => { log(`[Poll] ❌ outbound-api fetch error: ${e.message}`);   return []; }),
+      fetchRecentExotelCalls('outbound-dial', fetchSize).catch(e => { log(`[Poll] ❌ outbound-dial fetch error: ${e.message}`);  return []; }),
     ]);
 
     const seen = new Set();
     const merged = [];
-    for (const c of [...inbound, ...outbound]) {
+    for (const c of [...inbound, ...outboundApi, ...outboundDial]) {
       if (c && c.Sid && !seen.has(c.Sid)) { seen.add(c.Sid); merged.push(c); }
     }
     merged.sort((a, b) => callTimeMs(b) - callTimeMs(a));
     const calls = merged.slice(0, POLL_FETCH_LIMIT);
-    log(`[Poll] Merged ${merged.length} unique call(s) → evaluating last ${calls.length} (limit=${POLL_FETCH_LIMIT})`);
+    log(`[Poll] Merged ${merged.length} unique call(s) (inbound=${inbound.length} outbound-api=${outboundApi.length} outbound-dial=${outboundDial.length}) → evaluating last ${calls.length} (limit=${POLL_FETCH_LIMIT})`);
 
     let alreadySynced = 0, noRecording = 0, posted = 0, failed = 0, noNumber = 0, notInCrm = 0;
 
@@ -908,17 +918,19 @@ async function backfillOldRecordings() {
   syncedCallSids.clear();
   persistDedupSids();
 
-  const [inbound, outbound] = await Promise.all([
-    fetchRecentExotelCalls('inbound', 100).catch(e => { log(`[Backfill] ❌ inbound: ${e.message}`); return []; }),
-    fetchRecentExotelCalls('outbound-api', 100).catch(e => { log(`[Backfill] ❌ outbound: ${e.message}`); return []; })
+  // FIX: include outbound-dial so softphone calls are backfilled too
+  const [inbound, outboundApi, outboundDial] = await Promise.all([
+    fetchRecentExotelCalls('inbound',       100).catch(e => { log(`[Backfill] ❌ inbound: ${e.message}`);        return []; }),
+    fetchRecentExotelCalls('outbound-api',  100).catch(e => { log(`[Backfill] ❌ outbound-api: ${e.message}`);   return []; }),
+    fetchRecentExotelCalls('outbound-dial', 100).catch(e => { log(`[Backfill] ❌ outbound-dial: ${e.message}`);  return []; }),
   ]);
 
   const seen  = new Set();
   const calls = [];
-  for (const c of [...inbound, ...outbound]) {
+  for (const c of [...inbound, ...outboundApi, ...outboundDial]) {
     if (c && c.Sid && !seen.has(c.Sid)) { seen.add(c.Sid); calls.push(c); }
   }
-  log(`[Backfill] Total unique calls to process: ${calls.length}`);
+  log(`[Backfill] Total unique calls to process: ${calls.length} (inbound=${inbound.length} outbound-api=${outboundApi.length} outbound-dial=${outboundDial.length})`);
 
   let posted = 0, skipped = 0, failed = 0;
 
