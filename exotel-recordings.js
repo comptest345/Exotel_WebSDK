@@ -547,12 +547,10 @@ async function syncRecordings({ phoneNumber, agentEmail, callSid: hintSid, bx24C
     }
 
     if (!recordingExists) {
-      if (callSid !== hintSid) {
-        log(`[Sync] SID=${callSid} has no recording — adding to dedup so we don't re-check`);
-        syncedCallSids.add(callSid);
-      } else {
-        log(`[Sync] SID=${callSid} is the hint call — NOT adding to dedup so next attempt can retry`);
-      }
+      // BUG FIX: Do NOT add to dedup when recording is absent.
+      // Recording may not be ready yet — poller and scheduleSync retries
+      // must be able to recheck this call on the next cycle.
+      log(`[Sync] SID=${callSid} has no recording yet — skipping but NOT adding to dedup (will retry next cycle)`);
       results.skipped++;
       continue;
     }
@@ -684,9 +682,12 @@ async function pollOnce() {
   _pollActive = true;
   log(`[Poll] ── Poll cycle START ──`);
   try {
+    // Only look at calls from the last 24 hours to avoid burning quota on old calls
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 19) + 'Z';
+    log(`[Poll] Fetching calls since ${since}`);
     const [inbound, outbound] = await Promise.all([
-      fetchRecentExotelCalls('inbound',      null, null).catch(e => { log(`[Poll] ❌ inbound fetch error: ${e.message}`); return []; }),
-      fetchRecentExotelCalls('outbound-api', null, null).catch(e => { log(`[Poll] ❌ outbound fetch error: ${e.message}`); return []; })
+      fetchRecentExotelCalls('inbound',      since, null).catch(e => { log(`[Poll] ❌ inbound fetch error: ${e.message}`); return []; }),
+      fetchRecentExotelCalls('outbound-api', since, null).catch(e => { log(`[Poll] ❌ outbound fetch error: ${e.message}`); return []; })
     ]);
     log(`[Poll] Fetched: inbound=${inbound.length} outbound=${outbound.length}`);
 
@@ -705,7 +706,17 @@ async function pollOnce() {
 
       if (syncedCallSids.has(callSid)) { alreadySynced++; continue; }
 
-      log(`[Poll] Checking SID=${callSid} (Dir=${call.Direction} Status=${call.Status} Dur=${call.Duration}s)`);
+      const callDuration = parseInt(call.Duration || '0');
+      const callStatus   = (call.Status || '').toLowerCase();
+      log(`[Poll] Checking SID=${callSid} (Dir=${call.Direction} Status=${call.Status} Dur=${callDuration}s)`);
+
+      // Skip and dedup calls that are too short to have a recording (unanswered / <5s)
+      if (callDuration < 5 && (callStatus === 'no-answer' || callStatus === 'busy' || callStatus === 'failed' || callStatus === 'canceled')) {
+        log(`[Poll] SID=${callSid} unanswered (status=${callStatus} dur=${callDuration}s) — deduping so it's not checked again`);
+        syncedCallSids.add(callSid);
+        alreadySynced++;
+        continue;
+      }
 
       let recUrl = call.RecordingUrl || call.PreSignedRecordingUrl || null;
       if (recUrl) {
