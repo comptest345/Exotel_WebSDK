@@ -437,18 +437,23 @@ async function updateBx24CallRecord({
   const mins = Math.floor((duration || 0) / 60);
   const secs = (duration || 0) % 60;
   const fmtDate = d => { try { return new Date(d).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true}); } catch(_){ return d; } };
+  // For outbound, From is the agent SIP address — show email instead.
+  const agentDisplay  = agentEmail || (agentBx24Id ? `User #${agentBx24Id}` : 'Unassigned');
+  const fromDisplay   = direction === 'outbound' ? agentDisplay : fromNum;
+  const answeredLine  = (status || '').toLowerCase() === 'completed' ? 'Answered' : 'Not Answered';
+  const recordingPart = recordingLink ? `\n🔗 Recording: ${recordingLink}` : '';
   const desc =
     `☎ ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call\n\n` +
-    `Agent     : ${agentEmail || (agentBx24Id ? `User #${agentBx24Id}` : 'Unassigned')}\n` +
-    `From      : ${fromNum}\n` +
+    `Agent     : ${agentDisplay}\n` +
+    `From      : ${fromDisplay}\n` +
     `To        : ${toNum}\n` +
     `Customer  : ${clientNum}\n` +
     `Start     : ${fmtDate(callDate)}\n` +
     `End       : ${fmtDate(endDate || callDate)}\n` +
     `Duration  : ${mins}m ${secs}s\n` +
-    `Status    : ${status || 'Completed'}\n` +
-    `Call SID  : ${callSid}\n\n` +
-    `🔗 Recording: ${recordingLink}`;
+    `Answered  : ${answeredLine}\n` +
+    `Status    : ${status || 'Completed'}` +
+    recordingPart;
 
   // No number at all on the call — nothing to search BX24 for.
   if (!clientNum) {
@@ -481,7 +486,7 @@ async function updateBx24CallRecord({
       COMPLETED:        'Y',
       RESPONSIBLE_ID:   agentBx24Id || '1',
       COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }],
-      WEBDAV_INFOS:     [{ NAME: '▶ Call Recording', LINK: recordingLink, ICON: 'audio' }]
+      ...(recordingLink ? { WEBDAV_INFOS: [{ NAME: '▶ Call Recording', LINK: recordingLink, ICON: 'audio' }] } : {})
     }});
     log(`[BX24Push] ✅ Step 2 OK — activityId=${result} on ${entity.entityType} ID=${entity.entityId}`);
     log(`[BX24Push] ══════════════ updateBx24CallRecord DONE ✅ ══════════════`);
@@ -525,7 +530,8 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
     return 'NO_NUMBER';
   }
 
-  const recordingLink = buildRecordingLink(callSid);
+  // Only generate a recording link if Exotel actually has a recording for this call.
+  const recordingLink = (call.RecordingUrl || call.PreSignedRecordingUrl) ? buildRecordingLink(callSid) : null;
   const mins = Math.floor(duration / 60);
   const secs = duration % 60;
 
@@ -536,18 +542,22 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
   log(`[BX24Push] resolvedId=${resolvedId || 'null'} | agentLabel="${agentLabel}"`);
 
   const fmtDate = d => { try { return new Date(d).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true}); } catch(_){ return d; } };
+  // For outbound, From is the agent SIP address — show email/label instead.
+  const fromDisplay2  = direction === 'outbound' ? agentLabel : fromNum;
+  const answeredLine2 = (status || '').toLowerCase() === 'completed' ? 'Answered' : 'Not Answered';
+  const recordingPart2 = recordingLink ? `\n🔗 Recording: ${recordingLink}` : '';
   const desc =
     `☎ ${direction === 'outbound' ? 'Outbound' : 'Inbound'} Call\n\n` +
     `Agent     : ${agentLabel}\n` +
-    `From      : ${fromNum}\n` +
+    `From      : ${fromDisplay2}\n` +
     `To        : ${toNum}\n` +
     `Customer  : ${clientNum}\n` +
     `Start     : ${fmtDate(callDate)}\n` +
     `End       : ${fmtDate(endDate)}\n` +
     `Duration  : ${mins}m ${secs}s\n` +
-    `Status    : ${status}\n` +
-    `Call SID  : ${callSid}\n\n` +
-    `🔗 Recording: ${recordingLink}`;
+    `Answered  : ${answeredLine2}\n` +
+    `Status    : ${status}` +
+    recordingPart2;
 
   log(`[BX24Push] Looking up BX24 entity for clientNum=${clientNum}...`);
   const entity = await findBx24EntityByPhone(clientNum);
@@ -578,7 +588,7 @@ async function createBx24CallActivity(call, callSid, agentBx24UserId) {
       COMPLETED:        'Y',
       RESPONSIBLE_ID:   responsibleId,
       COMMUNICATIONS:   [{ VALUE: clientNum, TYPE: 'PHONE' }],
-      WEBDAV_INFOS:     [{ NAME: '▶ Call Recording', LINK: recordingLink, ICON: 'audio' }]
+      ...(recordingLink ? { WEBDAV_INFOS: [{ NAME: '▶ Call Recording', LINK: recordingLink, ICON: 'audio' }] } : {})
     }});
     log(`[BX24Push] ✅ TYPE_ID=2 OK — activityId=${result} on ${entity.entityType} ID=${entity.entityId}`);
     log(`[BX24Push] ══════════════ createBx24CallActivity DONE ✅ ══════════════`);
@@ -814,9 +824,20 @@ async function pollOnce() {
       log(`[Poll] Evaluating SID=${callSid} Dir=${call.Direction} Status=${call.Status} Dur=${callDuration}s`);
 
       // Failed/busy/no-answer/canceled calls never have recordings regardless of duration.
-      // Dedupe them immediately so they stop blocking the poll window every cycle.
+      // Unanswered/failed calls never have recordings — push a card to BX24 (no recording link),
+      // then dedupe so they don't block the poll window on future cycles.
       if (['no-answer','busy','failed','canceled'].includes(callStatus)) {
-        log(`[Poll] SID=${callSid} status=${callStatus} — no recording possible, deduping permanently`);
+        log(`[Poll] SID=${callSid} status=${callStatus} — pushing unanswered card to BX24 then deduping`);
+        if (call.From || call.To) {
+          // Temporarily clear RecordingUrl so buildRecordingLink is skipped in the desc
+          const savedUrl = call.RecordingUrl;
+          call.RecordingUrl = null;
+          const regEntry2 = callRegistry.get(callSid);
+          await createBx24CallActivity(call, callSid, regEntry2?.agentBx24Id || null).catch(e =>
+            log(`[Poll] SID=${callSid} unanswered card push failed (non-fatal): ${e.message}`)
+          );
+          call.RecordingUrl = savedUrl;
+        }
         syncedCallSids.add(callSid);
         persistDedupSids();
         alreadySynced++;
